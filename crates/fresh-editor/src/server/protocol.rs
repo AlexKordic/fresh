@@ -107,6 +107,9 @@ pub struct ServerHello {
     pub session_id: String,
     #[serde(default)]
     pub fc_integration: u32,
+    /// Checkpoint-confirmed restart, independent of the terminal protocol.
+    #[serde(default)]
+    pub fc_restart: bool,
 }
 
 impl ServerHello {
@@ -116,6 +119,7 @@ impl ServerHello {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             session_id,
             fc_integration: 1,
+            fc_restart: true,
         }
     }
 }
@@ -144,6 +148,8 @@ pub enum ClientControl {
     Detach,
     /// Request to quit (shutdown server if last client)
     Quit,
+    /// Checkpoint unsaved text and stop only if persistence succeeds.
+    Restart,
     /// Request to open files in the editor
     OpenFiles {
         files: Vec<FileRequest>,

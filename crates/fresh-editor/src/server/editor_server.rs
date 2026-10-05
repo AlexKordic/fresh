@@ -106,6 +106,7 @@ pub struct EditorServer {
     /// Index of the client that most recently provided input (for per-client detach)
     last_input_client: Option<usize>,
     last_checkpoint: Instant,
+    restart_checkpointed: bool,
     /// Next wait ID for --wait tracking
     next_wait_id: u64,
     /// Maps wait_id → client_id for clients waiting on file events
@@ -260,6 +261,7 @@ impl EditorServer {
             term_size: TermSize::new(80, 24), // Default until first client connects
             last_input_client: None,
             last_checkpoint: Instant::now(),
+            restart_checkpointed: false,
             next_wait_id: 1,
             waiting_clients: std::collections::HashMap::new(),
             pending_commands: std::collections::HashMap::new(),
@@ -437,6 +439,9 @@ impl EditorServer {
             // Process client messages and get input events
             tracing::trace!("[server] main loop: calling process_clients");
             let (input_events, resize_occurred, input_source) = self.process_clients()?;
+            if self.restart_checkpointed {
+                break; // No input or async edits after the acknowledged snapshot.
+            }
             if let Some(idx) = input_source {
                 self.last_input_client = Some(idx);
             }
@@ -691,10 +696,12 @@ impl EditorServer {
 
         // The same shutdown sequence as the normal (non-daemon) exit path in
         // run_event_loop_common — see `Editor::persist_on_exit`.
-        if let Some(ref mut editor) = self.editor {
-            // Each failure is logged inside; none blocks shutdown.
-            if let Err(e) = editor.persist_on_exit(true) {
-                tracing::debug!("Shutdown persistence incomplete: {e}");
+        if !self.restart_checkpointed {
+            if let Some(ref mut editor) = self.editor {
+                // Each failure is logged inside; none blocks shutdown.
+                if let Err(e) = editor.persist_on_exit(true) {
+                    tracing::debug!("Shutdown persistence incomplete: {e}");
+                }
             }
         }
 
@@ -1297,6 +1304,46 @@ impl EditorServer {
             }
 
             match msg {
+                ClientControl::Restart => {
+                    let result = if self
+                        .clients
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !disconnected.contains(i))
+                        .count()
+                        != 1
+                        || self.web_busy()
+                    {
+                        Err(anyhow::anyhow!(
+                            "Detach other editor clients before restarting"
+                        ))
+                    } else if let Some(ref mut editor) = self.editor {
+                        editor.checkpoint_for_restart()
+                    } else {
+                        Err(anyhow::anyhow!("Editor is not ready to restart"))
+                    };
+                    let ok = result.is_ok();
+                    let response = match result {
+                        Ok(()) => ServerControl::Quit {
+                            reason: "Restart checkpoint saved".into(),
+                        },
+                        Err(error) => ServerControl::Error {
+                            message: format!("Restart canceled; editor remains running: {error}"),
+                        },
+                    };
+                    if let Some(client) = self.clients.get(idx) {
+                        // A failed acknowledgement leaves the live editor alone.
+                        if client
+                            .conn
+                            .write_control(&serde_json::to_string(&response).unwrap())
+                            .is_ok()
+                            && ok
+                        {
+                            self.restart_checkpointed = true;
+                            break;
+                        }
+                    }
+                }
                 ClientControl::Hello(_) => {
                     tracing::warn!("Unexpected Hello from client");
                 }

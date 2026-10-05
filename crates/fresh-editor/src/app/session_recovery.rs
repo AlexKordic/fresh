@@ -57,6 +57,52 @@ impl Editor {
         Ok(())
     }
 
+    /// A user-requested backend restart must not fall through to best-effort
+    /// exit persistence or auto-save source files. Refuse before stopping if
+    /// the next backend cannot recover the current tabs and unsaved text.
+    pub fn checkpoint_for_restart(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.workspace_persistence_enabled,
+            "Enable workspace persistence before restarting the editor"
+        );
+        anyhow::ensure!(
+            self.config().editor.restore_previous_session,
+            "Enable restore_previous_session before restarting the editor"
+        );
+        anyhow::ensure!(
+            self.recovery_service.lock().unwrap().is_enabled(),
+            "Enable recovery before restarting the editor"
+        );
+        for id in self.window_ids_sorted() {
+            self.with_window_retargeted(id, |editor| {
+                // Re-write every unsaved snapshot, including empty untitled
+                // tabs and buffers whose previous recovery write is missing.
+                let ids: Vec<_> = editor
+                    .buffers()
+                    .iter()
+                    .filter_map(|(id, state)| {
+                        let meta = editor.active_window().buffer_metadata.get(id)?;
+                        if meta.hidden_from_tabs || meta.is_virtual() || state.is_composite_buffer {
+                            return None;
+                        }
+                        (state.buffer.is_modified()
+                            || meta.file_path().is_none_or(|p| p.as_os_str().is_empty()))
+                        .then_some(*id)
+                    })
+                    .collect();
+                for id in ids {
+                    editor
+                        .buffers_mut()
+                        .get_mut(&id)
+                        .unwrap()
+                        .buffer
+                        .set_recovery_pending(true);
+                }
+            });
+        }
+        self.checkpoint_session()
+    }
+
     pub fn restore_session_checkpoint(&mut self, path: &Path) -> anyhow::Result<bool> {
         let file = match std::fs::File::open(path) {
             Ok(file) => file,

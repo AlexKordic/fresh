@@ -239,6 +239,7 @@ struct Args {
     list_sessions: bool,
     session_name: Option<String>,
     kill: Option<Option<String>>,
+    prepare_restart: Option<Vec<String>>,
     /// Open files in a daemon without attaching (session_name, files, wait)
     open_files_in_session: Option<(Option<String>, Vec<String>, bool)>,
     /// Launch in GUI mode
@@ -255,6 +256,14 @@ struct Args {
 
 impl From<Cli> for Args {
     fn from(cli: Cli) -> Self {
+        let prepare_restart = if cli.cmd.len() >= 2
+            && matches!(cli.cmd[0].as_str(), "session" | "daemon")
+            && cli.cmd[1] == "prepare-restart"
+        {
+            Some(cli.cmd[2..].to_vec())
+        } else {
+            None
+        };
         // Check for grammar list command before the main tuple parsing
         let list_grammars = if !cli.cmd.is_empty() {
             let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
@@ -322,6 +331,9 @@ impl From<Cli> for Args {
             // Parse command from --cmd arguments
             let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
             match cmd_args.as_slice() {
+                ["session" | "daemon", "prepare-restart", ..] => {
+                    (false, None, false, None, false, false, None, vec![], None)
+                }
                 // Daemon commands. `daemon` is the current term; `session`
                 // (and the `s` short form) are kept as non-breaking aliases.
                 ["daemon", "list", ..]
@@ -587,6 +599,7 @@ impl From<Cli> for Args {
             list_sessions,
             session_name,
             kill,
+            prepare_restart,
             open_files_in_session,
             #[cfg(feature = "gui")]
             gui: cli.gui,
@@ -3071,6 +3084,111 @@ fn list_sessions_command() -> AnyhowResult<()> {
 }
 
 /// Kill a daemon (terminate the daemon process)
+/// Stop one FC backend, after an acknowledged checkpoint. FC attaches with
+/// the installed binary only after this succeeds. Never signals a PID or
+/// unlinks sockets belonging to a live/unreachable daemon.
+fn prepare_restart_command(args: &[String]) -> AnyhowResult<bool> {
+    use fresh::server::ipc::{ClientConnection, ServerLiveness};
+    use fresh::server::protocol::{
+        ClientControl, ClientHello, ServerControl, TermSize, PROTOCOL_VERSION,
+    };
+    use std::time::{Duration, Instant};
+    anyhow::ensure!(
+        args.len() == 1 || (args.len() == 2 && args[1] == "--allow-legacy-checkpoint"),
+        "Usage: fresh --cmd session prepare-restart NAME [--allow-legacy-checkpoint]"
+    );
+    let name = &args[0];
+    anyhow::ensure!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+        "Invalid editor session name"
+    );
+    let paths = SocketPaths::for_session_name(name)?;
+    let _lock = lock_daemon_startup(&paths)?;
+    match paths.probe_server() {
+        ServerLiveness::Dead => {
+            paths.cleanup_if_stale();
+            return Ok(true);
+        }
+        ServerLiveness::Unreachable => anyhow::bail!("Editor is unreachable; restart canceled"),
+        ServerLiveness::Alive => {}
+    }
+    let original_pid = paths.read_pid()?;
+    let mut protocol = PROTOCOL_VERSION;
+    let (conn, hello) = loop {
+        let conn = ClientConnection::connect(&paths)?;
+        let mut hello = ClientHello::new(TermSize::new(120, 30));
+        hello.protocol_version = protocol;
+        conn.write_control(&serde_json::to_string(&ClientControl::Hello(hello))?)?;
+        let response = conn
+            .read_control_timeout(Duration::from_secs(10))?
+            .ok_or_else(|| anyhow::anyhow!("Editor closed the restart handshake"))?;
+        match serde_json::from_str::<ServerControl>(&response)? {
+            ServerControl::Hello(hello) => break (conn, hello),
+            ServerControl::VersionMismatch(m)
+                if protocol == PROTOCOL_VERSION && m.server_version == "0.2.3" =>
+            {
+                if args.len() != 2 {
+                    return Ok(false);
+                }
+                protocol = 2; // Only the previously pinned FC protocol.
+            }
+            ServerControl::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("Unsupported editor backend; restart canceled"),
+        }
+    };
+    anyhow::ensure!(
+        hello.session_id == *name && hello.protocol_version == protocol,
+        "Editor identity changed; restart canceled"
+    );
+    let confirmed = protocol == PROTOCOL_VERSION && hello.fc_integration == 1 && hello.fc_restart;
+    if !confirmed {
+        anyhow::ensure!(
+            (protocol == 2 && hello.server_version == "0.2.3")
+                || (protocol == PROTOCOL_VERSION && hello.fc_integration == 1),
+            "This editor does not support FC recovery; save and quit it first"
+        );
+        if args.len() != 2 {
+            return Ok(false);
+        }
+    }
+    let request = if confirmed {
+        ClientControl::Restart
+    } else {
+        ClientControl::Quit
+    };
+    conn.write_control(&serde_json::to_string(&request)?)?;
+    if confirmed {
+        let response = conn
+            .read_control_timeout(Duration::from_secs(10))?
+            .ok_or_else(|| anyhow::anyhow!("Editor closed without confirming its checkpoint"))?;
+        match serde_json::from_str::<ServerControl>(&response)? {
+            ServerControl::Quit { reason } if reason == "Restart checkpoint saved" => {}
+            ServerControl::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("Editor did not confirm its restart checkpoint"),
+        }
+    }
+    drop(conn);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if paths.probe_server() == ServerLiveness::Dead {
+            paths.cleanup_if_stale();
+            return Ok(true);
+        }
+        anyhow::ensure!(
+            paths.read_pid()? == original_pid,
+            "Editor identity changed while waiting for restart; try again"
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "Editor did not stop within 10 seconds; it was not force-killed"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn kill_session_command(session: Option<&str>, args: &Args) -> AnyhowResult<()> {
     use fresh::server::ipc::ClientConnection;
     use fresh::server::protocol::ClientControl;
@@ -5842,6 +5960,21 @@ fn run_if_subcommand(
     }
     if args.list_sessions {
         return Some(list_sessions_command());
+    }
+    if let Some(ref restart_args) = args.prepare_restart {
+        // Expected operational failures are a concise diagnostic, not an
+        // anyhow backtrace in FC's terminal. 20 asks FC for legacy consent.
+        match prepare_restart_command(restart_args) {
+            Ok(true) => return Some(Ok(())),
+            Ok(false) => {
+                eprintln!("This older editor cannot confirm a restart checkpoint");
+                std::process::exit(20);
+            }
+            Err(error) => {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Some(ref session) = args.kill {
         return Some(kill_session_command(session.as_deref(), args));
