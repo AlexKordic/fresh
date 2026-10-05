@@ -3204,6 +3204,14 @@ fn wait_for_spawned_daemon(socket_paths: &SocketPaths, pid: u32) -> AnyhowResult
             anyhow::bail!("The daemon exited during startup{log}");
         }
         if std::time::Instant::now() >= deadline {
+            // This PID belongs to this launch. A child stuck before readiness
+            // must not wake up after the lock is released and replace a retry's
+            // sockets. Never terminate an already-running daemon here.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+                libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG);
+            }
             anyhow::bail!("The daemon did not start within {STARTUP_LIMIT:?}{log}");
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
