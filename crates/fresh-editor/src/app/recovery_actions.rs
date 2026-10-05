@@ -242,8 +242,16 @@ impl Editor {
             .filter_map(|(_, state)| state.buffer.file_path().map(|p| p.to_path_buf()))
             .collect();
 
+        let already_recovered: std::collections::HashSet<String> = self
+            .active_window()
+            .buffer_metadata
+            .values()
+            .filter_map(|m| m.recovery_id.clone())
+            .collect();
+
         let mine: Vec<_> = entries
             .into_iter()
+            .filter(|entry| !already_recovered.contains(&entry.id))
             .filter(|entry| match self.recovery_entry_owner(entry) {
                 Some(owner) => owner == active,
                 None => claim_unowned,
