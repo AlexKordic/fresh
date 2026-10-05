@@ -783,7 +783,10 @@ impl Editor {
         };
         let line_count = state.buffer.line_count();
 
-        if state.buffer.is_large_file() {
+        // FC's previous checkpoint was self-contained even for large files.
+        // Keep that property: a replaced/deleted source must not make unsaved
+        // recovery depend on a base file that no longer exists.
+        if state.buffer.is_large_file() && std::env::var_os("FRESH_FC_DATA_DIR").is_none() {
             let chunks = state.buffer.get_recovery_chunks();
             if chunks.is_empty() {
                 state.buffer.set_recovery_pending(false);
@@ -813,7 +816,7 @@ impl Editor {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     tracing::warn!("Failed to get buffer content for recovery save: {}", e);
-                    return Ok(false);
+                    return Err(e.into());
                 }
             };
             let chunks = vec![crate::services::recovery::types::RecoveryChunk::new(

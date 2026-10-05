@@ -369,10 +369,18 @@ impl RecoveryService {
         // New buffer or small file - chunk contains full content
         // For file-backed small files, check if the original was modified on disk
         if entry.metadata.original_path.is_some() && entry.original_file_modified() {
-            return Ok(RecoveryResult::OriginalFileModified {
-                id: entry.id.clone(),
-                original_path: entry.metadata.original_path.clone().unwrap(),
-            });
+            if std::env::var_os("FRESH_FC_DATA_DIR").is_none() {
+                return Ok(RecoveryResult::OriginalFileModified {
+                    id: entry.id.clone(),
+                    original_path: entry.metadata.original_path.clone().unwrap(),
+                });
+            }
+            // A full snapshot is independent of the new disk version. Restore
+            // it as unsaved text; leave saving/merging to the editor's user.
+            tracing::warn!(
+                "Recovered unsaved snapshot for {:?}; disk version changed, review before saving",
+                entry.metadata.original_path
+            );
         }
 
         // Load the chunk data directly
