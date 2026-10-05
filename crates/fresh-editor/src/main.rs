@@ -3385,7 +3385,13 @@ fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()>
     let config = EditorServerConfig {
         working_dir: working_dir.clone(),
         session_name: args.session_name.clone(),
-        idle_timeout: Some(std::time::Duration::from_secs(3600)), // 1 hour default
+        idle_timeout: Some(std::time::Duration::from_secs(
+            std::env::var("FRESH_SESSION_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(3600),
+        )),
         editor_config,
         dir_context,
         plugins_enabled: !args.no_plugins,

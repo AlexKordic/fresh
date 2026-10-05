@@ -105,6 +105,7 @@ pub struct EditorServer {
     term_size: TermSize,
     /// Index of the client that most recently provided input (for per-client detach)
     last_input_client: Option<usize>,
+    last_checkpoint: Instant,
     /// Next wait ID for --wait tracking
     next_wait_id: u64,
     /// Maps wait_id → client_id for clients waiting on file events
@@ -258,6 +259,7 @@ impl EditorServer {
             shutdown: Arc::new(AtomicBool::new(false)),
             term_size: TermSize::new(80, 24), // Default until first client connects
             last_input_client: None,
+            last_checkpoint: Instant::now(),
             next_wait_id: 1,
             waiting_clients: std::collections::HashMap::new(),
             pending_commands: std::collections::HashMap::new(),
@@ -341,6 +343,11 @@ impl EditorServer {
                 break;
             }
 
+            if self.last_checkpoint.elapsed() >= Duration::from_secs(2) {
+                self.checkpoint();
+                self.last_checkpoint = Instant::now();
+            }
+
             // Check idle timeout. A browser on the hosted web bridge counts as
             // a client: a web-only session has no IPC clients at all, and
             // without this the daemon would reap itself out from under an open
@@ -348,10 +355,17 @@ impl EditorServer {
             if let Some(timeout) = self.config.idle_timeout {
                 if self.clients.is_empty()
                     && !self.web_busy()
+                    && !self
+                        .editor
+                        .as_ref()
+                        .is_some_and(|e| e.session_has_modified_buffers())
                     && self.last_client_activity.elapsed() > timeout
                 {
-                    tracing::info!("Idle timeout reached, shutting down");
-                    break;
+                    if self.checkpoint() {
+                        tracing::info!("Idle timeout reached, shutting down");
+                        break;
+                    }
+                    self.last_client_activity = Instant::now();
                 }
             }
 
@@ -458,6 +472,7 @@ impl EditorServer {
                 .map(|e| e.should_detach())
                 .unwrap_or(false);
             if detach_requested {
+                self.checkpoint();
                 // Detach only the client that triggered it (via last input)
                 if let Some(idx) = self.last_input_client.take() {
                     if idx < self.clients.len() {
@@ -879,32 +894,66 @@ impl EditorServer {
     pub fn initialize_editor(&mut self) -> io::Result<()> {
         let (mut editor, terminal) = self.build_editor_instance()?;
 
-        // Restore workspace and recovery data (mirrors the standalone startup
-        // path in handle_first_run_setup in main.rs).
-        match editor.try_restore_workspace() {
-            Ok(true) => {
-                tracing::info!("Session workspace restored successfully");
-            }
-            Ok(false) => {
-                tracing::debug!("No previous session workspace found");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to restore session workspace: {}", e);
-            }
+        let identity = self
+            .listener
+            .paths()
+            .pid
+            .file_stem()
+            .unwrap()
+            .to_string_lossy();
+        let legacy = std::env::var_os("FC_LEGACY_CHECKPOINT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                self.config
+                    .dir_context
+                    .data_dir
+                    .join("sessions")
+                    .join(format!("{identity}.json"))
+            });
+        let imported = editor.restore_session_checkpoint(&legacy).map_err(|e| {
+            io::Error::other(format!(
+                "Legacy FC recovery failed; checkpoint retained: {e}"
+            ))
+        })?;
+        if imported {
+            editor.checkpoint_session().map_err(|e| {
+                io::Error::other(format!("FC recovery migration could not be saved: {e}"))
+            })?;
+            std::fs::rename(&legacy, legacy.with_extension("json.imported"))?;
         }
 
-        // Recover buffers from hot exit recovery files
-        if editor.has_recovery_files().unwrap_or(false) {
-            tracing::info!("Recovery files found for session, recovering...");
-            match editor.recover_all_buffers() {
-                Ok(count) if count > 0 => {
-                    tracing::info!("Recovered {} buffer(s) for session", count);
+        if !imported {
+            // Restore workspace and recovery data (mirrors the standalone startup
+            // path in handle_first_run_setup in main.rs).
+            match editor.try_restore_workspace() {
+                Ok(true) => {
+                    tracing::info!("Session workspace restored successfully");
                 }
-                Ok(_) => {
-                    tracing::info!("No buffers to recover for session");
+                Ok(false) => {
+                    tracing::debug!("No previous session workspace found");
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to recover session buffers: {}", e);
+                    return Err(io::Error::other(format!(
+                        "Session workspace recovery failed; state retained: {e}"
+                    )));
+                }
+            }
+
+            // Recover buffers from hot exit recovery files
+            if editor.has_recovery_files().unwrap_or(false) {
+                tracing::info!("Recovery files found for session, recovering...");
+                match editor.recover_all_buffers() {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Recovered {} buffer(s) for session", count);
+                    }
+                    Ok(_) => {
+                        tracing::info!("No buffers to recover for session");
+                    }
+                    Err(e) => {
+                        return Err(io::Error::other(format!(
+                            "Session buffer recovery failed; state retained: {e}"
+                        )));
+                    }
                 }
             }
         }
@@ -977,9 +1026,20 @@ impl EditorServer {
         }
     }
 
+    fn checkpoint(&mut self) -> bool {
+        if let Some(editor) = &mut self.editor {
+            if let Err(e) = editor.checkpoint_session() {
+                editor.set_status_message(format!("Session checkpoint failed: {e}"));
+                tracing::error!("Session checkpoint failed: {e}");
+                return false;
+            }
+        }
+        true
+    }
+
     /// Handle a new client connection
     fn handle_new_connection(
-        &self,
+        &mut self,
         conn: ServerConnection,
         client_id: u64,
         cursor_style: crate::config::CursorStyle,
@@ -1024,6 +1084,21 @@ impl EditorServer {
             conn.write_control(&response)?;
 
             return Err(io::Error::other("Version mismatch"));
+        }
+
+        // A successful handshake promises a usable editor. Report restore
+        // errors before Hello, so FC never mistakes a failed import for a
+        // successful open/attach or replaces the retained recovery record.
+        if self.editor.is_none() {
+            self.term_size = hello.term_size;
+            if let Err(error) = self.initialize_editor() {
+                let response = serde_json::to_string(&ServerControl::Error {
+                    message: error.to_string(),
+                })
+                .map_err(io::Error::other)?;
+                conn.write_control(&response)?;
+                return Err(error);
+            }
         }
 
         // Send server hello

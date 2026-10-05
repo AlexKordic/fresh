@@ -596,7 +596,7 @@ impl Editor {
 
     /// Save all buffers marked `recovery_pending` to recovery storage.
     /// Shared by the periodic auto-save and the exit flush.
-    fn save_pending_recovery_buffers(&mut self) -> AnyhowResult<usize> {
+    pub(super) fn save_pending_recovery_buffers(&mut self) -> AnyhowResult<usize> {
         if !self.recovery_service.lock().unwrap().is_enabled() {
             return Ok(0);
         }
