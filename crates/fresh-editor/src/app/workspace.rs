@@ -2709,6 +2709,10 @@ impl crate::app::window::Window {
         self.restore_external_files(&workspace.external_files, &mut path_to_buffer);
         self.apply_read_only_flags(&workspace.read_only_files, &path_to_buffer);
 
+        // Recover text before applying saved cursor/scroll positions: otherwise
+        // positions beyond the original on-disk length are clamped and lost.
+        self.restore_hot_exit_changes(&path_to_buffer);
+
         let terminal_buffer_map = self.restore_terminals_from_workspace(&workspace.terminals);
 
         let mut split_id_map: HashMap<usize, SplitId> = HashMap::new();
@@ -2741,9 +2745,6 @@ impl crate::app::window::Window {
         self.restore_bookmarks_from_workspace(&workspace.bookmarks, &path_to_buffer);
         self.clean_orphaned_buffers();
         self.log_restore_summary(session_name);
-
-        // Replay hot-exit changes onto the file-backed buffers we opened.
-        self.restore_hot_exit_changes(&path_to_buffer);
     }
 
     /// Build a `Window` directly from a persisted `Workspace`: construct
