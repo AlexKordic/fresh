@@ -51,6 +51,15 @@ pub fn get_data_dir() -> std::io::Result<PathBuf> {
     if let Some(dir) = DATA_DIR_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return Ok(dir);
     }
+    // Set only on an FC-owned daemon before exec; all threads and native
+    // stores agree on its private persistence directory on every platform.
+    if let Some(dir) = std::env::var_os("FRESH_FC_DATA_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() {
+            return Err(std::io::Error::other("FRESH_FC_DATA_DIR must be absolute"));
+        }
+        return Ok(dir);
+    }
     let data_dir = dirs::data_dir().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,

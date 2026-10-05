@@ -80,6 +80,27 @@ pub fn spawn_server_detached(spawn: &super::DaemonSpawn<'_>) -> io::Result<u32> 
     // Use Command to spawn, which properly handles the process
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(super::server_args(spawn));
+    // Native workspaces are now shared across daemons by project. FC owns a
+    // profile-specific editor identity, so give its daemon a private data store
+    // while keeping the user's Fresh config and runtime socket locations.
+    if std::env::var_os("FC_EDITOR_SWITCH_KEY").is_some() {
+        if let Some(name) = spawn.session_name {
+            let data = crate::config_io::DirectoryContext::from_system()
+                .map_err(io::Error::other)?
+                .data_dir;
+            let identity = crate::server::ipc::SocketPaths::for_session_name(name)?;
+            let safe_name = identity.pid.file_stem().unwrap();
+            cmd.env(
+                "FC_LEGACY_CHECKPOINT",
+                data.join("sessions").join(safe_name).with_extension("json"),
+            );
+            let private = data.join("fc-daemons").join(safe_name);
+            std::fs::create_dir_all(&private)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))?;
+            cmd.env("FRESH_FC_DATA_DIR", private);
+        }
+    }
     detach_from_terminal(&mut cmd);
 
     let child = cmd.spawn()?;

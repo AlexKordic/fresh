@@ -932,14 +932,7 @@ impl DirectoryContext {
     /// Create a DirectoryContext from the system directories
     /// This should ONLY be called from main()
     pub fn from_system() -> std::io::Result<Self> {
-        let data_dir = dirs::data_dir()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Could not determine data directory",
-                )
-            })?
-            .join("fresh");
+        let data_dir = crate::data_dir::get_data_dir()?;
 
         let config_dir = Self::default_config_dir().ok_or_else(|| {
             std::io::Error::new(
