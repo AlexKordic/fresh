@@ -1412,6 +1412,12 @@ impl EditorServer {
 
     /// Handle an input event
     fn handle_event(&mut self, event: Event) -> io::Result<bool> {
+        let switch_key = self
+            .last_input_client
+            .and_then(|i| self.clients.get(i))
+            .and_then(|c| c.env.get("FC_EDITOR_SWITCH_KEY"))
+            .and_then(|key| key.as_deref())
+            .and_then(fc_switch_key);
         let Some(ref mut editor) = self.editor else {
             return Ok(false);
         };
@@ -1428,6 +1434,10 @@ impl EditorServer {
         match event {
             Event::Key(press) => {
                 if crate::input::is_keystroke(press.kind) {
+                    if switch_key == Some((press.code, press.modifiers)) {
+                        editor.request_detach();
+                        return Ok(true);
+                    }
                     editor
                         .handle_key_press(press)
                         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -1943,4 +1953,55 @@ mod editor_tick_tests {
             "the tick must have consumed the full-redraw request"
         );
     }
+}
+
+// FC's documented key tokens. Unknown values leave the ordinary keymap intact.
+fn fc_switch_key(
+    token: &str,
+) -> Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)> {
+    use crossterm::event::{KeyCode as K, KeyModifiers as M};
+    let named = match token {
+        "<-" => K::Left,
+        "->" => K::Right,
+        "up" => K::Up,
+        "down" => K::Down,
+        "back" => K::Backspace,
+        "del" => K::Delete,
+        "esc" => K::Esc,
+        "ret" => K::Enter,
+        "tab" => K::Tab,
+        "stab" => return Some((K::BackTab, M::SHIFT)),
+        "c<-" => return Some((K::Left, M::CONTROL)),
+        "c->" => return Some((K::Right, M::CONTROL)),
+        "cup" => return Some((K::Up, M::CONTROL)),
+        "cdown" => return Some((K::Down, M::CONTROL)),
+        _ => {
+            if let Some(n) = token
+                .strip_prefix('f')
+                .and_then(|n| n.parse::<u8>().ok())
+                .filter(|n| (1..=12).contains(n))
+            {
+                return Some((K::F(n), M::NONE));
+            }
+            let chars: Vec<_> = token.chars().collect();
+            return match chars.as_slice() {
+                [c] => Some((
+                    K::Char(*c),
+                    if c.is_ascii_uppercase() {
+                        M::SHIFT
+                    } else {
+                        M::NONE
+                    },
+                )),
+                ['c', c] if c.is_ascii_uppercase() => {
+                    Some((K::Char(c.to_ascii_lowercase()), M::CONTROL))
+                }
+                ['a', c] if c.is_ascii_uppercase() => {
+                    Some((K::Char(c.to_ascii_lowercase()), M::ALT))
+                }
+                _ => None,
+            };
+        }
+    };
+    Some((named, M::NONE))
 }

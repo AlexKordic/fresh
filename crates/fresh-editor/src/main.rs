@@ -3158,11 +3158,32 @@ fn redirect_stderr_to_server_log() {
     }
 }
 
+/// OS-owned startup lock; concurrent open/attach clients cannot unlink each
+/// other's listening sockets. Dropping the file releases it after readiness.
+fn lock_daemon_startup(paths: &SocketPaths) -> AnyhowResult<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.pid.with_extension("start.lock"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(e) => anyhow::bail!("Editor startup lock: {e}"),
+        }
+    }
+}
+
 /// Wait for a daemon this client just spawned to bind its sockets (the pid
 /// file is written after `bind()`); fail, naming its log, if it exits first.
 fn wait_for_spawned_daemon(socket_paths: &SocketPaths, pid: u32) -> AnyhowResult<()> {
     use fresh::server::daemon::{is_process_running, spawned_daemon_exited};
-    const STARTUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+    const STARTUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[cfg(unix)]
     let log = format!(
@@ -3175,7 +3196,7 @@ fn wait_for_spawned_daemon(socket_paths: &SocketPaths, pid: u32) -> AnyhowResult
     let deadline = std::time::Instant::now() + STARTUP_LIMIT;
     loop {
         if let Ok(Some(ready)) = socket_paths.read_pid() {
-            if is_process_running(ready) {
+            if ready == pid && is_process_running(ready) && socket_paths.exists() {
                 return Ok(());
             }
         }
@@ -3539,6 +3560,7 @@ fn run_open_files_command(
     // Determine socket paths based on session name or working directory
     let socket_paths = resolve_session(session_name)?;
 
+    let startup_lock = lock_daemon_startup(&socket_paths)?;
     // Clean up stale sockets if server is dead
     socket_paths.cleanup_if_stale();
 
@@ -3558,6 +3580,7 @@ fn run_open_files_command(
         false
     };
 
+    drop(startup_lock);
     // Connect to server
     let conn = fresh::server::ipc::ClientConnection::connect(&socket_paths)?;
 
@@ -3620,7 +3643,9 @@ fn run_open_files_command(
 /// caller should abort quietly — a message has already been printed), and
 /// `Err` on a protocol-level error.
 fn client_handshake(conn: &fresh::server::ipc::ClientConnection) -> AnyhowResult<bool> {
-    client_handshake_reading(conn, || Ok(conn.read_control()?))
+    client_handshake_reading(conn, || {
+        Ok(conn.read_control_timeout(std::time::Duration::from_secs(10))?)
+    })
 }
 
 /// [`client_handshake`], but with the reply read through a caller-supplied
@@ -3646,18 +3671,25 @@ where
 
     match serde_json::from_str::<ServerControl>(&response)? {
         ServerControl::Hello(server_hello) => {
+            if std::env::var_os("FC_EDITOR_SWITCH_KEY").is_some()
+                && server_hello.fc_integration != 1
+            {
+                anyhow::bail!("Editor lacks FC integration; save work and quit the old editor before retrying");
+            }
             if server_hello.protocol_version != PROTOCOL_VERSION {
                 eprintln!(
                     "Version mismatch: server is v{}",
                     server_hello.server_version
                 );
-                return Ok(false);
+                anyhow::bail!(
+                    "Incompatible editor; save work and quit the old editor before retrying"
+                );
             }
             Ok(true)
         }
         ServerControl::VersionMismatch(mismatch) => {
             eprintln!("Version mismatch: server is v{}", mismatch.server_version);
-            Ok(false)
+            anyhow::bail!("Incompatible editor; save work and quit the old editor before retrying")
         }
         ServerControl::Error { message } => Err(anyhow::anyhow!("Server error: {}", message)),
         _ => Err(anyhow::anyhow!("Unexpected server response")),
@@ -5436,6 +5468,7 @@ fn run_attach(
     // Determine socket paths based on session name or working directory
     let socket_paths = resolve_session(session_name)?;
 
+    let startup_lock = lock_daemon_startup(&socket_paths)?;
     // Clean up stale sockets if the daemon is dead
     if socket_paths.cleanup_if_stale() {
         eprintln!("Cleaned up stale daemon.");
@@ -5465,6 +5498,7 @@ fn run_attach(
     if let Some(pid) = spawned {
         wait_for_spawned_daemon(&socket_paths, pid)?;
     }
+    drop(startup_lock);
     let server_was_started = spawned.is_some();
 
     // Now connect - server is ready
@@ -5483,20 +5517,27 @@ fn run_attach(
 
     // Read server response
     let response = conn
-        .read_control()?
+        .read_control_timeout(std::time::Duration::from_secs(10))?
         .ok_or_else(|| anyhow::anyhow!("Server closed connection during handshake"))?;
 
     let server_msg: ServerControl = serde_json::from_str(&response)?;
 
     match server_msg {
         ServerControl::Hello(server_hello) => {
+            if std::env::var_os("FC_EDITOR_SWITCH_KEY").is_some()
+                && server_hello.fc_integration != 1
+            {
+                anyhow::bail!("Editor lacks FC integration; save work and quit the old editor before retrying");
+            }
             if server_hello.protocol_version != PROTOCOL_VERSION {
                 eprintln!(
                     "Version mismatch: daemon is v{}",
                     server_hello.server_version
                 );
                 eprintln!("Please restart the daemon with the same version as the client.");
-                return Ok(());
+                anyhow::bail!(
+                    "Incompatible editor; save work and quit the old editor before retrying"
+                );
             }
             tracing::info!(
                 "Connected to session '{}' (server {})",
@@ -5506,8 +5547,7 @@ fn run_attach(
         }
         ServerControl::VersionMismatch(mismatch) => {
             eprintln!("Version mismatch: daemon is v{}", mismatch.server_version);
-            eprintln!("Please restart the daemon with the same version as the client.");
-            return Ok(());
+            anyhow::bail!("Save work and quit the old editor before retrying");
         }
         ServerControl::Error { message } => {
             return Err(anyhow::anyhow!("Server error: {}", message));

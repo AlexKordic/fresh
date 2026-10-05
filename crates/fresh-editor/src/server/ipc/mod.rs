@@ -575,6 +575,40 @@ fn connect_error(e: impl std::fmt::Display + Into<io::Error>) -> io::Error {
 }
 
 impl ClientConnection {
+    /// Bound the initial handshake without imposing a lifetime on an attachment.
+    pub fn read_control_timeout(&self, timeout: std::time::Duration) -> io::Result<Option<String>> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            match self.control.try_read(&mut byte) {
+                Ok(0) => return Ok(None),
+                Ok(_) => {
+                    bytes.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        return String::from_utf8(bytes)
+                            .map(Some)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+                    }
+                    if bytes.len() > 65536 {
+                        return Err(io::Error::other("Oversized editor handshake"));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Editor handshake timed out",
+                ));
+            }
+            if byte[0] == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
     /// Connect to a server at the given socket paths
     pub fn connect(paths: &SocketPaths) -> io::Result<Self> {
         let control_name = platform::socket_name_for_path(&paths.control)?;

@@ -18,6 +18,11 @@ impl Editor {
         self.should_detach
     }
 
+    /// Return to the attaching application without closing or saving tabs.
+    pub fn request_detach(&mut self) {
+        self.should_detach = true;
+    }
+
     /// Clear the detach flag (after processing)
     pub fn clear_detach(&mut self) {
         self.should_detach = false;

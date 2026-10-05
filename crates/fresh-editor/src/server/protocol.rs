@@ -58,7 +58,13 @@ impl ClientHello {
         let mut env = HashMap::new();
 
         // Collect terminal-relevant environment variables
-        for key in &["TERM", "COLORTERM", "LANG", "LC_ALL"] {
+        for key in &[
+            "TERM",
+            "COLORTERM",
+            "LANG",
+            "LC_ALL",
+            "FC_EDITOR_SWITCH_KEY",
+        ] {
             env.insert(key.to_string(), std::env::var(key).ok());
         }
 
@@ -99,6 +105,8 @@ pub struct ServerHello {
     pub server_version: String,
     /// Daemon identifier (encoded working directory)
     pub session_id: String,
+    #[serde(default)]
+    pub fc_integration: u32,
 }
 
 impl ServerHello {
@@ -107,6 +115,7 @@ impl ServerHello {
             protocol_version: PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             session_id,
+            fc_integration: 1,
         }
     }
 }
