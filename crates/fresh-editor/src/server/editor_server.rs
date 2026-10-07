@@ -1296,7 +1296,10 @@ impl EditorServer {
 
             // Always process OpenFiles / OpenWindow - they're one-shot
             // commands from clients that disconnect immediately
-            if let ClientControl::OpenFiles { .. } | ClientControl::OpenWindow { .. } = msg {
+            if let ClientControl::OpenFiles { .. }
+            | ClientControl::OpenWindow { .. }
+            | ClientControl::OpenLocation { .. } = msg
+            {
                 // Fall through to process it
             } else if disconnected.contains(&idx) {
                 // Skip other messages from disconnected clients
@@ -1416,6 +1419,36 @@ impl EditorServer {
 
                         resize_occurred = true; // Force re-render
                     }
+                }
+                ClientControl::OpenLocation {
+                    target,
+                    root,
+                    control_path,
+                    files,
+                } => {
+                    let result = self
+                        .editor
+                        .as_mut()
+                        .ok_or_else(|| "Editor unavailable".to_string())
+                        .and_then(|editor| {
+                            editor.fc_open_location(
+                                &target,
+                                std::path::PathBuf::from(root),
+                                control_path,
+                                files,
+                            )
+                        });
+                    if let Some(client) = self.clients.get_mut(idx) {
+                        let reply = ServerControl::ScriptResult {
+                            ok: result.is_ok(),
+                            error: result.err(),
+                            output: None,
+                        };
+                        let _ = client
+                            .conn
+                            .write_control(&serde_json::to_string(&reply).unwrap_or_default());
+                    }
+                    resize_occurred = true;
                 }
                 ClientControl::OpenWindow { path } => {
                     if let Some(ref mut editor) = self.editor {

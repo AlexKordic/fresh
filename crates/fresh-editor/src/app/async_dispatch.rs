@@ -1857,6 +1857,13 @@ impl Editor {
             return;
         }
         tracing::warn!("Remote attach failed: {}", error);
+        let fc_id = fresh_core::WindowId(u64::MAX - request_id);
+        if self.fc_pending_locations.contains_key(&fc_id) {
+            if let Some(placeholder) = self.preparing_windows.get_mut(&fc_id) {
+                placeholder.failed = true;
+                placeholder.message=format!("SSH connection failed: {error}. Retry opening this location from File Commander.");
+            }
+        }
         // A *dive-triggered* reconnect of a dormant workspace has no
         // awaiting JS callback for `reject_remote_attach` to reject
         // and no plugin dialog open, so its only user-visible signal

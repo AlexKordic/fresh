@@ -240,6 +240,7 @@ struct Args {
     session_name: Option<String>,
     kill: Option<Option<String>>,
     prepare_restart: Option<Vec<String>>,
+    open_location: Option<Vec<String>>,
     /// Open files in a daemon without attaching (session_name, files, wait)
     open_files_in_session: Option<(Option<String>, Vec<String>, bool)>,
     /// Launch in GUI mode
@@ -256,6 +257,14 @@ struct Args {
 
 impl From<Cli> for Args {
     fn from(cli: Cli) -> Self {
+        let open_location = if cli.cmd.len() >= 2
+            && matches!(cli.cmd[0].as_str(), "session" | "daemon")
+            && cli.cmd[1] == "open-location"
+        {
+            Some(cli.cmd[2..].to_vec())
+        } else {
+            None
+        };
         let prepare_restart = if cli.cmd.len() >= 2
             && matches!(cli.cmd[0].as_str(), "session" | "daemon")
             && cli.cmd[1] == "prepare-restart"
@@ -331,7 +340,7 @@ impl From<Cli> for Args {
             // Parse command from --cmd arguments
             let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
             match cmd_args.as_slice() {
-                ["session" | "daemon", "prepare-restart", ..] => {
+                ["session" | "daemon", "prepare-restart" | "open-location", ..] => {
                     (false, None, false, None, false, false, None, vec![], None)
                 }
                 // Daemon commands. `daemon` is the current term; `session`
@@ -600,6 +609,7 @@ impl From<Cli> for Args {
             session_name,
             kill,
             prepare_restart,
+            open_location,
             open_files_in_session,
             #[cfg(feature = "gui")]
             gui: cli.gui,
@@ -3087,6 +3097,70 @@ fn list_sessions_command() -> AnyhowResult<()> {
 /// Stop one FC backend, after an acknowledged checkpoint. FC attaches with
 /// the installed binary only after this succeeds. Never signals a PID or
 /// unlinks sockets belonging to a live/unreachable daemon.
+fn open_location_command(values: &[String], args: &Args) -> AnyhowResult<()> {
+    use fresh::server::ipc::ClientConnection;
+    use fresh::server::protocol::{ClientControl, ClientHello, ServerControl, TermSize};
+    use std::time::Duration;
+    anyhow::ensure!(
+        values.len() >= 4,
+        "Usage: fresh --cmd session open-location NAME TARGET ROOT CONTROL_PATH [FILES...]"
+    );
+    let name = &values[0];
+    anyhow::ensure!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
+        "Invalid session name"
+    );
+    let paths = SocketPaths::for_session_name(name)?;
+    let lock = lock_daemon_startup(&paths)?;
+    paths.cleanup_if_stale();
+    if !paths.is_server_alive() {
+        let pid = fresh::server::spawn_server_detached(&fresh::server::DaemonSpawn {
+            session_name: Some(name),
+            locale: args.locale.as_deref(),
+            config: args.config.as_deref(),
+            ..Default::default()
+        })?;
+        wait_for_spawned_daemon(&paths, pid)?;
+    }
+    drop(lock);
+    let conn = ClientConnection::connect(&paths)?;
+    conn.write_control(&serde_json::to_string(&ClientControl::Hello(
+        ClientHello::new(TermSize::new(120, 30)),
+    ))?)?;
+    let response = conn
+        .read_control_timeout(Duration::from_secs(10))?
+        .ok_or_else(|| anyhow::anyhow!("Editor closed location handshake"))?;
+    match serde_json::from_str::<ServerControl>(&response)? {
+        ServerControl::Hello(hello) if hello.fc_locations && hello.session_id==*name => {},
+        _ => anyhow::bail!("Editor backend does not support filesystem routing. Use Restart editor backend before opening this location."),
+    }
+    let request = ClientControl::OpenLocation {
+        target: values[1].clone(),
+        root: values[2].clone(),
+        control_path: if values[3] == "-" {
+            None
+        } else {
+            Some(values[3].clone())
+        },
+        files: values[4..].to_vec(),
+    };
+    conn.write_control(&serde_json::to_string(&request)?)?;
+    let reply = conn
+        .read_control_timeout(Duration::from_secs(10))?
+        .ok_or_else(|| anyhow::anyhow!("Editor did not acknowledge location routing"))?;
+    match serde_json::from_str::<ServerControl>(&reply)? {
+        ServerControl::ScriptResult { ok: true, .. } => Ok(()),
+        ServerControl::ScriptResult { error, .. } => anyhow::bail!(
+            "{}",
+            error.unwrap_or_else(|| "Editor location rejected".into())
+        ),
+        _ => anyhow::bail!("Unexpected editor location response"),
+    }
+}
+
 fn prepare_restart_command(args: &[String]) -> AnyhowResult<bool> {
     use fresh::server::ipc::{ClientConnection, ServerLiveness};
     use fresh::server::protocol::{
@@ -5960,6 +6034,9 @@ fn run_if_subcommand(
     }
     if args.list_sessions {
         return Some(list_sessions_command());
+    }
+    if let Some(ref location_args) = args.open_location {
+        return Some(open_location_command(location_args, args));
     }
     if let Some(ref restart_args) = args.prepare_restart {
         // Expected operational failures are a concise diagnostic, not an

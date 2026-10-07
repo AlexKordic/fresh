@@ -53,6 +53,19 @@ impl Editor {
     /// Opens files that were queued during startup, using the same error handling
     /// as interactive file opens. Returns true if any files were processed.
     pub fn process_pending_file_opens(&mut self) -> bool {
+        let id = self.active_window;
+        if self.is_window_preparing(id) || self.dormant_remote.contains_key(&id) {
+            return false;
+        }
+        if self.active_window().authority_spec.is_remote() && self.authority().env_is_this_process()
+        {
+            return false;
+        }
+        if let Some(files) = self.fc_pending_locations.remove(&id) {
+            for path in files {
+                self.queue_file_open(path, None, None, None, None, None, None);
+            }
+        }
         if self.active_window_mut().pending_file_opens.is_empty() {
             return false;
         }

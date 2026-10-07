@@ -596,7 +596,8 @@ async fn read_ssh_stderr(stderr: Option<ChildStderr>) -> Option<String> {
 /// through here so neither can regress to an interactive carrier. Cross-platform
 /// (a plain ssh argument); the tty detachment below is the unix-only companion.
 fn configure_agent_carrier_ssh(cmd: &mut Command, params: &ConnectionParams) {
-    // Don't check host key strictly for ease of use.
+    // Machine-supplied options win; preserve the host configuration by default.
+    cmd.args(&params.extra_args);
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     // Never prompt interactively — fail fast instead (EOF → `ssh_eof_error`).
     cmd.arg("-o").arg("BatchMode=yes");
@@ -607,7 +608,6 @@ fn configure_agent_carrier_ssh(cmd: &mut Command, params: &ConnectionParams) {
     if let Some(ref identity) = params.identity_file {
         cmd.arg("-i").arg(identity);
     }
-    cmd.args(&params.extra_args);
     // After the machine's own options: ssh takes the first value for an option,
     // so these are defaults the machine can override.
     cmd.arg("-o")

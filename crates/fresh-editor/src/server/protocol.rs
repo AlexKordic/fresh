@@ -110,6 +110,8 @@ pub struct ServerHello {
     /// Checkpoint-confirmed restart, independent of the terminal protocol.
     #[serde(default)]
     pub fc_restart: bool,
+    #[serde(default)]
+    pub fc_locations: bool,
 }
 
 impl ServerHello {
@@ -120,6 +122,7 @@ impl ServerHello {
             session_id,
             fc_integration: 1,
             fc_restart: true,
+            fc_locations: true,
         }
     }
 }
@@ -164,6 +167,13 @@ pub enum ClientControl {
     /// embedded terminal: the directory becomes a new workspace (a `Window`)
     /// instead of launching a second editor in the terminal.
     OpenWindow { path: String },
+    /// FC's explicit filesystem routing. Bare paths never inherit a remote authority.
+    OpenLocation {
+        target: String,
+        root: String,
+        control_path: Option<String>,
+        files: Vec<String>,
+    },
     /// Evaluate a plugin script in this editor, on the workspace the caller's
     /// token is bound to (the target window is derived from the token, never
     /// passed in). The server answers with `ServerControl::ScriptResult`

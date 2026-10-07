@@ -144,6 +144,124 @@ impl crate::app::Editor {
     /// this, never-dived windows have `splits == None` and any
     /// cross-window render (e.g. the Orchestrator preview pane's
     /// `WindowEmbed`) draws blank.
+
+    /// Route FC opens by endpoint and root, keeping existing dirty buffers on
+    /// their original authority. A remote placeholder never opens a local path.
+    pub fn fc_open_location(
+        &mut self,
+        target: &str,
+        root: PathBuf,
+        control_path: Option<String>,
+        files: Vec<String>,
+    ) -> Result<(), String> {
+        use crate::services::authority::{
+            RemoteAgentSpec, RemoteTransportSpec, SessionAuthoritySpec,
+        };
+        if !root.is_absolute() || files.iter().any(|p| !std::path::Path::new(p).is_absolute()) {
+            return Err("Editor locations require absolute paths".into());
+        }
+        let remote = target != "-";
+        if remote
+            && (target.is_empty()
+                || target.starts_with('-')
+                || !target
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-@".contains(&c)))
+        {
+            return Err("Invalid SSH target".into());
+        }
+        let matches = |spec: &SessionAuthoritySpec| match spec {
+            SessionAuthoritySpec::Local => !remote,
+            SessionAuthoritySpec::RemoteAgent(agent) => match &agent.transport {
+                RemoteTransportSpec::Ssh { user, host, .. } => {
+                    let name = user
+                        .as_ref()
+                        .map(|u| format!("{u}@{host}"))
+                        .unwrap_or_else(|| host.clone());
+                    remote && name == target
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        let existing = self
+            .windows
+            .iter()
+            .find(|(_, w)| w.root == root && matches(&w.authority_spec))
+            .map(|(id, _)| *id)
+            .or_else(|| {
+                self.dormant_remote
+                    .iter()
+                    .find(|(_, d)| d.root == root && matches(&d.authority_spec))
+                    .map(|(id, _)| *id)
+            });
+        let id = if let Some(id) = existing {
+            self.ensure_dormant_shell(id);
+            if self.preparing_windows.get(&id).is_some_and(|p| p.failed) {
+                if let SessionAuthoritySpec::RemoteAgent(mut agent) =
+                    self.windows[&id].authority_spec.clone()
+                {
+                    agent.window = true;
+                    agent.adopt_window = Some(id.0);
+                    if let Some(p) = self.preparing_windows.get_mut(&id) {
+                        p.failed = false;
+                        p.message = "Connecting over SSH".into();
+                    }
+                    self.start_remote_connect(agent, None, u64::MAX - id.0, false);
+                }
+            }
+            id
+        } else if !remote {
+            let authority = self.local_session_authority(&root);
+            self.create_window_with_authority(
+                root.clone(),
+                root.display().to_string(),
+                std::sync::Arc::new(crate::services::authority::Connection::plain(authority)),
+            )
+        } else {
+            let id = self.open_preparing_window(
+                root.clone(),
+                format!("{target}:{}", root.display()),
+                "Connecting over SSH".into(),
+            );
+            let (user, host) = target
+                .split_once('@')
+                .map(|(u, h)| (Some(u.to_string()), h.to_string()))
+                .unwrap_or((None, target.to_string()));
+            let mut extra_args = vec!["-o".into(), "StrictHostKeyChecking=yes".into()];
+            if let Some(p) = control_path {
+                extra_args.extend(["-o".into(), format!("ControlPath={p}")]);
+            }
+            let spec = RemoteAgentSpec {
+                transport: RemoteTransportSpec::Ssh {
+                    user,
+                    host,
+                    port: None,
+                    identity_file: None,
+                    remote_path: Some(root.display().to_string()),
+                    extra_args,
+                },
+                base_env: vec![],
+                window: true,
+                label: Some(format!("{target}:{}", root.display())),
+                command: None,
+                adopt_window: Some(id.0),
+            };
+            self.windows.get_mut(&id).unwrap().authority_spec =
+                SessionAuthoritySpec::RemoteAgent(spec.clone());
+            self.start_remote_connect(spec, None, u64::MAX - id.0, false);
+            id
+        };
+        self.fc_pending_locations
+            .entry(id)
+            .or_default()
+            .extend(files.into_iter().map(PathBuf::from));
+        self.set_active_window(id);
+        if remote && !self.is_window_preparing(id) {
+            self.reconnect_dormant_session_if_needed(id);
+        }
+        Ok(())
+    }
     pub fn create_window_at(&mut self, root: PathBuf, label: String) -> WindowId {
         self.mark_plugin_snapshot_dirty();
         // One session per directory: reuse an existing window at this

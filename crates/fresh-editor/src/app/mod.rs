@@ -956,6 +956,8 @@ pub struct Editor {
     /// The entry is dropped when the workspace's terminal is finally seeded
     /// into it (via `create_window_with_terminal`'s adopt path), at which
     /// point the window renders as the ordinary session it has become.
+    pub(crate) fc_pending_locations:
+        std::collections::HashMap<fresh_core::WindowId, Vec<std::path::PathBuf>>,
     pub(crate) preparing_windows: std::collections::HashMap<fresh_core::WindowId, PreparingWindow>,
 
     /// Monotonic counter for the next session id. The base session
