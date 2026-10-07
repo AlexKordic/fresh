@@ -1756,6 +1756,11 @@ impl Editor {
                 // ran, and growing a *live* window into this session would
                 // take somebody's workspace away from them.
                 let adopt = adopt.filter(|id| self.preparing_windows.contains_key(id));
+                if let Some(id) = adopt.filter(|id| self.fc_pending_locations.contains_key(id)) {
+                    self.land_fc_remote_window(id, root, label, connection, spec);
+                    self.resolve_remote_attach(request_id);
+                    return;
+                }
                 match self
                     .create_remote_session_window(connection, root, label, command, spec, adopt)
                 {

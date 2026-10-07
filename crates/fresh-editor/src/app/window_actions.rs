@@ -262,6 +262,40 @@ impl crate::app::Editor {
         }
         Ok(())
     }
+    /// FC opens an editing workspace without spawning an unrelated remote shell.
+    pub(crate) fn land_fc_remote_window(
+        &mut self,
+        id: WindowId,
+        root: PathBuf,
+        label: String,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
+        spec: crate::services::authority::SessionAuthoritySpec,
+    ) {
+        let stable_id = self.windows[&id].stable_id.clone();
+        let connection = self.adopt_connection(connection);
+        let mut resources = self.window_resources();
+        resources.fs_manager = std::sync::Arc::new(crate::services::fs::FsManager::new(
+            connection.authority.filesystem.clone(),
+        ));
+        let mut window = Window::new(id, label, root, connection.clone(), resources);
+        window.stable_id = stable_id;
+        window.authority_spec = spec;
+        window.terminal_width = self.terminal_width;
+        window.terminal_height = self.terminal_height;
+        self.windows.insert(id, window);
+        self.preparing_windows.remove(&id);
+        if let Some((buf, state, metadata, event_log, mgr, vs)) =
+            self.build_fresh_layout_if_needed(id)
+        {
+            let w = self.windows.get_mut(&id).unwrap();
+            w.buffers.set_splits((mgr, vs));
+            w.buffers.insert(buf, state);
+            w.buffer_metadata.insert(buf, metadata);
+            w.event_logs.insert(buf, event_log);
+        }
+        self.set_session_connection(id, connection);
+    }
+
     pub fn create_window_at(&mut self, root: PathBuf, label: String) -> WindowId {
         self.mark_plugin_snapshot_dirty();
         // One session per directory: reuse an existing window at this
