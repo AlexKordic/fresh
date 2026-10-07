@@ -89,6 +89,9 @@ pub struct RemoteDirEntry {
     pub mtime: i64,
     #[serde(default)]
     pub mode: u32,
+    /// Effective write access of the remote login, never the local UID.
+    #[serde(default)]
+    pub writable: Option<bool>,
 }
 
 /// File metadata returned by `stat` command
@@ -98,6 +101,9 @@ pub struct RemoteMetadata {
     pub size: u64,
     pub mtime: i64,
     pub mode: u32,
+    /// Effective write access of the remote login, never the local UID.
+    #[serde(default)]
+    pub writable: Option<bool>,
     #[serde(default)]
     pub uid: u32,
     #[serde(default)]

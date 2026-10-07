@@ -168,6 +168,7 @@ def cmd_stat(id, p):
             "mtime": int(st.st_mtime),
             "mode": st.st_mode,
             "uid": st.st_uid,
+            "writable": os.access(path, os.W_OK),
             "gid": st.st_gid,
             "dir": stat.S_ISDIR(st.st_mode),
             "file": stat.S_ISREG(st.st_mode),
@@ -205,6 +206,7 @@ def cmd_ls(id, p):
                     "size": st.st_size,
                     "mtime": int(st.st_mtime),
                     "mode": st.st_mode,
+                    "writable": os.access(entry.path, os.W_OK),
                 }
             )
         except OSError:

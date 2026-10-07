@@ -163,14 +163,12 @@ impl RemoteFileSystem {
         let is_hidden = name.starts_with('.');
         let permissions = FilePermissions::from_mode(rm.mode);
 
-        #[cfg(unix)]
-        let is_readonly = {
-            let (euid, user_groups) =
-                crate::model::filesystem::StdFileSystem::current_user_groups();
-            permissions.is_readonly_for_user(euid, rm.uid, rm.gid, &user_groups)
-        };
-        #[cfg(not(unix))]
-        let is_readonly = permissions.is_readonly();
+        // UID/GID namespaces differ between machines. The agent evaluates
+        // access under the actual remote login (including groups and ACLs).
+        let is_readonly = rm
+            .writable
+            .map(|w| !w)
+            .unwrap_or_else(|| permissions.is_readonly());
 
         let mut meta = FileMetadata::new(rm.size)
             .with_hidden(is_hidden)
@@ -208,7 +206,10 @@ impl RemoteFileSystem {
 
         let is_hidden = re.name.starts_with('.');
         let permissions = FilePermissions::from_mode(re.mode);
-        let is_readonly = permissions.is_readonly();
+        let is_readonly = re
+            .writable
+            .map(|w| !w)
+            .unwrap_or_else(|| permissions.is_readonly());
 
         let mut metadata = FileMetadata::new(re.size)
             .with_hidden(is_hidden)
@@ -1010,23 +1011,24 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_metadata() {
-        // Use the current user's uid/gid so the file appears writable regardless
-        // of which user runs the test (on Unix, is_readonly checks effective user).
-        #[cfg(unix)]
-        let (uid, gid) = {
-            let (euid, groups) = crate::model::filesystem::StdFileSystem::current_user_groups();
-            (euid, *groups.first().unwrap_or(&0u32))
-        };
-        #[cfg(not(unix))]
-        let (uid, gid) = (1000u32, 1000u32);
+    fn remote_write_access_does_not_use_local_uid() {
+        let mut rm: RemoteMetadata = serde_json::from_value(serde_json::json!({"size":1,"mtime":1,"mode":0o100600,"uid":4000000000u32,"gid":4000000000u32,"file":true,"writable":true})).unwrap();
+        assert!(!RemoteFileSystem::convert_metadata(&rm, "private.txt").is_readonly);
+        rm.writable = Some(false);
+        assert!(RemoteFileSystem::convert_metadata(&rm, "private.txt").is_readonly);
+        rm.mode = 0o100666;
+        assert!(RemoteFileSystem::convert_metadata(&rm, "acl-denied.txt").is_readonly);
+    }
 
+    #[test]
+    fn test_convert_metadata() {
         let rm = RemoteMetadata {
             size: 1234,
             mtime: 1700000000,
             mode: 0o644,
-            uid,
-            gid,
+            writable: Some(true),
+            uid: 1000,
+            gid: 1000,
             dir: false,
             file: true,
             link: false,
@@ -1053,6 +1055,7 @@ mod tests {
             size: 100,
             mtime: 1700000000,
             mode: 0o644,
+            writable: Some(true),
         };
 
         let entry = RemoteFileSystem::convert_dir_entry(&re);
