@@ -1457,9 +1457,6 @@ dependencies = [
  "notify",
  "once_cell",
  "open",
- "oxc_allocator",
- "oxc_parser",
- "oxc_span",
  "portable-pty",
  "proptest",
  "pulldown-cmark",
@@ -1608,6 +1605,7 @@ dependencies = [
  "oxc_semantic",
  "oxc_span",
  "oxc_transformer",
+ "serde_json",
 ]
 
 [[package]]
