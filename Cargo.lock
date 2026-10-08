@@ -1408,10 +1408,9 @@ name = "fresh-core"
 version = "0.5.2"
 dependencies = [
  "anyhow",
+ "fresh-js",
  "lsp-types",
  "proptest",
- "rquickjs",
- "rquickjs-serde",
  "schemars",
  "serde",
  "serde_json",
@@ -1563,6 +1562,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fresh-js"
+version = "0.5.2"
+dependencies = [
+ "rquickjs",
+ "rquickjs-serde",
+]
+
+[[package]]
 name = "fresh-languages"
 version = "0.5.2"
 dependencies = [
@@ -1605,6 +1612,7 @@ version = "0.5.2"
 dependencies = [
  "anyhow",
  "fresh-core",
+ "fresh-js",
  "fresh-parser-js",
  "fresh-plugin-api-macros",
  "jsonc-parser",
@@ -1616,7 +1624,6 @@ dependencies = [
  "oxc_parser",
  "oxc_span",
  "rquickjs",
- "rquickjs-serde",
  "serde",
  "serde_json",
  "tokio",
