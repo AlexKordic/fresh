@@ -50,6 +50,12 @@ pub struct ClientHello {
     /// client) — script evaluation is then refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd_token: Option<String>,
+    /// A short-lived File Commander command client (`open-location`,
+    /// `ensure`, `prepare-restart`) rather than a terminal. It never sizes the
+    /// shared grid, so opening a file doesn't briefly shrink the editor a
+    /// native window or terminal is showing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fc_control: bool,
 }
 
 impl ClientHello {
@@ -78,6 +84,7 @@ impl ClientHello {
             cmd_token: std::env::var("FRESH_CMD_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty()),
+            fc_control: false,
         }
     }
 
@@ -112,6 +119,11 @@ pub struct ServerHello {
     pub fc_restart: bool,
     #[serde(default)]
     pub fc_locations: bool,
+    /// The Unix socket this session serves its scene on, for File
+    /// Commander's native front end. `None` when it serves none (a build
+    /// without the `web` feature, or a session FC didn't start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fc_scene: Option<String>,
 }
 
 impl ServerHello {
@@ -123,6 +135,7 @@ impl ServerHello {
             fc_integration: 1,
             fc_restart: true,
             fc_locations: true,
+            fc_scene: None,
         }
     }
 }

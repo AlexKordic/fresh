@@ -52,6 +52,8 @@ fn make_server_config(
         startup_files: Vec::new(),
         #[cfg(feature = "web")]
         web_addr: None,
+        #[cfg(feature = "web")]
+        scene_socket: None,
     }
 }
 

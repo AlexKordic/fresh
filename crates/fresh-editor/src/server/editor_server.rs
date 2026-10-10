@@ -90,6 +90,12 @@ pub struct EditorServerConfig {
     /// the same session, not a second editor. `None` = TUI clients only.
     #[cfg(feature = "web")]
     pub web_addr: Option<String>,
+    /// When set and `web_addr` isn't, the daemon serves the same scene on this
+    /// Unix socket instead of a TCP port: the transport File Commander's
+    /// native front end attaches over. The path is advertised in every
+    /// handshake's `fc_scene`.
+    #[cfg(feature = "web")]
+    pub scene_socket: Option<std::path::PathBuf>,
 }
 
 /// Editor server that manages editor state and client connections
@@ -205,6 +211,9 @@ struct ConnectedClient {
     needs_full_render: bool,
     /// If set, this client is waiting for a --wait completion signal
     wait_id: Option<u64>,
+    /// A File Commander command client (`ClientHello::fc_control`): never
+    /// the client that sizes the session.
+    control_only: bool,
     /// Per-workspace capability token presented in this client's `Hello`
     /// (from `$FRESH_CMD_TOKEN`). Authorizes `RunScript` against the token's
     /// grant; `None` for clients that carry no token.
@@ -723,7 +732,7 @@ impl EditorServer {
     fn recompute_term_size(&mut self) -> bool {
         // `mut` is exercised only by the `web` branch below.
         #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-        let mut fit: Option<TermSize> = self.clients.first().map(|c| c.term_size);
+        let mut fit: Option<TermSize> = self.primary_client().map(|c| c.term_size);
         #[cfg(feature = "web")]
         if let Some((wc, wr)) = self.web.as_ref().and_then(|b| b.wanted_size()) {
             fit = Some(match fit {
@@ -738,6 +747,12 @@ impl EditorServer {
             }
             _ => false,
         }
+    }
+
+    /// The terminal that sizes the session: the first attached client that
+    /// isn't a short-lived File Commander command client.
+    fn primary_client(&self) -> Option<&ConnectedClient> {
+        self.clients.iter().find(|c| !c.control_only)
     }
 
     /// True while a browser is connected to the hosted web bridge.
@@ -762,9 +777,11 @@ impl EditorServer {
     /// (`webui::DEFAULT_SIZE`), refit as soon as a real viewport reports in.
     #[cfg(feature = "web")]
     fn start_web_bridge(&mut self) -> io::Result<()> {
-        let Some(addr) = self.config.web_addr.clone() else {
+        let addr = self.config.web_addr.clone();
+        let socket = self.config.scene_socket.clone();
+        if addr.is_none() && socket.is_none() {
             return Ok(());
-        };
+        }
         if self.editor.is_none() {
             let (cols, rows) = crate::webui::DEFAULT_SIZE;
             self.term_size = TermSize::new(cols, rows);
@@ -777,9 +794,29 @@ impl EditorServer {
         // parity harness that owns its editor, not for a session carrying a
         // recovery log, a restored workspace and attached terminals. Hence
         // `allow_reset: false` (and no file list for it to reopen).
-        let bridge = crate::webui::WebBridge::bind(&addr, editor, &[], false)
-            .map_err(|e| io::Error::other(format!("failed to serve the web UI on {addr}: {e}")))?;
-        tracing::info!("Web UI bridge listening on {}", addr);
+        let bridge = match (addr, socket) {
+            (Some(addr), _) => {
+                let bridge = crate::webui::WebBridge::bind(&addr, editor, &[], false).map_err(|e| {
+                    io::Error::other(format!("failed to serve the web UI on {addr}: {e}"))
+                })?;
+                tracing::info!("Web UI bridge listening on {}", addr);
+                bridge
+            }
+            (None, Some(path)) => {
+                #[cfg(unix)]
+                let bridge = crate::webui::WebBridge::bind_unix(&path, editor).map_err(|e| {
+                    io::Error::other(format!("failed to serve the scene on {}: {e}", path.display()))
+                })?;
+                #[cfg(not(unix))]
+                let bridge = return Err(io::Error::other(format!(
+                    "a scene socket ({}) needs Unix sockets",
+                    path.display()
+                )));
+                tracing::info!("Scene bridge listening on {}", path.display());
+                bridge
+            }
+            (None, None) => return Ok(()),
+        };
         self.web = Some(bridge);
         Ok(())
     }
@@ -1113,7 +1150,16 @@ impl EditorServer {
             crate::workspace::encode_path_for_filename(&self.config.working_dir)
         });
 
-        let server_hello = ServerHello::new(session_id);
+        #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+        let mut server_hello = ServerHello::new(session_id);
+        #[cfg(feature = "web")]
+        {
+            server_hello.fc_scene = self
+                .web
+                .as_ref()
+                .and_then(|b| b.socket_path())
+                .map(|p| p.display().to_string());
+        }
         let response = serde_json::to_string(&ServerControl::Hello(server_hello))
             .map_err(|e| io::Error::other(e.to_string()))?;
         conn.write_control(&response)?;
@@ -1151,6 +1197,7 @@ impl EditorServer {
             input_parser: ClientInputParser::new(),
             needs_full_render: true,
             wait_id: None,
+            control_only: hello.fc_control,
             cmd_token: hello.cmd_token,
         })
     }
@@ -1351,12 +1398,13 @@ impl EditorServer {
                     tracing::warn!("Unexpected Hello from client");
                 }
                 ClientControl::Resize { cols, rows } => {
+                    let primary = self.clients.iter().position(|c| !c.control_only);
                     if let Some(client) = self.clients.get_mut(idx) {
                         client.term_size = TermSize::new(cols, rows);
-                        // The first client sizes the session; the main loop
+                        // The primary client sizes the session; the main loop
                         // recomputes the shared grid from it (mins'd against
                         // any browsers on the hosted web bridge).
-                        if idx == 0 {
+                        if primary == Some(idx) {
                             resize_occurred = true;
                         }
                     }
@@ -1835,6 +1883,8 @@ mod wave_dismiss_tests {
             startup_files: Vec::new(),
             #[cfg(feature = "web")]
             web_addr: None,
+            #[cfg(feature = "web")]
+            scene_socket: None,
         };
         let mut server = EditorServer::new(config).expect("EditorServer::new");
         server.initialize_editor().expect("initialize_editor");

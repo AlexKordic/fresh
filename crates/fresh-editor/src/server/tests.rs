@@ -72,6 +72,8 @@ mod integration_tests {
             startup_files: Vec::new(),
             #[cfg(feature = "web")]
             web_addr: None,
+            #[cfg(feature = "web")]
+            scene_socket: None,
         }
     }
 
@@ -668,6 +670,8 @@ mod integration_tests {
             startup_files: Vec::new(),
             #[cfg(feature = "web")]
             web_addr: None,
+            #[cfg(feature = "web")]
+            scene_socket: None,
         };
 
         let (paths_tx, paths_rx) = mpsc::channel();
@@ -846,6 +850,8 @@ mod integration_tests {
             startup_files: Vec::new(),
             #[cfg(feature = "web")]
             web_addr: None,
+            #[cfg(feature = "web")]
+            scene_socket: None,
         };
 
         let (paths_tx, paths_rx) = mpsc::channel();
@@ -1412,6 +1418,8 @@ mod integration_tests {
             startup_files: Vec::new(),
             #[cfg(feature = "web")]
             web_addr: None,
+            #[cfg(feature = "web")]
+            scene_socket: None,
         };
 
         let dropped_for_thread = dropped.clone();
@@ -1568,6 +1576,7 @@ mod integration_tests {
             session_keepalive: None,
             startup_files: Vec::new(),
             web_addr: Some(format!("127.0.0.1:{port}")),
+            scene_socket: None,
         };
 
         let (paths_tx, paths_rx) = mpsc::channel();
@@ -1653,6 +1662,168 @@ mod integration_tests {
         shutdown_handle.store(true, Ordering::SeqCst);
         drop(server_handle.join());
         drop(socket_paths.cleanup());
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// A File Commander session serves its scene on a Unix socket instead of a
+    /// TCP port (`scene_socket`). The contract:
+    ///
+    ///   1. the socket is owner-only and advertised in every handshake;
+    ///   2. FC's short-lived command clients (`fc_control`) never size the
+    ///      shared grid, while a real terminal still does;
+    ///   3. a `/ws?grid=1` client gets the whole frame as cells in its hello.
+    #[cfg(all(feature = "web", unix))]
+    #[test]
+    fn test_scene_socket_serves_fc_sessions() {
+        use crate::config::Config;
+        use crate::config_io::DirectoryContext;
+        use crate::server::editor_server::{EditorServer, EditorServerConfig};
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
+        fn try_state(path: &std::path::Path) -> Option<serde_json::Value> {
+            let mut stream = UnixStream::connect(path).ok()?;
+            stream
+                .write_all(b"GET /state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .ok()?;
+            let mut raw = String::new();
+            drop(stream.read_to_string(&mut raw));
+            serde_json::from_str(raw.split_once("\r\n\r\n")?.1).ok()
+        }
+
+        fn state_until(
+            path: &std::path::Path,
+            f: impl Fn(&serde_json::Value) -> bool,
+        ) -> serde_json::Value {
+            loop {
+                if let Some(v) = try_state(path) {
+                    if f(&v) {
+                        return v;
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn hello_as(socket_paths: &crate::server::ipc::SocketPaths, size: TermSize, control: bool) -> (ClientConnection, crate::server::protocol::ServerHello) {
+            let conn = ClientConnection::connect(socket_paths).expect("connect client");
+            let mut hello = ClientHello::new(size);
+            hello.fc_control = control;
+            conn.write_control(&serde_json::to_string(&ClientControl::Hello(hello)).unwrap())
+                .unwrap();
+            let response = conn.read_control().unwrap().unwrap();
+            match serde_json::from_str::<ServerControl>(&response).unwrap() {
+                ServerControl::Hello(h) => (conn, h),
+                other => panic!("expected Hello, got {other:?}"),
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("fsc-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let scene_path = temp_dir.join("s.sock");
+        let dir_context = DirectoryContext::for_testing(&temp_dir);
+        let session_name = unique_session_name("scene");
+
+        let server_config = EditorServerConfig {
+            working_dir: temp_dir.clone(),
+            session_name: Some(session_name.clone()),
+            idle_timeout: Some(Duration::from_secs(30)),
+            editor_config: Config::default(),
+            dir_context,
+            plugins_enabled: false,
+            init_enabled: false,
+            orchestrator_mode: false,
+            startup_authority: None,
+            workspace_trust: std::sync::Arc::new(
+                crate::services::workspace_trust::WorkspaceTrust::permissive(),
+            ),
+            env_provider: std::sync::Arc::new(
+                crate::services::env_provider::EnvProvider::inactive(),
+            ),
+            session_keepalive: None,
+            startup_files: Vec::new(),
+            web_addr: None,
+            scene_socket: Some(scene_path.clone()),
+        };
+
+        let (paths_tx, paths_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let server_handle = thread::spawn(move || {
+            let mut server = EditorServer::new(server_config).unwrap();
+            paths_tx.send(server.socket_paths().clone()).unwrap();
+            shutdown_tx.send(server.shutdown_handle()).unwrap();
+            server.run()
+        });
+        let socket_paths = paths_rx.recv().unwrap();
+        let shutdown_handle = shutdown_rx.recv().unwrap();
+
+        // (1) Owner-only, and named in the handshake.
+        let booted = state_until(&scene_path, |v| v["w"].as_u64().is_some());
+        let mode = std::fs::metadata(&scene_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the scene socket must be owner-only");
+        let (control, hello) = hello_as(&socket_paths, TermSize::new(50, 10), true);
+        assert_eq!(
+            hello.fc_scene.as_deref(),
+            Some(scene_path.to_str().unwrap()),
+            "the handshake advertises the scene socket"
+        );
+
+        // (2) A command client leaves the grid alone; a terminal sizes it.
+        thread::sleep(Duration::from_millis(300));
+        let still = state_until(&scene_path, |v| v["w"].as_u64().is_some());
+        assert_eq!(
+            (still["w"].clone(), still["h"].clone()),
+            (booted["w"].clone(), booted["h"].clone()),
+            "an fc_control client must not size the shared grid"
+        );
+        let (terminal, _) = hello_as(&socket_paths, TermSize::new(80, 24), false);
+        state_until(&scene_path, |v| v["w"] == 80 && v["h"] == 24);
+        drop(control);
+
+        // (3) A grid client's hello carries every row of the frame as cells,
+        //     and its panes carry geometry without cells of their own.
+        let mut ws = UnixStream::connect(&scene_path).unwrap();
+        ws.write_all(
+            b"GET /ws?grid=1 HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65536];
+        let frame = loop {
+            let n = ws.read(&mut chunk).unwrap();
+            assert!(n > 0, "the bridge closed the upgrade");
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(head) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let body = &buf[head + 4..];
+            if body.len() < 2 {
+                continue;
+            }
+            let (len, off) = match body[1] & 0x7F {
+                126 if body.len() >= 4 => (u16::from_be_bytes([body[2], body[3]]) as usize, 4),
+                127 if body.len() >= 10 => (u64::from_be_bytes(body[2..10].try_into().unwrap()) as usize, 10),
+                n @ 0..=125 => (n as usize, 2),
+                _ => continue,
+            };
+            if body.len() >= off + len {
+                break body[off..off + len].to_vec();
+            }
+        };
+        let hello: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(hello["type"], "hello");
+        let grid = hello["scene"]["regions"]["grid"].as_array().expect("grid rows");
+        assert_eq!(grid.len(), 24, "one row of cells per terminal row");
+        assert!(hello["scene"]["regions"]["panes"][0]["cells"].is_null());
+
+        drop(ws);
+        drop(terminal);
+        shutdown_handle.store(true, Ordering::SeqCst);
+        drop(server_handle.join());
+        drop(socket_paths.cleanup());
+        assert!(!scene_path.exists(), "the scene socket goes away with the session");
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 }

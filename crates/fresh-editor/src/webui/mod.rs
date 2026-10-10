@@ -92,7 +92,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -127,6 +127,139 @@ pub const DEFAULT_SIZE: (u16, u16) = (140, 44);
 /// behaves identically wherever the binary runs. Editing the frontend
 /// therefore requires a rebuild.
 const INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/webui-index.html"));
+
+/// One connection the bridge serves: a TCP socket (browsers, `fresh --web`) or
+/// a Unix socket (File Commander's native front end, which never opens a TCP
+/// port). Everything above the socket — HTTP assembly, the WebSocket upgrade,
+/// framing, the diff protocol — is shared, so the two transports can't drift.
+enum Conn {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl Conn {
+    fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(s) => s.set_nonblocking(on),
+            #[cfg(unix)]
+            Conn::Unix(s) => s.set_nonblocking(on),
+        }
+    }
+
+    /// Nagle off for TCP; a Unix socket has nothing to turn off.
+    fn set_nodelay(&self) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(s) => s.set_nodelay(true),
+            #[cfg(unix)]
+            Conn::Unix(_) => Ok(()),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(s) => s.set_write_timeout(timeout),
+            #[cfg(unix)]
+            Conn::Unix(s) => s.set_write_timeout(timeout),
+        }
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            Conn::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            Conn::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            Conn::Unix(s) => s.flush(),
+        }
+    }
+}
+
+/// Where the bridge accepts connections. A Unix listener owns its socket file
+/// and removes it when the bridge goes away.
+enum BridgeListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix {
+        listener: std::os::unix::net::UnixListener,
+        path: PathBuf,
+    },
+}
+
+impl BridgeListener {
+    fn accept(&self) -> std::io::Result<Conn> {
+        match self {
+            BridgeListener::Tcp(l) => l.accept().map(|(s, _)| Conn::Tcp(s)),
+            #[cfg(unix)]
+            BridgeListener::Unix { listener, .. } => listener.accept().map(|(s, _)| Conn::Unix(s)),
+        }
+    }
+}
+
+impl Drop for BridgeListener {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let BridgeListener::Unix { path, .. } = self {
+            drop(std::fs::remove_file(path));
+        }
+    }
+}
+
+/// What the connected front end asked the scene to carry — set by a
+/// `configure` message, or by the `/ws` upgrade's query (`?grid=1&menus=native`)
+/// so the hello already has it. One set per bridge: FC's socket serves one app.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneOptions {
+    /// Ship the whole frame as cells, chrome included, as `regions.grid` (one
+    /// array of runs per row, diffed per row). For a front end that draws
+    /// Fresh's own surfaces from cells until it has native ones; the panes then
+    /// carry their geometry but no cells of their own.
+    pub grid: bool,
+    /// The front end shows Fresh's menus in its own menu bar.
+    pub native_menus: bool,
+}
+
+impl SceneOptions {
+    /// Read the options from a `configure` message.
+    fn from_message(v: &Value) -> Self {
+        Self {
+            grid: v.get("grid").and_then(|b| b.as_bool()).unwrap_or(false),
+            native_menus: v.get("nativeMenus").and_then(|b| b.as_bool()).unwrap_or(false),
+        }
+    }
+
+    /// Read the options from the query of a `/ws` request path, if it has one.
+    fn from_ws_path(path: &str) -> Option<Self> {
+        let query = path.strip_prefix("/ws?")?;
+        let mut options = Self::default();
+        for pair in query.split('&') {
+            match pair {
+                "grid=1" => options.grid = true,
+                "menus=native" => options.native_menus = true,
+                _ => {}
+            }
+        }
+        Some(options)
+    }
+}
 
 /// Cap on the clipboard text exposed in the scene (`ClipboardSync`). Anything
 /// larger is truncated at a char boundary — a copy that big is better served
@@ -374,7 +507,9 @@ pub struct BridgePoll {
 /// reports the size its browsers want ([`wanted_size`](Self::wanted_size)),
 /// which the daemon mins against its attached terminals.
 pub struct WebBridge {
-    listener: TcpListener,
+    listener: BridgeListener,
+    /// What the connected front end asked the scene to carry.
+    options: SceneOptions,
     /// Host part of the bind address — only the fallback for the WS-upgrade
     /// Origin check when a request carries no Host header (the check prefers
     /// the request's Host header; see `origin_host_matches`).
@@ -413,7 +548,8 @@ impl WebBridge {
             .unwrap_or(addr)
             .to_string();
         Ok(Self {
-            listener,
+            listener: BridgeListener::Tcp(listener),
+            options: SceneOptions::default(),
             bind_host,
             pending: Vec::new(),
             ws: Vec::new(),
@@ -421,6 +557,59 @@ impl WebBridge {
             files: files.to_vec(),
             allow_reset,
         })
+    }
+
+    /// Bind the bridge on a Unix socket at `path` instead of a TCP port. This
+    /// is how a File Commander session serves its native front end: the socket
+    /// lives in the session's owner-only socket directory and is itself mode
+    /// 0600, so only the user's own processes can reach the editor — there is
+    /// no port for anything else on the machine to find.
+    ///
+    /// Only the daemon binds this path, while holding the session's startup
+    /// lock, so a file already there is a socket left behind by a previous run.
+    #[cfg(unix)]
+    pub fn bind_unix(path: &Path, editor: &Editor) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener: BridgeListener::Unix {
+                listener,
+                path: path.to_path_buf(),
+            },
+            options: SceneOptions::default(),
+            bind_host: "localhost".to_string(),
+            pending: Vec::new(),
+            ws: Vec::new(),
+            clip: ClipboardSync::new(editor),
+            files: Vec::new(),
+            allow_reset: false,
+        })
+    }
+
+    /// Switch to `options`. Turning native menus off gives the active window
+    /// its configured menu row back.
+    fn set_options(&mut self, editor: &mut Editor, options: SceneOptions) {
+        if self.options.native_menus && !options.native_menus {
+            let show = editor.config().editor.show_menu_bar;
+            editor.active_window_mut().menu_bar_visible = show;
+        }
+        self.options = options;
+    }
+
+    /// The Unix socket this bridge listens on, when it listens on one.
+    pub fn socket_path(&self) -> Option<&Path> {
+        match &self.listener {
+            BridgeListener::Tcp(_) => None,
+            #[cfg(unix)]
+            BridgeListener::Unix { path, .. } => Some(path),
+        }
     }
 
     /// True while a browser is connected or a request is mid-assembly. The
@@ -473,9 +662,18 @@ impl WebBridge {
                 Ok(msgs) => {
                     for m in &msgs {
                         let v: Value = serde_json::from_str(m).unwrap_or_else(|_| json!({}));
-                        if v.get("type").and_then(|t| t.as_str()) == Some("resize") {
+                        let kind = v.get("type").and_then(|t| t.as_str());
+                        if kind == Some("resize") {
                             if self.ws[i].note_resize(&v) {
                                 out.resize_dirty = true;
+                            }
+                        } else if kind == Some("configure") {
+                            // Changes what the scene carries, not the editor;
+                            // `mutated` gets the reshaped scene pushed now.
+                            let options = SceneOptions::from_message(&v);
+                            if options != self.options {
+                                self.set_options(editor, options);
+                                out.mutated = true;
                             }
                         } else {
                             inputs.push(v);
@@ -491,15 +689,23 @@ impl WebBridge {
             }
         }
 
+        // A front end's options last as long as it does: when the last client
+        // leaves (or one turns native menus off), the menu row comes back for
+        // the terminals.
+        if self.ws.is_empty() && self.options != SceneOptions::default() {
+            self.set_options(editor, SceneOptions::default());
+            out.mutated = true;
+        }
+
         // 2) Accept new connections into the pending pool (nonblocking).
         loop {
             match self.listener.accept() {
-                Ok((stream, _)) => {
+                Ok(stream) => {
                     // The pump relies on nonblocking reads; a socket we can't
                     // configure is dropped rather than risked stalling the
                     // editor loop. nodelay is folded in — it never fails on a
                     // live socket, and a dead one belongs on the floor anyway.
-                    if stream.set_nonblocking(true).is_err() || stream.set_nodelay(true).is_err() {
+                    if stream.set_nonblocking(true).is_err() || stream.set_nodelay().is_err() {
                         continue;
                     }
                     self.pending.push(PendingConn {
@@ -531,6 +737,11 @@ impl WebBridge {
                 }
                 Pump::Ready(req) => {
                     let conn = self.pending.remove(i);
+                    // A `/ws?…` upgrade names its options up front, so the
+                    // hello it gets already has the scene it wants.
+                    if let Some(options) = SceneOptions::from_ws_path(&req.path) {
+                        self.set_options(editor, options);
+                    }
                     match serve_request(
                         conn.stream,
                         &req,
@@ -541,6 +752,7 @@ impl WebBridge {
                         &mut self.clip,
                         &self.bind_host,
                         self.allow_reset,
+                        self.options,
                     ) {
                         Ok(Served::WsClient(session)) => {
                             let mut session = *session;
@@ -587,7 +799,7 @@ impl WebBridge {
         if self.ws.is_empty() {
             return;
         }
-        let scene = build_scene(editor, cols, rows, &mut self.clip);
+        let scene = build_scene(editor, cols, rows, &mut self.clip, self.options);
         let mut i = 0;
         while i < self.ws.len() {
             if let Err(e) = self.ws[i].push_diff(&scene) {
@@ -751,7 +963,7 @@ impl HttpRequest {
 
 /// A connection whose request bytes are still arriving.
 struct PendingConn {
-    stream: TcpStream,
+    stream: Conn,
     buf: Vec<u8>,
     since: Instant,
 }
@@ -846,7 +1058,7 @@ enum Served {
 /// editor over HTTP (see below).
 #[allow(clippy::too_many_arguments)]
 fn serve_request(
-    mut stream: TcpStream,
+    mut stream: Conn,
     req: &HttpRequest,
     editor: &mut Editor,
     cols: &mut u16,
@@ -855,6 +1067,7 @@ fn serve_request(
     clip: &mut ClipboardSync,
     bind_host: &str,
     allow_reset: bool,
+    options: SceneOptions,
 ) -> Result<Served> {
     // Serve the response blocking for simplicity — but bound the write. `GET /`
     // returns the whole embedded page (~200 KB), so a client that stops reading
@@ -866,12 +1079,12 @@ fn serve_request(
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(HTTP_READ_DEADLINE))?;
     let wants_ws = req.method == "GET"
-        && req.path == "/ws"
+        && (req.path == "/ws" || req.path.starts_with("/ws?"))
         && req
             .header("upgrade")
             .is_some_and(|u| u.to_ascii_lowercase().contains("websocket"));
     if wants_ws {
-        return match upgrade_ws(stream, req, editor, *cols, *rows, clip, bind_host)? {
+        return match upgrade_ws(stream, req, editor, *cols, *rows, clip, bind_host, options)? {
             Some(session) => Ok(Served::WsClient(Box::new(session))),
             None => Ok(Served::Http { mutated: false }),
         };
@@ -906,6 +1119,7 @@ fn serve_request(
         files,
         clip,
         allow_reset,
+        options,
     )?;
     Ok(Served::Http { mutated })
 }
@@ -917,7 +1131,7 @@ fn serve_request(
 /// whether the route may have mutated editor state.
 #[allow(clippy::too_many_arguments)]
 fn handle_http(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     req: &HttpRequest,
     editor: &mut Editor,
     cols: &mut u16,
@@ -925,6 +1139,7 @@ fn handle_http(
     files: &[PathBuf],
     clip: &mut ClipboardSync,
     allow_reset: bool,
+    options: SceneOptions,
 ) -> Result<bool> {
     let body_json = || serde_json::from_slice::<Value>(&req.body).unwrap_or_else(|_| json!({}));
     match (req.method.as_str(), req.path.as_str()) {
@@ -942,7 +1157,7 @@ fn handle_http(
             Ok(false)
         }
         ("GET", "/state") => {
-            let s = tick_scene(editor, *cols, *rows, clip).to_string();
+            let s = tick_scene(editor, *cols, *rows, clip, options).to_string();
             respond(stream, "200 OK", "application/json", s.as_bytes())?;
             Ok(false)
         }
@@ -957,7 +1172,7 @@ fn handle_http(
             | "/resize"),
         ) => {
             apply_message(editor, &p[1..], &body_json(), cols, rows);
-            let s = tick_scene(editor, *cols, *rows, clip).to_string();
+            let s = tick_scene(editor, *cols, *rows, clip, options).to_string();
             respond(stream, "200 OK", "application/json", s.as_bytes())?;
             Ok(true)
         }
@@ -1238,13 +1453,14 @@ fn origin_host_matches(origin: &str, host_header: Option<&str>, bind_host: &str)
 /// request — every client joins (shared-view mirroring, see the module docs).
 #[allow(clippy::too_many_arguments)]
 fn upgrade_ws(
-    mut stream: TcpStream,
+    mut stream: Conn,
     req: &HttpRequest,
     editor: &mut Editor,
     cols: u16,
     rows: u16,
     clip: &mut ClipboardSync,
     bind_host: &str,
+    options: SceneOptions,
 ) -> Result<Option<WsSession>> {
     if let Some(origin) = req.header("origin") {
         if !origin_host_matches(origin, req.header("host"), bind_host) {
@@ -1274,7 +1490,7 @@ fn upgrade_ws(
     stream.flush()?;
     stream.set_nonblocking(true)?;
     let mut session = WsSession::new(stream);
-    let scene = tick_scene(editor, cols, rows, clip);
+    let scene = tick_scene(editor, cols, rows, clip, options);
     session.send_hello(&scene)?;
     Ok(Some(session))
 }
@@ -1383,7 +1599,7 @@ const WS_OUTBUF_CAP: usize = 8 << 20; // 8 MiB
 /// ONLY by this session's hello/push path — HTTP routes build their own full
 /// scenes independently and never touch it.
 struct WsSession {
-    stream: TcpStream,
+    stream: Conn,
     /// Inbound bytes not yet parsed into complete frames.
     inbuf: Vec<u8>,
     /// Encoded outbound frames the socket hasn't accepted yet. Writes are
@@ -1397,6 +1613,8 @@ struct WsSession {
     top: HashMap<&'static str, u64>,
     regions: HashMap<String, u64>,
     panes: Vec<u64>,
+    /// Row fingerprints of `regions.grid`, diffed per row like `panes`.
+    grid: Vec<u64>,
     /// Liveness clock: the last time ANY inbound bytes arrived (input, a pong,
     /// a ping — all count). Refreshed in `drain_messages`; read by `heartbeat`
     /// to reap a peer that has gone silent past `WS_LIVENESS_TIMEOUT`.
@@ -1441,7 +1659,7 @@ fn value_fingerprint(v: &Value) -> u64 {
 const TOP_KEYS: [&str; 5] = ["w", "h", "theme", "clipboard", "windowId"];
 
 impl WsSession {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: Conn) -> Self {
         Self {
             stream,
             inbuf: Vec::new(),
@@ -1452,6 +1670,7 @@ impl WsSession {
             top: HashMap::new(),
             regions: HashMap::new(),
             panes: Vec::new(),
+            grid: Vec::new(),
             last_recv: Instant::now(),
             last_ping: Instant::now(),
             want: None,
@@ -1547,7 +1766,7 @@ impl WsSession {
             .and_then(|r| r.as_object())
             .unwrap_or(&empty);
         for (k, v) in regions {
-            if k == "panes" {
+            if k == "panes" || k == "grid" {
                 continue; // diffed one level deeper below
             }
             let h = value_fingerprint(v);
@@ -1573,6 +1792,23 @@ impl WsSession {
             changed.insert("regions.panes.len".to_string(), json!(new_hashes.len()));
         }
         self.panes = new_hashes;
+        // The full-frame grid (`SceneOptions::grid`) is the biggest unit of
+        // all; typing changes a row or two, so it goes per row.
+        let grid: &[Value] = regions
+            .get("grid")
+            .and_then(|g| g.as_array())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let grid_hashes: Vec<u64> = grid.iter().map(value_fingerprint).collect();
+        for (i, (row, h)) in grid.iter().zip(&grid_hashes).enumerate() {
+            if self.grid.get(i) != Some(h) {
+                changed.insert(format!("regions.grid.{i}"), row.clone());
+            }
+        }
+        if grid_hashes.len() != self.grid.len() {
+            changed.insert("regions.grid.len".to_string(), json!(grid_hashes.len()));
+        }
+        self.grid = grid_hashes;
         changed
     }
 
@@ -1685,7 +1921,7 @@ impl WsSession {
     }
 }
 
-fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
+fn respond(stream: &mut Conn, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
     // No CORS header: the frontend is served from this same origin, so it needs
     // none, and `Access-Control-Allow-Origin: *` would let any site the user
     // visits read `/state` (live buffer contents) cross-origin. Same-origin
@@ -1840,8 +2076,14 @@ fn poll_active(editor: &Editor) -> bool {
 /// clipboard `seq` bumps on actual text changes (hash compare), so it cannot
 /// double-increment no matter which path — `GET /state` or WS push — builds
 /// the scene.
-fn build_scene(editor: &mut Editor, cols: u16, rows: u16, clip: &mut ClipboardSync) -> Value {
-    let mut scene = scene_json(editor, cols, rows);
+fn build_scene(
+    editor: &mut Editor,
+    cols: u16,
+    rows: u16,
+    clip: &mut ClipboardSync,
+    options: SceneOptions,
+) -> Value {
+    let mut scene = scene_json_with(editor, cols, rows, options);
     clip.attach(editor, &mut scene);
     scene
 }
@@ -1849,9 +2091,15 @@ fn build_scene(editor: &mut Editor, cols: u16, rows: u16, clip: &mut ClipboardSy
 /// Tick, then build the browser-facing scene. Called per HTTP request (as
 /// always) and for the WS hello; the WS push loop ticks and builds separately
 /// so an idle tick doesn't pay for a render.
-fn tick_scene(editor: &mut Editor, cols: u16, rows: u16, clip: &mut ClipboardSync) -> Value {
+fn tick_scene(
+    editor: &mut Editor,
+    cols: u16,
+    rows: u16,
+    clip: &mut ClipboardSync,
+    options: SceneOptions,
+) -> Value {
     tick_only(editor);
-    build_scene(editor, cols, rows, clip)
+    build_scene(editor, cols, rows, clip, options)
 }
 
 /// Run one render with chrome kept out of the cells.
@@ -1871,7 +2119,26 @@ fn with_chrome_suppressed<T>(editor: &mut Editor, f: impl FnOnce(&mut Editor) ->
 }
 
 fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
-    let (buf, cursor) = with_chrome_suppressed(editor, |e| render_to_buffer(e, cols, rows));
+    scene_json_with(editor, cols, rows, SceneOptions::default())
+}
+
+fn scene_json_with(editor: &mut Editor, cols: u16, rows: u16, options: SceneOptions) -> Value {
+    // A front end with its own menu bar has no use for Fresh's menu row, so
+    // the frame starts at row 0. Only while no menu is open: a menu opened from
+    // the keyboard (`menu_activate`) still shows itself, the way a hidden bar
+    // auto-shows in the terminal.
+    if options.native_menus && editor.menu_state().active_menu.is_none() {
+        let window = editor.active_window_mut();
+        window.menu_bar_visible = false;
+        window.menu_bar_auto_shown = false;
+    }
+    // A grid client draws Fresh's chrome from cells, so its render keeps the
+    // chrome; everyone else gets pane interiors only and draws chrome natively.
+    let (buf, cursor) = if options.grid {
+        render_to_buffer(editor, cols, rows)
+    } else {
+        with_chrome_suppressed(editor, |e| render_to_buffer(e, cols, rows))
+    };
     let w = buf.area.width;
     let h = buf.area.height;
 
@@ -1954,8 +2221,8 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
                     "buffer": bufid.map(|b| b.0),
                     "content": rect_json(*content_rect),
                     "gutterWidth": gw,
-                    "gutter": if gw > 0 { cells_json(&buf, gutter_rect) } else { Value::Null },
-                    "cells": cells_json(&buf, text_rect),
+                    "gutter": if gw > 0 && !options.grid { cells_json(&buf, gutter_rect) } else { Value::Null },
+                    "cells": if options.grid { Value::Null } else { cells_json(&buf, text_rect) },
                     "tabBar": serde_json::to_value(tb.bar).unwrap_or(Value::Null),
                     "tabs": serde_json::to_value(tb.tabs).unwrap_or_else(|_| json!([])),
                     "vscroll": rect_json(*scrollbar_rect),
@@ -2081,6 +2348,8 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
         "keybindingEditor": keybinding_editor,
         "settings": settings,
         "cursor": cursor.map(|(x, y)| json!({ "x": x, "y": y })),
+        // The whole frame as cells, for a grid client (`SceneOptions::grid`).
+        "grid": if options.grid { cells_json(&buf, buf.area) } else { Value::Null },
         // Pacing hint: when something is animating / an LSP spinner is live /
         // a timer is pending, the server ticks fast (TICK_ACTIVE), otherwise
         // idles (TICK_IDLE, just to pick up async LSP/file events). Kept in
@@ -2127,6 +2396,10 @@ fn apply_key(editor: &mut Editor, v: &Value) {
         "End" => KeyCode::End,
         "PageUp" => KeyCode::PageUp,
         "PageDown" => KeyCode::PageDown,
+        "Insert" => KeyCode::Insert,
+        f if f.len() > 1 && f.starts_with('F') && f[1..].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n)) => {
+            KeyCode::F(f[1..].parse().unwrap_or(1))
+        }
         s if s.chars().count() == 1 => KeyCode::Char(s.chars().next().unwrap()),
         _ => return,
     };
@@ -2194,9 +2467,54 @@ fn apply_key(editor: &mut Editor, v: &Value) {
     if editor.maybe_dismiss_wave_animation(&Event::key(KeyEvent::new(code, mods))) {
         return;
     }
+    // Cmd chords from a macOS front end. Keymaps written for terminals can't
+    // bind Super (no terminal sends it), so Fresh's own `macos-gui` keymap
+    // answers them — Cmd+S saves, Cmd+Z undoes, Cmd+W closes the tab — while
+    // the user's keymap keeps every other key, here and for the terminals
+    // sharing this session.
+    if mods.contains(KeyModifiers::SUPER) {
+        if let Some(action) = super_chord_action(editor, code, mods) {
+            if let Err(e) = editor.handle_action(action) {
+                eprintln!("[webui] action error: {e}");
+            }
+            return;
+        }
+    }
     if let Err(e) = editor.handle_key(code, mods) {
         eprintln!("handle_key error: {e}");
     }
+}
+
+/// The action Fresh's `macos-gui` keymap binds to a Cmd chord in the current
+/// key context, if any. The resolver is built once and rebuilt only when the
+/// user's keymap choice or custom bindings change.
+fn super_chord_action(
+    editor: &mut Editor,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> Option<crate::input::keybindings::Action> {
+    use crate::input::keybindings::KeybindingResolver;
+    use std::cell::RefCell;
+    thread_local! {
+        static RESOLVER: RefCell<Option<(String, KeybindingResolver)>> = const { RefCell::new(None) };
+    }
+    let context = editor.get_key_context();
+    let config = editor.config();
+    let stamp = format!(
+        "{}:{}",
+        config.active_keybinding_map.0,
+        serde_json::to_string(&config.keybindings).unwrap_or_default()
+    );
+    let event = KeyEvent::new(code, mods);
+    RESOLVER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(s, _)| *s != stamp) {
+            let mut gui = config.clone();
+            gui.active_keybinding_map = config::KeybindingMapName("macos-gui".to_string());
+            *slot = Some((stamp, KeybindingResolver::new(&gui)));
+        }
+        slot.as_ref().and_then(|(_, r)| r.explicit_binding(&event, &context))
+    })
 }
 
 /// Forward a browser mouse/wheel event to the real `Editor::handle_mouse` at
@@ -2358,8 +2676,33 @@ fn indexed_css(i: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        digit_row_char, host_only, origin_host_matches, try_parse_request, HTTP_REQUEST_CAP,
+        digit_row_char, host_only, origin_host_matches, try_parse_request, SceneOptions,
+        HTTP_REQUEST_CAP,
     };
+
+    #[test]
+    fn scene_options_come_from_the_upgrade_query_or_a_message() {
+        assert_eq!(SceneOptions::from_ws_path("/ws"), None);
+        assert_eq!(
+            SceneOptions::from_ws_path("/ws?grid=1&menus=native"),
+            Some(SceneOptions {
+                grid: true,
+                native_menus: true
+            })
+        );
+        assert_eq!(
+            SceneOptions::from_ws_path("/ws?other=2"),
+            Some(SceneOptions::default())
+        );
+        let message = serde_json::json!({"type": "configure", "grid": true});
+        assert_eq!(
+            SceneOptions::from_message(&message),
+            SceneOptions {
+                grid: true,
+                native_menus: false
+            }
+        );
+    }
 
     #[test]
     fn digit_row_is_recovered_from_the_physical_key() {

@@ -241,6 +241,9 @@ struct Args {
     kill: Option<Option<String>>,
     prepare_restart: Option<Vec<String>>,
     open_location: Option<Vec<String>>,
+    /// `--cmd session ensure NAME`: start File Commander's session if needed
+    /// and report where it serves its scene.
+    ensure_session: Option<Vec<String>>,
     /// Open files in a daemon without attaching (session_name, files, wait)
     open_files_in_session: Option<(Option<String>, Vec<String>, bool)>,
     /// Launch in GUI mode
@@ -268,6 +271,14 @@ impl From<Cli> for Args {
         let prepare_restart = if cli.cmd.len() >= 2
             && matches!(cli.cmd[0].as_str(), "session" | "daemon")
             && cli.cmd[1] == "prepare-restart"
+        {
+            Some(cli.cmd[2..].to_vec())
+        } else {
+            None
+        };
+        let ensure_session = if cli.cmd.len() >= 2
+            && matches!(cli.cmd[0].as_str(), "session" | "daemon")
+            && cli.cmd[1] == "ensure"
         {
             Some(cli.cmd[2..].to_vec())
         } else {
@@ -340,7 +351,7 @@ impl From<Cli> for Args {
             // Parse command from --cmd arguments
             let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
             match cmd_args.as_slice() {
-                ["session" | "daemon", "prepare-restart" | "open-location", ..] => {
+                ["session" | "daemon", "prepare-restart" | "open-location" | "ensure", ..] => {
                     (false, None, false, None, false, false, None, vec![], None)
                 }
                 // Daemon commands. `daemon` is the current term; `session`
@@ -609,6 +620,7 @@ impl From<Cli> for Args {
             session_name,
             kill,
             prepare_restart,
+            ensure_session,
             open_location,
             open_files_in_session,
             #[cfg(feature = "gui")]
@@ -3127,9 +3139,9 @@ fn open_location_command(values: &[String], args: &Args) -> AnyhowResult<()> {
     }
     drop(lock);
     let conn = ClientConnection::connect(&paths)?;
-    conn.write_control(&serde_json::to_string(&ClientControl::Hello(
-        ClientHello::new(TermSize::new(120, 30)),
-    ))?)?;
+    let mut hello = ClientHello::new(TermSize::new(120, 30));
+    hello.fc_control = true;
+    conn.write_control(&serde_json::to_string(&ClientControl::Hello(hello))?)?;
     let response = conn
         .read_control_timeout(Duration::from_secs(10))?
         .ok_or_else(|| anyhow::anyhow!("Editor closed location handshake"))?;
@@ -3159,6 +3171,59 @@ fn open_location_command(values: &[String], args: &Args) -> AnyhowResult<()> {
         ),
         _ => anyhow::bail!("Unexpected editor location response"),
     }
+}
+
+/// Start one FC backend if it isn't running, without routing a workspace or
+/// opening files, and print where it serves its scene:
+/// `{"scene":"<socket>"|null,"pid":N}`. `scene` is null when the running
+/// backend has no scene channel (a build without the `web` feature, or one
+/// started before it had one); FC then attaches a terminal instead.
+fn ensure_session_command(values: &[String], args: &Args) -> AnyhowResult<()> {
+    use fresh::server::ipc::ClientConnection;
+    use fresh::server::protocol::{ClientControl, ClientHello, ServerControl, TermSize};
+    use std::time::Duration;
+    anyhow::ensure!(
+        values.len() == 1,
+        "Usage: fresh --cmd session ensure NAME"
+    );
+    let name = &values[0];
+    anyhow::ensure!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
+        "Invalid session name"
+    );
+    let paths = SocketPaths::for_session_name(name)?;
+    let lock = lock_daemon_startup(&paths)?;
+    paths.cleanup_if_stale();
+    if !paths.is_server_alive() {
+        let pid = fresh::server::spawn_server_detached(&fresh::server::DaemonSpawn {
+            session_name: Some(name),
+            locale: args.locale.as_deref(),
+            config: args.config.as_deref(),
+            ..Default::default()
+        })?;
+        wait_for_spawned_daemon(&paths, pid)?;
+    }
+    drop(lock);
+    let conn = ClientConnection::connect(&paths)?;
+    let mut hello = ClientHello::new(TermSize::new(120, 30));
+    hello.fc_control = true;
+    conn.write_control(&serde_json::to_string(&ClientControl::Hello(hello))?)?;
+    let response = conn
+        .read_control_timeout(Duration::from_secs(10))?
+        .ok_or_else(|| anyhow::anyhow!("Editor closed the handshake"))?;
+    let hello = match serde_json::from_str::<ServerControl>(&response)? {
+        ServerControl::Hello(hello) => hello,
+        ServerControl::Error { message } => anyhow::bail!("{message}"),
+        ServerControl::VersionMismatch(m) => anyhow::bail!("{}", m.message),
+        _ => anyhow::bail!("Unexpected editor handshake"),
+    };
+    anyhow::ensure!(hello.session_id == *name, "Editor identity changed; try again");
+    let pid = paths.read_pid()?;
+    println!("{}", serde_json::json!({ "scene": hello.fc_scene, "pid": pid }));
+    Ok(())
 }
 
 fn prepare_restart_command(args: &[String]) -> AnyhowResult<bool> {
@@ -3195,6 +3260,7 @@ fn prepare_restart_command(args: &[String]) -> AnyhowResult<bool> {
         let conn = ClientConnection::connect(&paths)?;
         let mut hello = ClientHello::new(TermSize::new(120, 30));
         hello.protocol_version = protocol;
+        hello.fc_control = true;
         conn.write_control(&serde_json::to_string(&ClientControl::Hello(hello))?)?;
         let response = conn
             .read_control_timeout(Duration::from_secs(10))?
@@ -3439,6 +3505,20 @@ fn log_spawned_daemon(pid: u32) {
 /// editor's default level into `fresh-server-<PID>.log`; a foreground `--web`
 /// would flood the user's terminal with it, so it logs at `warn` and skips the
 /// boot chatter. `RUST_LOG` still overrides either.
+/// Where a File Commander session serves its scene: beside the session's own
+/// sockets, in the owner-only socket directory. Only a session an FC client
+/// started (`FRESH_FC_DATA_DIR`, set by `spawn_server_detached`) gets one, and
+/// never alongside `--web`, which serves the scene over TCP instead.
+#[cfg(feature = "web")]
+fn fc_scene_socket(args: &Args, web_addr: Option<&str>) -> Option<std::path::PathBuf> {
+    if web_addr.is_some() || std::env::var_os("FRESH_FC_DATA_DIR").is_none() {
+        return None;
+    }
+    let name = args.session_name.as_deref()?;
+    let paths = SocketPaths::for_session_name(name).ok()?;
+    Some(paths.pid.with_extension("scene.sock"))
+}
+
 fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()> {
     use fresh::server::{EditorServer, EditorServerConfig};
 
@@ -3604,6 +3684,8 @@ fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()>
         startup_files,
         #[cfg(feature = "web")]
         web_addr: web_addr.clone(),
+        #[cfg(feature = "web")]
+        scene_socket: fc_scene_socket(args, web_addr.as_deref()),
     };
 
     boot!("[server] Creating EditorServer...");
@@ -6037,6 +6119,13 @@ fn run_if_subcommand(
     }
     if let Some(ref location_args) = args.open_location {
         return Some(open_location_command(location_args, args));
+    }
+    if let Some(ref ensure_args) = args.ensure_session {
+        if let Err(error) = ensure_session_command(ensure_args, args) {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return Some(Ok(()));
     }
     if let Some(ref restart_args) = args.prepare_restart {
         // Expected operational failures are a concise diagnostic, not an
