@@ -466,7 +466,9 @@ impl EditorServer {
             // quit the session, and folded into `needs_render` so its effect
             // is broadcast to the attached terminals in this same pass.
             #[cfg(feature = "web")]
-            if self.poll_web()? {
+            let web_input = self.poll_web()?;
+            #[cfg(feature = "web")]
+            if web_input {
                 needs_render = true;
             }
 
@@ -664,11 +666,15 @@ impl EditorServer {
             // the same `needs_render` signal keeps the two views in step;
             // `web_dirty` remembers a frame that fell inside the window so the
             // last keystroke of a burst still lands.
+            //
+            // Input from a browser or the native front end is the exception:
+            // what it changed is pushed in this same pass, so typing answers
+            // with the next frame rather than the next 40 ms slot.
             #[cfg(feature = "web")]
             {
                 const WEB_PUSH_INTERVAL: Duration = Duration::from_millis(40);
                 web_dirty |= needs_render;
-                if web_dirty && last_web_push.elapsed() >= WEB_PUSH_INTERVAL {
+                if web_dirty && (web_input || last_web_push.elapsed() >= WEB_PUSH_INTERVAL) {
                     self.push_web_scene();
                     last_web_push = Instant::now();
                     web_dirty = false;
@@ -699,6 +705,11 @@ impl EditorServer {
                         .saturating_duration_since(Instant::now())
                         .max(until_frame),
                 );
+            }
+            // A connected browser or native window is waiting on its input,
+            // so poll for it quickly (nonblocking reads; idle CPU stays near 0).
+            if self.web_busy() {
+                wait = wait.min(Duration::from_millis(3));
             }
             std::thread::sleep(wait.max(Duration::from_millis(1)));
         }
