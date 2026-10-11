@@ -268,14 +268,28 @@ pub struct SceneOptions {
     /// long building and diffing took, the bytes of earlier frames still queued
     /// ahead of it, wheel lines still owed, the top line.
     pub telemetry: bool,
+    /// The client applies `regions.grid.copy`: grid rows it already has,
+    /// named by where they were in its previous frame. A scroll then sends
+    /// only the rows that came into view.
+    pub row_copies: bool,
 }
 
 /// What a frame's telemetry reports about building the scene it came from.
 #[derive(Clone, Copy, Debug)]
 struct FrameTiming {
     build_ms: f64,
+    times: SceneTimes,
     owed: u32,
     top: usize,
+}
+
+/// Where part of building a scene went, for telemetry: rendering the editor
+/// into cells, and hashing the grid's rows (`GridFrame`; a row's runs are
+/// built when it is sent, in the diff).
+#[derive(Clone, Copy, Debug, Default)]
+struct SceneTimes {
+    render_ms: f64,
+    grid_ms: f64,
 }
 
 impl SceneOptions {
@@ -285,6 +299,7 @@ impl SceneOptions {
             grid: v.get("grid").and_then(|b| b.as_bool()).unwrap_or(false),
             native_menus: v.get("nativeMenus").and_then(|b| b.as_bool()).unwrap_or(false),
             telemetry: v.get("telemetry").and_then(|b| b.as_bool()).unwrap_or(false),
+            row_copies: v.get("rowCopies").and_then(|b| b.as_bool()).unwrap_or(false),
         }
     }
 
@@ -297,6 +312,7 @@ impl SceneOptions {
                 "grid=1" => options.grid = true,
                 "menus=native" => options.native_menus = true,
                 "telemetry=1" => options.telemetry = true,
+                "copies=1" => options.row_copies = true,
                 _ => {}
             }
         }
@@ -862,15 +878,17 @@ impl WebBridge {
             return true;
         }
         let started = Instant::now();
-        let scene = build_scene(editor, cols, rows, &mut self.clip, self.options);
+        let mut times = SceneTimes::default();
+        let (scene, grid) = build_scene(editor, cols, rows, &mut self.clip, self.options, &mut times);
         let timing = self.options.telemetry.then(|| FrameTiming {
             build_ms: started.elapsed().as_secs_f64() * 1000.0,
+            times,
             owed: editor.pending_wheel_lines(),
             top: editor.active_top_line(),
         });
         let mut i = 0;
         while i < self.ws.len() {
-            if let Err(e) = self.ws[i].push_diff(&scene, timing) {
+            if let Err(e) = self.ws[i].push_diff(&scene, grid.as_ref(), timing, self.options.row_copies) {
                 eprintln!("[webui] ws push failed, dropping client: {e}");
                 self.ws.remove(i);
             } else {
@@ -1564,8 +1582,9 @@ fn upgrade_ws(
     stream.flush()?;
     stream.set_nonblocking(true)?;
     let mut session = WsSession::new(stream);
-    let scene = tick_scene(editor, cols, rows, clip, options);
-    session.send_hello(&scene)?;
+    tick_only(editor);
+    let (scene, grid) = build_scene(editor, cols, rows, clip, options, &mut SceneTimes::default());
+    session.send_hello(&scene, grid.as_ref())?;
     Ok(Some(session))
 }
 
@@ -1753,6 +1772,37 @@ fn value_fingerprint(v: &Value) -> u64 {
     hw.0.finish()
 }
 
+/// The grid rows that changed but that the client already has at another
+/// index of its previous frame, as `[to, from, count]` runs: rows `to..to+count`
+/// become its previous rows `from..from+count`. A scroll moves rows rather
+/// than changing them, so this names nearly all of them in one run, and only
+/// the rows that came into view (and any whose content changed, such as a
+/// scrollbar's) are sent in full. The client applies every run to its
+/// previous rows before the rows sent in full.
+fn grid_copies(old: &[u64], new: &[u64]) -> Vec<[usize; 3]> {
+    let mut at: HashMap<u64, usize> = HashMap::with_capacity(old.len());
+    for (i, h) in old.iter().enumerate() {
+        at.entry(*h).or_insert(i);
+    }
+    let mut runs: Vec<[usize; 3]> = Vec::new();
+    for (i, h) in new.iter().enumerate() {
+        if old.get(i) == Some(h) {
+            continue;
+        }
+        // Rows moved together stay together: extend the run before this row.
+        if let Some(run) = runs.last_mut() {
+            if run[0] + run[2] == i && old.get(run[1] + run[2]) == Some(h) {
+                run[2] += 1;
+                continue;
+            }
+        }
+        if let Some(&from) = at.get(h) {
+            runs.push([i, from, 1]);
+        }
+    }
+    runs
+}
+
 /// Top-level scene keys diffed as single units ("regions" is handled per key).
 const TOP_KEYS: [&str; 5] = ["w", "h", "theme", "clipboard", "windowId"];
 
@@ -1846,10 +1896,12 @@ impl WsSession {
     /// per connection; seeds the diff cache and restarts `seq`. `acks` tells
     /// the client it may report each message it applied (`applied`), and then
     /// gets the newest scene rather than every frame when it falls behind.
-    fn send_hello(&mut self, scene: &Value) -> std::io::Result<()> {
+    fn send_hello(&mut self, scene: &Value, grid: Option<&GridFrame>) -> std::io::Result<()> {
         self.seq = 0;
-        self.diff(scene); // seed the cache; the hello carries the full scene
-        let msg = json!({ "type": "hello", "seq": 0, "scene": scene, "acks": true }).to_string();
+        self.diff(scene, grid, false); // seed the cache; the hello carries the full scene
+        let mut msg = json!({ "type": "hello", "seq": 0, "scene": scene, "acks": true });
+        GridFrame::embed(grid, &mut msg["scene"]);
+        let msg = msg.to_string();
         self.enqueue(0x1, msg.as_bytes());
         self.flush()
     }
@@ -1860,14 +1912,20 @@ impl WsSession {
     /// A client too far behind (`ready`) gets nothing now: the cache keeps
     /// what it last sent, and the frame after it catches up carries
     /// everything that changed since.
-    fn push_diff(&mut self, scene: &Value, timing: Option<FrameTiming>) -> std::io::Result<()> {
+    fn push_diff(
+        &mut self,
+        scene: &Value,
+        grid: Option<&GridFrame>,
+        timing: Option<FrameTiming>,
+        row_copies: bool,
+    ) -> std::io::Result<()> {
         if !self.ready() {
             self.held = true;
             return self.flush();
         }
         self.held = false;
         let started = Instant::now();
-        let changed = self.diff(scene);
+        let changed = self.diff(scene, grid, row_copies);
         if changed.is_empty() {
             return self.flush(); // still drain any backlog from earlier frames
         }
@@ -1884,6 +1942,9 @@ impl WsSession {
                 // Earlier frames sent that the client had not applied yet.
                 "ahead": ahead,
                 "build_ms": timing.build_ms,
+                // Of building: rendering the editor, and hashing the grid's rows.
+                "render_ms": timing.times.render_ms,
+                "grid_ms": timing.times.grid_ms,
                 "diff_ms": started.elapsed().as_secs_f64() * 1000.0,
                 "owed": timing.owed,
                 "top": timing.top,
@@ -1896,8 +1957,15 @@ impl WsSession {
 
     /// Compute the changed-paths map and update the cache. A changed value
     /// replaces the previous one wholesale (null is a legal value — regions
-    /// are frequently null).
-    fn diff(&mut self, scene: &Value) -> serde_json::Map<String, Value> {
+    /// are frequently null). Grid rows come from `grid` and are compared by
+    /// their cells' hashes; with `row_copies`, a row the client already has at
+    /// another index is named by that index instead (`grid_copies`).
+    fn diff(
+        &mut self,
+        scene: &Value,
+        grid: Option<&GridFrame>,
+        row_copies: bool,
+    ) -> serde_json::Map<String, Value> {
         let mut changed = serde_json::Map::new();
         for k in TOP_KEYS {
             let v = scene.get(k).cloned().unwrap_or(Value::Null);
@@ -1940,17 +2008,24 @@ impl WsSession {
         }
         self.panes = new_hashes;
         // The full-frame grid (`SceneOptions::grid`) is the biggest unit of
-        // all; typing changes a row or two, so it goes per row.
-        let grid: &[Value] = regions
-            .get("grid")
-            .and_then(|g| g.as_array())
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        let grid_hashes: Vec<u64> = grid.iter().map(value_fingerprint).collect();
-        for (i, (row, h)) in grid.iter().zip(&grid_hashes).enumerate() {
-            if self.grid.get(i) != Some(h) {
-                changed.insert(format!("regions.grid.{i}"), row.clone());
+        // all; typing changes a row or two, so it goes per row, and a row's
+        // runs are built only when it is sent.
+        let grid_hashes: Vec<u64> = grid.map(|g| g.hashes.clone()).unwrap_or_default();
+        let copies = if row_copies {
+            grid_copies(&self.grid, &grid_hashes)
+        } else {
+            Vec::new()
+        };
+        let copied = |i: usize| copies.iter().any(|&[to, _, n]| (to..to + n).contains(&i));
+        if let Some(grid) = grid {
+            for (i, h) in grid_hashes.iter().enumerate() {
+                if self.grid.get(i) != Some(h) && !copied(i) {
+                    changed.insert(format!("regions.grid.{i}"), grid.row(i));
+                }
             }
+        }
+        if !copies.is_empty() {
+            changed.insert("regions.grid.copy".to_string(), json!(copies));
         }
         if grid_hashes.len() != self.grid.len() {
             changed.insert("regions.grid.len".to_string(), json!(grid_hashes.len()));
@@ -2147,6 +2222,80 @@ fn scrollbar_markers_json(editor: &Editor, leaf: crate::model::event::LeafId) ->
 }
 
 fn cells_json(buf: &Buffer, r: Rect) -> Value {
+    runs_json(buf, r, false)
+}
+
+/// The whole frame for a grid client (`SceneOptions::grid`), kept as cells
+/// until a row is sent: a scroll sends a dozen of its rows, so building runs
+/// for all of them would be wasted. Rows are told apart by a hash of their
+/// cells, which the clients' diff caches keep. A row's runs are as
+/// `cells_json` makes them, except that a run leaves out what is off — `b`,
+/// `i`, `u`, `r` when false, `fg` and `bg` when the terminal default — which
+/// halves a typical row.
+struct GridFrame {
+    buf: Buffer,
+    hashes: Vec<u64>,
+}
+
+impl GridFrame {
+    fn new(buf: Buffer) -> Self {
+        use std::hash::{Hash, Hasher};
+        /// A row's cells as bytes, hashed in one pass: hashing each cell's
+        /// fields one by one costs a millisecond for a large grid.
+        struct RowBytes(Vec<u8>);
+        impl Hasher for RowBytes {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
+            fn finish(&self) -> u64 {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                hasher.write(&self.0);
+                hasher.finish()
+            }
+        }
+        let area = buf.area;
+        let mut row = RowBytes(Vec::with_capacity(area.width as usize * 32));
+        let hashes = (area.y..area.y.saturating_add(area.height))
+            .map(|y| {
+                row.0.clear();
+                for x in area.x..area.x.saturating_add(area.width) {
+                    if let Some(cell) = buf.cell(Position::new(x, y)) {
+                        cell.symbol().hash(&mut row);
+                        cell.fg.hash(&mut row);
+                        cell.bg.hash(&mut row);
+                        cell.modifier.hash(&mut row);
+                    }
+                }
+                row.finish()
+            })
+            .collect();
+        Self { buf, hashes }
+    }
+
+    /// Row `i`'s runs.
+    fn row(&self, i: usize) -> Value {
+        let area = self.buf.area;
+        let rect = Rect::new(area.x, area.y + i as u16, area.width, 1);
+        match runs_json(&self.buf, rect, true) {
+            Value::Array(mut rows) if !rows.is_empty() => rows.swap_remove(0),
+            _ => json!([]),
+        }
+    }
+
+    /// Every row's runs, for a scene sent whole.
+    fn rows(&self) -> Value {
+        runs_json(&self.buf, self.buf.area, true)
+    }
+
+    /// Put every row into `scene` as `regions.grid`.
+    fn embed(grid: Option<&GridFrame>, scene: &mut Value) {
+        if let (Some(grid), Some(regions)) = (grid, scene.get_mut("regions")) {
+            regions["grid"] = grid.rows();
+        }
+    }
+}
+
+fn runs_json(buf: &Buffer, r: Rect, compact: bool) -> Value {
     let mut rows = Vec::with_capacity(r.height as usize);
     for y in r.y..r.y.saturating_add(r.height) {
         let mut runs: Vec<Value> = Vec::new();
@@ -2160,14 +2309,35 @@ fn cells_json(buf: &Buffer, r: Rect) -> Value {
                      bg: &Option<String>,
                      m: Modifier| {
             if !text.is_empty() {
-                runs.push(json!({
-                    "t": text,
-                    "fg": fg, "bg": bg,
-                    "b": m.contains(Modifier::BOLD),
-                    "i": m.contains(Modifier::ITALIC),
-                    "u": m.contains(Modifier::UNDERLINED),
-                    "r": m.contains(Modifier::REVERSED),
-                }));
+                if compact {
+                    let mut run = serde_json::Map::new();
+                    run.insert("t".into(), Value::String(std::mem::take(text)));
+                    for (key, color) in [("fg", fg), ("bg", bg)] {
+                        if let Some(color) = color {
+                            run.insert(key.into(), Value::String(color.clone()));
+                        }
+                    }
+                    for (key, flag) in [
+                        ("b", Modifier::BOLD),
+                        ("i", Modifier::ITALIC),
+                        ("u", Modifier::UNDERLINED),
+                        ("r", Modifier::REVERSED),
+                    ] {
+                        if m.contains(flag) {
+                            run.insert(key.into(), Value::Bool(true));
+                        }
+                    }
+                    runs.push(Value::Object(run));
+                } else {
+                    runs.push(json!({
+                        "t": text,
+                        "fg": fg, "bg": bg,
+                        "b": m.contains(Modifier::BOLD),
+                        "i": m.contains(Modifier::ITALIC),
+                        "u": m.contains(Modifier::UNDERLINED),
+                        "r": m.contains(Modifier::REVERSED),
+                    }));
+                }
                 text.clear();
             }
         };
@@ -2229,15 +2399,16 @@ fn build_scene(
     rows: u16,
     clip: &mut ClipboardSync,
     options: SceneOptions,
-) -> Value {
-    let mut scene = scene_json_with(editor, cols, rows, options);
+    times: &mut SceneTimes,
+) -> (Value, Option<GridFrame>) {
+    let (mut scene, grid) = scene_parts(editor, cols, rows, options, times);
     clip.attach(editor, &mut scene);
-    scene
+    (scene, grid)
 }
 
-/// Tick, then build the browser-facing scene. Called per HTTP request (as
-/// always) and for the WS hello; the WS push loop ticks and builds separately
-/// so an idle tick doesn't pay for a render.
+/// Tick, then build the browser-facing scene, whole. Called per HTTP request
+/// (as always); the WS hello and push loop build their own so an idle tick
+/// doesn't pay for a render and a grid goes out row by row.
 fn tick_scene(
     editor: &mut Editor,
     cols: u16,
@@ -2246,7 +2417,9 @@ fn tick_scene(
     options: SceneOptions,
 ) -> Value {
     tick_only(editor);
-    build_scene(editor, cols, rows, clip, options)
+    let (mut scene, grid) = build_scene(editor, cols, rows, clip, options, &mut SceneTimes::default());
+    GridFrame::embed(grid.as_ref(), &mut scene);
+    scene
 }
 
 /// Run one render with chrome kept out of the cells.
@@ -2266,10 +2439,19 @@ fn with_chrome_suppressed<T>(editor: &mut Editor, f: impl FnOnce(&mut Editor) ->
 }
 
 fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
-    scene_json_with(editor, cols, rows, SceneOptions::default())
+    scene_parts(editor, cols, rows, SceneOptions::default(), &mut SceneTimes::default()).0
 }
 
-fn scene_json_with(editor: &mut Editor, cols: u16, rows: u16, options: SceneOptions) -> Value {
+/// The scene, and for a grid client its cells (`SceneOptions::grid`), which
+/// the scene's `regions.grid` leaves out: frames send only the rows a client
+/// lacks, and a whole scene puts them all in (`GridFrame::embed`).
+fn scene_parts(
+    editor: &mut Editor,
+    cols: u16,
+    rows: u16,
+    options: SceneOptions,
+    times: &mut SceneTimes,
+) -> (Value, Option<GridFrame>) {
     // A front end with its own menu bar has no use for Fresh's menu row, so
     // the frame starts at row 0. Only while no menu is open: a menu opened from
     // the keyboard (`menu_activate`) still shows itself, the way a hidden bar
@@ -2281,11 +2463,13 @@ fn scene_json_with(editor: &mut Editor, cols: u16, rows: u16, options: SceneOpti
     }
     // A grid client draws Fresh's chrome from cells, so its render keeps the
     // chrome; everyone else gets pane interiors only and draws chrome natively.
+    let started = Instant::now();
     let (buf, cursor) = if options.grid {
         render_to_buffer(editor, cols, rows)
     } else {
         with_chrome_suppressed(editor, |e| render_to_buffer(e, cols, rows))
     };
+    times.render_ms = started.elapsed().as_secs_f64() * 1000.0;
     let w = buf.area.width;
     let h = buf.area.height;
 
@@ -2495,8 +2679,9 @@ fn scene_json_with(editor: &mut Editor, cols: u16, rows: u16, options: SceneOpti
         "keybindingEditor": keybinding_editor,
         "settings": settings,
         "cursor": cursor.map(|(x, y)| json!({ "x": x, "y": y })),
-        // The whole frame as cells, for a grid client (`SceneOptions::grid`).
-        "grid": if options.grid { cells_json(&buf, buf.area) } else { Value::Null },
+        // The whole frame as cells, for a grid client (`SceneOptions::grid`):
+        // filled in from the `GridFrame` when the scene goes out whole.
+        "grid": Value::Null,
         // Pacing hint: when something is animating / an LSP spinner is live /
         // a timer is pending, the server ticks fast (TICK_ACTIVE), otherwise
         // idles (TICK_IDLE, just to pick up async LSP/file events). Kept in
@@ -2508,7 +2693,11 @@ fn scene_json_with(editor: &mut Editor, cols: u16, rows: u16, options: SceneOpti
     // live-switch: everything changes at once) from an in-place layout change
     // (explorer toggle) — the former gets a hard cut, not layout motion.
     let window_id = editor.active_window.0;
-    json!({ "w": w, "h": h, "windowId": window_id, "regions": regions, "theme": theme })
+    let scene = json!({ "w": w, "h": h, "windowId": window_id, "regions": regions, "theme": theme });
+    let started = Instant::now();
+    let grid = options.grid.then(|| GridFrame::new(buf));
+    times.grid_ms = started.elapsed().as_secs_f64() * 1000.0;
+    (scene, grid)
 }
 
 /// The digit a browser's physical `code` names — `"Digit1"` → `'1'`. Every
@@ -2853,25 +3042,25 @@ mod tests {
     #[test]
     fn frames_wait_for_a_client_that_reports_what_it_applied() {
         let (mut session, _client) = session();
-        session.send_hello(&scene(0)).unwrap();
+        session.send_hello(&scene(0), None).unwrap();
         // A client that never reports gets every frame.
         for n in 1..=4 {
-            session.push_diff(&scene(n), None).unwrap();
+            session.push_diff(&scene(n), None, None, false).unwrap();
         }
         assert_eq!(session.seq, 4);
         // Once it reports, at most FRAMES_AHEAD frames go out unapplied.
         assert!(!session.note_applied(&json!({ "type": "applied", "seq": 4 })));
         for n in 5..=9 {
-            session.push_diff(&scene(n), None).unwrap();
+            session.push_diff(&scene(n), None, None, false).unwrap();
         }
         assert_eq!(session.seq, 4 + FRAMES_AHEAD);
         assert!(session.held);
         // Catching up owes it one frame, and that frame has the newest scene.
         assert!(session.note_applied(&json!({ "type": "applied", "seq": 4 + FRAMES_AHEAD })));
-        session.push_diff(&scene(9), None).unwrap();
+        session.push_diff(&scene(9), None, None, false).unwrap();
         assert_eq!(session.seq, 5 + FRAMES_AHEAD);
         assert!(!session.held);
-        assert!(session.diff(&scene(9)).is_empty());
+        assert!(session.diff(&scene(9), None, false).is_empty());
     }
 
     #[test]
@@ -2882,7 +3071,8 @@ mod tests {
             Some(SceneOptions {
                 grid: true,
                 native_menus: true,
-                telemetry: false
+                telemetry: false,
+                row_copies: false
             })
         );
         assert_eq!(
@@ -2895,7 +3085,8 @@ mod tests {
             SceneOptions {
                 grid: true,
                 native_menus: false,
-                telemetry: false
+                telemetry: false,
+                row_copies: false
             }
         );
         assert!(
@@ -2903,6 +3094,39 @@ mod tests {
                 .unwrap()
                 .telemetry
         );
+    }
+
+    #[test]
+    fn rows_that_moved_are_named_by_where_they_were() {
+        use super::grid_copies;
+        // Lines 1..6 scrolled by two: four rows moved up, two came into view.
+        assert_eq!(grid_copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 5, 6, 7, 8]), vec![[0, 2, 4]]);
+        // A row that changed (a scrollbar's) splits the run; rows that stayed
+        // where they were need nothing.
+        assert_eq!(
+            grid_copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 9, 6, 5, 6]),
+            vec![[0, 2, 2], [3, 5, 1]]
+        );
+        assert!(grid_copies(&[1, 2], &[1, 2]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scrolled_grid_sends_only_the_rows_that_came_into_view() {
+        use super::GridFrame;
+        use ratatui::buffer::Buffer;
+        let grid = |rows: [&str; 4]| GridFrame::new(Buffer::with_lines(rows));
+        let (mut session, _client) = session();
+        session.send_hello(&scene(0), Some(&grid(["a", "b", "c", "d"]))).unwrap();
+        let changed = session.diff(&scene(0), Some(&grid(["c", "d", "e", "f"])), true);
+        assert_eq!(changed["regions.grid.copy"], json!([[0, 2, 2]]));
+        assert_eq!(changed["regions.grid.2"], json!([{ "t": "e" }]));
+        assert_eq!(changed["regions.grid.3"], json!([{ "t": "f" }]));
+        assert!(!changed.contains_key("regions.grid.0"));
+        // A client that didn't ask for copies gets every changed row.
+        let changed = session.diff(&scene(0), Some(&grid(["e", "f", "g", "h"])), false);
+        assert!(changed.contains_key("regions.grid.0"));
+        assert!(!changed.contains_key("regions.grid.copy"));
     }
 
     #[test]
