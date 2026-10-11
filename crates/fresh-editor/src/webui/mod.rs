@@ -235,6 +235,19 @@ pub struct SceneOptions {
     pub grid: bool,
     /// The front end shows Fresh's menus in its own menu bar.
     pub native_menus: bool,
+    /// Each frame carries timing for the front end's latency telemetry (`t`):
+    /// how many of the client's messages were applied before it was built, how
+    /// long building and diffing took, the bytes of earlier frames still queued
+    /// ahead of it, wheel lines still owed, the top line.
+    pub telemetry: bool,
+}
+
+/// What a frame's telemetry reports about building the scene it came from.
+#[derive(Clone, Copy, Debug)]
+struct FrameTiming {
+    build_ms: f64,
+    owed: u32,
+    top: usize,
 }
 
 impl SceneOptions {
@@ -243,6 +256,7 @@ impl SceneOptions {
         Self {
             grid: v.get("grid").and_then(|b| b.as_bool()).unwrap_or(false),
             native_menus: v.get("nativeMenus").and_then(|b| b.as_bool()).unwrap_or(false),
+            telemetry: v.get("telemetry").and_then(|b| b.as_bool()).unwrap_or(false),
         }
     }
 
@@ -254,6 +268,7 @@ impl SceneOptions {
             match pair {
                 "grid=1" => options.grid = true,
                 "menus=native" => options.native_menus = true,
+                "telemetry=1" => options.telemetry = true,
                 _ => {}
             }
         }
@@ -660,6 +675,7 @@ impl WebBridge {
         while i < self.ws.len() {
             match self.ws[i].drain_messages() {
                 Ok(msgs) => {
+                    self.ws[i].received += msgs.len() as u64;
                     for m in &msgs {
                         let v: Value = serde_json::from_str(m).unwrap_or_else(|_| json!({}));
                         let kind = v.get("type").and_then(|t| t.as_str());
@@ -799,10 +815,16 @@ impl WebBridge {
         if self.ws.is_empty() {
             return;
         }
+        let started = Instant::now();
         let scene = build_scene(editor, cols, rows, &mut self.clip, self.options);
+        let timing = self.options.telemetry.then(|| FrameTiming {
+            build_ms: started.elapsed().as_secs_f64() * 1000.0,
+            owed: editor.pending_wheel_lines(),
+            top: editor.active_top_line(),
+        });
         let mut i = 0;
         while i < self.ws.len() {
-            if let Err(e) = self.ws[i].push_diff(&scene) {
+            if let Err(e) = self.ws[i].push_diff(&scene, timing) {
                 eprintln!("[webui] ws push failed, dropping client: {e}");
                 self.ws.remove(i);
             } else {
@@ -1627,6 +1649,10 @@ struct WsSession {
     /// client first reports (seeded to the current effective size on join so it
     /// doesn't transiently shrink the grid before its real viewport arrives).
     want: Option<(u16, u16)>,
+    /// Messages received from this client so far, every kind: a frame's
+    /// telemetry reports it as `ack`, so the client knows which of its inputs
+    /// the frame already shows.
+    received: u64,
 }
 
 /// Fingerprint a JSON value for change detection by streaming its serialization
@@ -1674,6 +1700,7 @@ impl WsSession {
             last_recv: Instant::now(),
             last_ping: Instant::now(),
             want: None,
+            received: 0,
         }
     }
 
@@ -1735,14 +1762,27 @@ impl WsSession {
 
     /// Diff `scene` against the last-sent one and push a
     /// `{"type":"frame","seq":N,"changed":{...}}` if anything changed.
-    fn push_diff(&mut self, scene: &Value) -> std::io::Result<()> {
+    fn push_diff(&mut self, scene: &Value, timing: Option<FrameTiming>) -> std::io::Result<()> {
+        let started = Instant::now();
         let changed = self.diff(scene);
         if changed.is_empty() {
             return self.flush(); // still drain any backlog from earlier frames
         }
         self.seq += 1;
-        let msg = json!({ "type": "frame", "seq": self.seq, "changed": Value::Object(changed) })
-            .to_string();
+        let mut msg = json!({ "type": "frame", "seq": self.seq, "changed": Value::Object(changed) });
+        if let Some(timing) = timing {
+            msg["t"] = json!({
+                "ack": self.received,
+                // Bytes of earlier frames still waiting for the socket: this
+                // frame reaches the client only after them.
+                "queued": self.outbuf.len(),
+                "build_ms": timing.build_ms,
+                "diff_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "owed": timing.owed,
+                "top": timing.top,
+            });
+        }
+        let msg = msg.to_string();
         self.enqueue(0x1, msg.as_bytes());
         self.flush()
     }
@@ -2692,7 +2732,8 @@ mod tests {
             SceneOptions::from_ws_path("/ws?grid=1&menus=native"),
             Some(SceneOptions {
                 grid: true,
-                native_menus: true
+                native_menus: true,
+                telemetry: false
             })
         );
         assert_eq!(
@@ -2704,8 +2745,14 @@ mod tests {
             SceneOptions::from_message(&message),
             SceneOptions {
                 grid: true,
-                native_menus: false
+                native_menus: false,
+                telemetry: false
             }
+        );
+        assert!(
+            SceneOptions::from_ws_path("/ws?grid=1&telemetry=1")
+                .unwrap()
+                .telemetry
         );
     }
 

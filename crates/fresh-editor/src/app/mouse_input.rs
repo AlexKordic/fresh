@@ -531,6 +531,13 @@ impl Editor {
         self.pending_wheel_scroll.is_some()
     }
 
+    /// Wheel lines a playing-out gesture still owes, for front-end telemetry.
+    pub fn pending_wheel_lines(&self) -> u32 {
+        self.pending_wheel_scroll
+            .as_ref()
+            .map_or(0, |pending| pending.remaining)
+    }
+
     /// When the next owed line comes due, for the loop's wait.
     pub fn pending_wheel_scroll_deadline(&self) -> Option<Instant> {
         self.pending_wheel_scroll

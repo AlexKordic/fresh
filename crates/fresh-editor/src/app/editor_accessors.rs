@@ -13,6 +13,13 @@
 use super::*;
 
 impl Editor {
+    /// The line at the top of the active view (0-based), for front-end
+    /// latency telemetry: where the view has actually got to.
+    pub fn active_top_line(&mut self) -> usize {
+        let top_byte = self.active_window().active_viewport().top_byte();
+        self.active_state_mut().buffer.get_line_number(top_byte)
+    }
+
     /// Get a reference to the async bridge (if available)
     pub fn async_bridge(&self) -> Option<&AsyncBridge> {
         self.async_bridge.as_ref()
