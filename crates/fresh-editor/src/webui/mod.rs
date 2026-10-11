@@ -147,12 +147,40 @@ impl Conn {
         }
     }
 
-    /// Nagle off for TCP; a Unix socket has nothing to turn off.
-    fn set_nodelay(&self) -> std::io::Result<()> {
+    /// Ready the socket for frames: Nagle off for TCP. A Unix socket gets big
+    /// buffers instead — macOS gives one 8 KiB each way, a fraction of a single
+    /// grid frame, so every frame would trickle out over many loop passes and
+    /// the frames behind it would queue up in `outbuf`. The kernel caps the size
+    /// at its own limit (`net.core.wmem_max` on Linux) or refuses a size past
+    /// it (`kern.ipc.maxsockbuf` on macOS); either way the socket still works,
+    /// only slower, so buffers are best effort.
+    fn tune(&self) -> std::io::Result<()> {
         match self {
             Conn::Tcp(s) => s.set_nodelay(true),
             #[cfg(unix)]
-            Conn::Unix(_) => Ok(()),
+            Conn::Unix(s) => {
+                use std::os::unix::io::AsRawFd;
+                const SOCKET_BUFFER: libc::c_int = 4 << 20; // 4 MiB
+                for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                    // SAFETY: a live descriptor, and an option value of the size passed.
+                    let result = unsafe {
+                        libc::setsockopt(
+                            s.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            option,
+                            (&SOCKET_BUFFER as *const libc::c_int).cast(),
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                        )
+                    };
+                    if result != 0 {
+                        eprintln!(
+                            "[webui] scene socket buffer not raised: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -719,9 +747,9 @@ impl WebBridge {
                 Ok(stream) => {
                     // The pump relies on nonblocking reads; a socket we can't
                     // configure is dropped rather than risked stalling the
-                    // editor loop. nodelay is folded in — it never fails on a
+                    // editor loop. `tune` is folded in — it never fails on a
                     // live socket, and a dead one belongs on the floor anyway.
-                    if stream.set_nonblocking(true).is_err() || stream.set_nodelay().is_err() {
+                    if stream.set_nonblocking(true).is_err() || stream.tune().is_err() {
                         continue;
                     }
                     self.pending.push(PendingConn {
