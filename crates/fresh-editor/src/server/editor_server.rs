@@ -788,11 +788,13 @@ impl EditorServer {
     /// (`webui::DEFAULT_SIZE`), refit as soon as a real viewport reports in.
     #[cfg(feature = "web")]
     fn start_web_bridge(&mut self) -> io::Result<()> {
-        let addr = self.config.web_addr.clone();
-        let socket = self.config.scene_socket.clone();
-        if addr.is_none() && socket.is_none() {
+        // An FC session's scene socket is bound later, once a client's
+        // handshake has built the editor (`ensure_scene_bridge`): building it
+        // here would turn a failed restore into a dead daemon instead of the
+        // error the handshake reports in place of its hello.
+        let Some(addr) = self.config.web_addr.clone() else {
             return Ok(());
-        }
+        };
         if self.editor.is_none() {
             let (cols, rows) = crate::webui::DEFAULT_SIZE;
             self.term_size = TermSize::new(cols, rows);
@@ -805,31 +807,33 @@ impl EditorServer {
         // parity harness that owns its editor, not for a session carrying a
         // recovery log, a restored workspace and attached terminals. Hence
         // `allow_reset: false` (and no file list for it to reopen).
-        let bridge = match (addr, socket) {
-            (Some(addr), _) => {
-                let bridge = crate::webui::WebBridge::bind(&addr, editor, &[], false).map_err(|e| {
-                    io::Error::other(format!("failed to serve the web UI on {addr}: {e}"))
-                })?;
-                tracing::info!("Web UI bridge listening on {}", addr);
-                bridge
-            }
-            (None, Some(path)) => {
-                #[cfg(unix)]
-                let bridge = crate::webui::WebBridge::bind_unix(&path, editor).map_err(|e| {
-                    io::Error::other(format!("failed to serve the scene on {}: {e}", path.display()))
-                })?;
-                #[cfg(not(unix))]
-                let bridge = return Err(io::Error::other(format!(
-                    "a scene socket ({}) needs Unix sockets",
-                    path.display()
-                )));
-                tracing::info!("Scene bridge listening on {}", path.display());
-                bridge
-            }
-            (None, None) => return Ok(()),
-        };
+        let bridge = crate::webui::WebBridge::bind(&addr, editor, &[], false)
+            .map_err(|e| io::Error::other(format!("failed to serve the web UI on {addr}: {e}")))?;
+        tracing::info!("Web UI bridge listening on {}", addr);
         self.web = Some(bridge);
         Ok(())
+    }
+
+    /// Bind the scene socket of an FC session (`config.scene_socket`) once the
+    /// editor exists — the first handshake builds it — and before that
+    /// handshake's hello names the socket. A socket that can't be bound is
+    /// logged and left out of the hello; FC then attaches a terminal instead.
+    #[cfg(feature = "web")]
+    fn ensure_scene_bridge(&mut self) {
+        if self.web.is_some() || self.config.web_addr.is_some() {
+            return;
+        }
+        let (Some(path), Some(editor)) = (self.config.scene_socket.clone(), self.editor.as_ref()) else {
+            return;
+        };
+        #[cfg(unix)]
+        match crate::webui::WebBridge::bind_unix(&path, editor) {
+            Ok(bridge) => {
+                tracing::info!("Scene bridge listening on {}", path.display());
+                self.web = Some(bridge);
+            }
+            Err(e) => tracing::warn!("failed to serve the scene on {}: {e}", path.display()),
+        }
     }
 
     /// Apply everything the browsers sent this pass and refit the shared grid.
@@ -1165,6 +1169,7 @@ impl EditorServer {
         let mut server_hello = ServerHello::new(session_id);
         #[cfg(feature = "web")]
         {
+            self.ensure_scene_bridge();
             server_hello.fc_scene = self
                 .web
                 .as_ref()

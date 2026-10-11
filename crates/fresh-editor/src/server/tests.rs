@@ -1668,7 +1668,8 @@ mod integration_tests {
     /// A File Commander session serves its scene on a Unix socket instead of a
     /// TCP port (`scene_socket`). The contract:
     ///
-    ///   1. the socket is owner-only and advertised in every handshake;
+    ///   1. the first handshake binds it (after building the editor), it is
+    ///      owner-only, and every handshake advertises it;
     ///   2. FC's short-lived command clients (`fc_control`) never size the
     ///      shared grid, while a real terminal still does;
     ///   3. a `/ws?grid=1` client gets the whole frame as cells in its hello.
@@ -1759,16 +1760,19 @@ mod integration_tests {
         let socket_paths = paths_rx.recv().unwrap();
         let shutdown_handle = shutdown_rx.recv().unwrap();
 
-        // (1) Owner-only, and named in the handshake.
-        let booted = state_until(&scene_path, |v| v["w"].as_u64().is_some());
-        let mode = std::fs::metadata(&scene_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "the scene socket must be owner-only");
+        // (1) Bound by the first handshake (which builds the editor, so a
+        //     failed restore is still reported in place of the hello),
+        //     owner-only, and named in that handshake.
+        assert!(!scene_path.exists(), "no scene socket before a client has built the editor");
         let (control, hello) = hello_as(&socket_paths, TermSize::new(50, 10), true);
         assert_eq!(
             hello.fc_scene.as_deref(),
             Some(scene_path.to_str().unwrap()),
             "the handshake advertises the scene socket"
         );
+        let booted = state_until(&scene_path, |v| v["w"].as_u64().is_some());
+        let mode = std::fs::metadata(&scene_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the scene socket must be owner-only");
 
         // (2) A command client leaves the grid alone; a terminal sizes it.
         thread::sleep(Duration::from_millis(300));
