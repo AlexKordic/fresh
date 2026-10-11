@@ -531,6 +531,9 @@ pub struct BridgePoll {
     /// A client joined, left, or reported a new viewport, so the host should
     /// refit the shared grid — see [`WebBridge::wanted_size`].
     pub resize_dirty: bool,
+    /// A client that frames were held back from caught up, so the host should
+    /// push the scene now even though the editor didn't change.
+    pub frame_owed: bool,
 }
 
 /// The browser-facing half of the web UI, decoupled from *who owns the editor*.
@@ -711,6 +714,10 @@ impl WebBridge {
                             if self.ws[i].note_resize(&v) {
                                 out.resize_dirty = true;
                             }
+                        } else if kind == Some("applied") {
+                            if self.ws[i].note_applied(&v) {
+                                out.frame_owed = true;
+                            }
                         } else if kind == Some("configure") {
                             // Changes what the scene carries, not the editor;
                             // `mutated` gets the reshaped scene pushed now.
@@ -839,9 +846,20 @@ impl WebBridge {
     /// Each client's diff is against ITS OWN last-sent cache (they connected at
     /// different times), so one shared scene still yields correct per-client
     /// frames. A client whose push fails is dropped.
-    pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) {
+    ///
+    /// Returns true while a client is owed a frame it was held back from
+    /// (`FRAMES_AHEAD`): the host pushes again when one catches up
+    /// (`BridgePoll::frame_owed`) or, failing that, on its own cadence. While
+    /// no client can take a frame, nothing is built.
+    pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> bool {
         if self.ws.is_empty() {
-            return;
+            return false;
+        }
+        if !self.ws.iter().any(WsSession::ready) {
+            for session in &mut self.ws {
+                session.held = true;
+            }
+            return true;
         }
         let started = Instant::now();
         let scene = build_scene(editor, cols, rows, &mut self.clip, self.options);
@@ -859,6 +877,7 @@ impl WebBridge {
                 i += 1;
             }
         }
+        self.ws.iter().any(|session| session.held)
     }
 
     /// Heartbeat + drain buffered outbound bytes for EACH client — a periodic
@@ -911,6 +930,8 @@ pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
     );
 
     let mut next_tick = Instant::now();
+    // A client is owed a frame it was held back from (`push_scene`).
+    let mut held = false;
 
     loop {
         // 0) Drain nested-forward command requests (file/dir opens, and the
@@ -951,11 +972,14 @@ pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
             // (animations / LSP spinner — `poll_active`, refreshed on the fast
             // cadence below). An unchanged scene diffs to nothing anyway;
             // skipping the build keeps connected-but-idle sessions near 0% CPU.
-            if had_input || needs_render || active_hint {
-                bridge.push_scene(&mut editor, cols, rows);
+            // A frame held back from a client that fell behind is owed too.
+            if had_input || needs_render || active_hint || held {
+                held = bridge.push_scene(&mut editor, cols, rows);
             }
             let interval = if active_hint { TICK_ACTIVE } else { TICK_IDLE };
             next_tick = Instant::now() + interval;
+        } else if poll.frame_owed {
+            held = bridge.push_scene(&mut editor, cols, rows);
         }
 
         // 4) Heartbeat / flush; a reap here shrank the constraint set, so refit.
@@ -1640,6 +1664,17 @@ fn ws_encode(opcode: u8, payload: &[u8]) -> Vec<u8> {
 /// stall is absorbed, not a real one.
 const WS_OUTBUF_CAP: usize = 8 << 20; // 8 MiB
 
+/// Frames a client that reports what it applied (`applied`) may have sent to
+/// it but not yet applied. Past this, newer frames are held back, and once it
+/// catches up it gets one frame with the newest scene: a client that falls
+/// behind skips to the present instead of working through every frame in
+/// between, each one older than the last by the time it is shown.
+const FRAMES_AHEAD: u64 = 2;
+
+/// How long a client with frames held back may go without reporting before
+/// frames go out regardless, so a lost `applied` can't freeze its view.
+const APPLIED_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// THE WebSocket client, plus the diff cache backing the region-diff protocol
 /// (see the module docs). The cache holds an 8-byte fingerprint of every unit
 /// last sent — top-level scalars, each `regions.<key>` except panes, and each
@@ -1681,6 +1716,15 @@ struct WsSession {
     /// telemetry reports it as `ack`, so the client knows which of its inputs
     /// the frame already shows.
     received: u64,
+    /// The last frame the client reported applying (`applied`), once it
+    /// reports at all. Only a client that reports has frames held back
+    /// (`FRAMES_AHEAD`); a browser never does.
+    applied: Option<u64>,
+    /// A frame was held back from this client: it is owed the newest scene
+    /// as soon as it can take one.
+    held: bool,
+    /// When the last frame was queued, for `APPLIED_TIMEOUT`.
+    sent_at: Instant,
 }
 
 /// Fingerprint a JSON value for change detection by streaming its serialization
@@ -1729,7 +1773,27 @@ impl WsSession {
             last_ping: Instant::now(),
             want: None,
             received: 0,
+            applied: None,
+            held: false,
+            sent_at: Instant::now(),
         }
+    }
+
+    /// Whether a frame may go out now: unless the client reports what it
+    /// applied and is `FRAMES_AHEAD` frames behind (and has reported lately).
+    fn ready(&self) -> bool {
+        self.applied.is_none_or(|applied| {
+            self.seq.saturating_sub(applied) < FRAMES_AHEAD
+                || self.sent_at.elapsed() >= APPLIED_TIMEOUT
+        })
+    }
+
+    /// Note the client's `applied` (`seq`, the frame it applied). True when it
+    /// is owed a held-back frame and can take it now.
+    fn note_applied(&mut self, v: &Value) -> bool {
+        let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+        self.applied = Some(self.applied.map_or(seq, |applied| applied.max(seq)));
+        self.held && self.ready()
     }
 
     /// Record this client's wanted grid size from a `resize` message, applying
@@ -1778,25 +1842,38 @@ impl WsSession {
         Ok(())
     }
 
-    /// `{"type":"hello","seq":0,"scene":<full scene>}` — sent once per
-    /// connection; seeds the diff cache and restarts `seq`.
+    /// `{"type":"hello","seq":0,"scene":<full scene>,"acks":true}` — sent once
+    /// per connection; seeds the diff cache and restarts `seq`. `acks` tells
+    /// the client it may report each message it applied (`applied`), and then
+    /// gets the newest scene rather than every frame when it falls behind.
     fn send_hello(&mut self, scene: &Value) -> std::io::Result<()> {
         self.seq = 0;
         self.diff(scene); // seed the cache; the hello carries the full scene
-        let msg = json!({ "type": "hello", "seq": 0, "scene": scene }).to_string();
+        let msg = json!({ "type": "hello", "seq": 0, "scene": scene, "acks": true }).to_string();
         self.enqueue(0x1, msg.as_bytes());
         self.flush()
     }
 
     /// Diff `scene` against the last-sent one and push a
     /// `{"type":"frame","seq":N,"changed":{...}}` if anything changed.
+    ///
+    /// A client too far behind (`ready`) gets nothing now: the cache keeps
+    /// what it last sent, and the frame after it catches up carries
+    /// everything that changed since.
     fn push_diff(&mut self, scene: &Value, timing: Option<FrameTiming>) -> std::io::Result<()> {
+        if !self.ready() {
+            self.held = true;
+            return self.flush();
+        }
+        self.held = false;
         let started = Instant::now();
         let changed = self.diff(scene);
         if changed.is_empty() {
             return self.flush(); // still drain any backlog from earlier frames
         }
+        let ahead = self.applied.map_or(0, |applied| self.seq.saturating_sub(applied));
         self.seq += 1;
+        self.sent_at = Instant::now();
         let mut msg = json!({ "type": "frame", "seq": self.seq, "changed": Value::Object(changed) });
         if let Some(timing) = timing {
             msg["t"] = json!({
@@ -1804,6 +1881,8 @@ impl WsSession {
                 // Bytes of earlier frames still waiting for the socket: this
                 // frame reaches the client only after them.
                 "queued": self.outbuf.len(),
+                // Earlier frames sent that the client had not applied yet.
+                "ahead": ahead,
                 "build_ms": timing.build_ms,
                 "diff_ms": started.elapsed().as_secs_f64() * 1000.0,
                 "owed": timing.owed,
@@ -2752,6 +2831,48 @@ mod tests {
         digit_row_char, host_only, origin_host_matches, try_parse_request, SceneOptions,
         HTTP_REQUEST_CAP,
     };
+    #[cfg(unix)]
+    use super::{Conn, WsSession, FRAMES_AHEAD};
+    #[cfg(unix)]
+    use serde_json::{json, Value};
+
+    /// A session on one end of a socket pair; keep the other end alive.
+    #[cfg(unix)]
+    fn session() -> (WsSession, std::os::unix::net::UnixStream) {
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        (WsSession::new(Conn::Unix(server)), client)
+    }
+
+    #[cfg(unix)]
+    fn scene(status: u64) -> Value {
+        json!({ "w": 10, "h": 2, "regions": { "statusbar": status } })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frames_wait_for_a_client_that_reports_what_it_applied() {
+        let (mut session, _client) = session();
+        session.send_hello(&scene(0)).unwrap();
+        // A client that never reports gets every frame.
+        for n in 1..=4 {
+            session.push_diff(&scene(n), None).unwrap();
+        }
+        assert_eq!(session.seq, 4);
+        // Once it reports, at most FRAMES_AHEAD frames go out unapplied.
+        assert!(!session.note_applied(&json!({ "type": "applied", "seq": 4 })));
+        for n in 5..=9 {
+            session.push_diff(&scene(n), None).unwrap();
+        }
+        assert_eq!(session.seq, 4 + FRAMES_AHEAD);
+        assert!(session.held);
+        // Catching up owes it one frame, and that frame has the newest scene.
+        assert!(session.note_applied(&json!({ "type": "applied", "seq": 4 + FRAMES_AHEAD })));
+        session.push_diff(&scene(9), None).unwrap();
+        assert_eq!(session.seq, 5 + FRAMES_AHEAD);
+        assert!(!session.held);
+        assert!(session.diff(&scene(9)).is_empty());
+    }
 
     #[test]
     fn scene_options_come_from_the_upgrade_query_or_a_message() {

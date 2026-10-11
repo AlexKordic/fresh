@@ -466,7 +466,7 @@ impl EditorServer {
             // quit the session, and folded into `needs_render` so its effect
             // is broadcast to the attached terminals in this same pass.
             #[cfg(feature = "web")]
-            let web_input = self.poll_web()?;
+            let (web_input, web_owed) = self.poll_web()?;
             #[cfg(feature = "web")]
             if web_input {
                 needs_render = true;
@@ -669,15 +669,19 @@ impl EditorServer {
             //
             // Input from a browser or the native front end is the exception:
             // what it changed is pushed in this same pass, so typing answers
-            // with the next frame rather than the next 40 ms slot.
+            // with the next frame rather than the next 40 ms slot. So is a
+            // client catching up after frames were held back from it: it gets
+            // the newest scene at once. One still held back keeps the scene
+            // dirty, to be tried again on the cadence.
             #[cfg(feature = "web")]
             {
                 const WEB_PUSH_INTERVAL: Duration = Duration::from_millis(40);
                 web_dirty |= needs_render;
-                if web_dirty && (web_input || last_web_push.elapsed() >= WEB_PUSH_INTERVAL) {
-                    self.push_web_scene();
+                if (web_dirty && (web_input || last_web_push.elapsed() >= WEB_PUSH_INTERVAL))
+                    || web_owed
+                {
+                    web_dirty = self.push_web_scene();
                     last_web_push = Instant::now();
-                    web_dirty = false;
                 }
             }
 
@@ -837,12 +841,13 @@ impl EditorServer {
     }
 
     /// Apply everything the browsers sent this pass and refit the shared grid.
-    /// Returns whether the editor changed and needs a render.
+    /// Returns whether the editor changed and needs a render, and whether a
+    /// client that frames were held back from caught up and is owed one.
     #[cfg(feature = "web")]
-    fn poll_web(&mut self) -> io::Result<bool> {
+    fn poll_web(&mut self) -> io::Result<(bool, bool)> {
         let before = self.term_size;
         let (Some(bridge), Some(editor)) = (self.web.as_mut(), self.editor.as_mut()) else {
-            return Ok(false);
+            return Ok((false, false));
         };
         let mut cols = before.cols;
         let mut rows = before.rows;
@@ -865,18 +870,22 @@ impl EditorServer {
         if poll.mutated {
             self.last_client_activity = Instant::now();
         }
-        Ok(poll.mutated || poll.resize_dirty || reaped || route_resized)
+        Ok((
+            poll.mutated || poll.resize_dirty || reaped || route_resized,
+            poll.frame_owed,
+        ))
     }
 
     /// Build the browser scene once and push each connected browser its own
-    /// region diff.
+    /// region diff. Returns whether a client is still owed a frame it was held
+    /// back from.
     #[cfg(feature = "web")]
-    fn push_web_scene(&mut self) {
+    fn push_web_scene(&mut self) -> bool {
         let size = self.term_size;
         let (Some(bridge), Some(editor)) = (self.web.as_mut(), self.editor.as_mut()) else {
-            return;
+            return false;
         };
-        bridge.push_scene(editor, size.cols, size.rows);
+        bridge.push_scene(editor, size.cols, size.rows)
     }
 
     /// Build the `Editor` from the current configuration and stored authority.
