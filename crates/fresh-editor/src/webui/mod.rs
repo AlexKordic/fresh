@@ -2493,7 +2493,7 @@ fn super_chord_action(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> Option<crate::input::keybindings::Action> {
-    use crate::input::keybindings::KeybindingResolver;
+    use crate::input::keybindings::{Action, KeybindingResolver};
     use std::cell::RefCell;
     thread_local! {
         static RESOLVER: RefCell<Option<(String, KeybindingResolver)>> = const { RefCell::new(None) };
@@ -2505,6 +2505,8 @@ fn super_chord_action(
         config.active_keybinding_map.0,
         serde_json::to_string(&config.keybindings).unwrap_or_default()
     );
+    // Bindings name the unshifted letter (`super+shift p`), as `handle_key` resolves them.
+    let (code, mods) = crate::input::keybindings::normalize_key(code, mods);
     let event = KeyEvent::new(code, mods);
     RESOLVER.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -2513,7 +2515,10 @@ fn super_chord_action(
             gui.active_keybinding_map = config::KeybindingMapName("macos-gui".to_string());
             *slot = Some((stamp, KeybindingResolver::new(&gui)));
         }
-        slot.as_ref().and_then(|(_, r)| r.explicit_binding(&event, &context))
+        // `resolve` falls back from the key context to Normal and Global, as
+        // the editor's own dispatch does (Cmd+Shift+P is a Global binding).
+        let action = slot.as_ref().map(|(_, r)| r.resolve(&event, context.clone()))?;
+        (!matches!(action, Action::None | Action::InsertChar(_))).then_some(action)
     })
 }
 
