@@ -4,6 +4,9 @@
 // writes these messages; a test keeps this file equal to it.
 syntax = "proto3";
 package fresh.scene.v1;
+// Swift's generated types are WireFrame, WireRect, ...: Error, Frame
+// and Key would clash with names the app already has.
+option swift_prefix = "Wire";
 
 // A rectangle of cells.
 message Rect {

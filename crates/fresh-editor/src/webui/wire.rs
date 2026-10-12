@@ -1224,7 +1224,10 @@ pub(crate) fn schema() -> String {
          // Unix socket. Generated from crates/fresh-editor/src/webui/wire.rs, which\n\
          // writes these messages; a test keeps this file equal to it.\n\
          syntax = \"proto3\";\n\
-         package fresh.scene.v1;\n",
+         package fresh.scene.v1;\n\
+         // Swift's generated types are WireFrame, WireRect, ...: Error, Frame\n\
+         // and Key would clash with names the app already has.\n\
+         option swift_prefix = \"Wire\";\n",
     );
     for part in SCHEMA.iter().chain(ONEOF_SCHEMA).chain(std::iter::once(&FRAME_SCHEMA)) {
         out.push('\n');
