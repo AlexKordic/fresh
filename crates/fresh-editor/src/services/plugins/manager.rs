@@ -8,6 +8,7 @@
 use crate::config_io::DirectoryContext;
 use crate::input::command_registry::CommandRegistry;
 use fresh_core::config::PluginConfig;
+use fresh_core::BufferId;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -513,6 +514,22 @@ impl PluginManager {
         #[cfg(not(feature = "plugins"))]
         {
             let _ = hook_name;
+            false
+        }
+    }
+
+    /// Non-blocking: does any plugin's `lines_changed` handler want the
+    /// lines of `buffer_id`, which a split shows composed when `composing`?
+    pub fn wants_lines(&self, buffer_id: BufferId, composing: bool) -> bool {
+        #[cfg(feature = "plugins")]
+        {
+            self.inner
+                .as_ref()
+                .is_some_and(|m| m.wants_lines(buffer_id, composing))
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = (buffer_id, composing);
             false
         }
     }

@@ -261,6 +261,10 @@ pub struct PluginThreadHandle {
     /// expensive per-render work (e.g. building hook args). See
     /// `EventHandlerRegistry` in `quickjs_backend.rs`.
     event_handlers: crate::backend::quickjs_backend::EventHandlerRegistry,
+
+    /// Which buffers each plugin wants `lines_changed` batches for, shared
+    /// with the plugin thread like `event_handlers`; see `wants_lines`.
+    lines_scopes: crate::backend::quickjs_backend::LinesScopeRegistry,
 }
 
 impl PluginThreadHandle {
@@ -295,6 +299,9 @@ impl PluginThreadHandle {
         let event_handlers: crate::backend::quickjs_backend::EventHandlerRegistry =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let thread_event_handlers = Arc::clone(&event_handlers);
+        let lines_scopes: crate::backend::quickjs_backend::LinesScopeRegistry =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let thread_lines_scopes = Arc::clone(&lines_scopes);
 
         // Create channel for requests (unbounded allows sync send, async recv)
         let (request_sender, request_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -331,6 +338,7 @@ impl PluginThreadHandle {
                 thread_async_resource_owners,
                 thread_search_handles,
                 thread_event_handlers,
+                thread_lines_scopes,
             ) {
                 Ok(rt) => {
                     tracing::debug!("Plugin thread: QuickJS runtime created successfully");
@@ -370,6 +378,7 @@ impl PluginThreadHandle {
             async_resource_owners,
             search_handles,
             event_handlers,
+            lines_scopes,
         })
     }
 
@@ -388,6 +397,18 @@ impl PluginThreadHandle {
             .read()
             .map(|h| h.get(hook_name).is_some_and(|v| !v.is_empty()))
             .unwrap_or(false)
+    }
+
+    /// Non-blocking check: does any plugin's `lines_changed` handler want
+    /// the lines of `buffer_id`? `composing` is whether a split shows it
+    /// composed. The renderer builds no batch nobody wants.
+    pub fn wants_lines(&self, buffer_id: fresh_core::BufferId, composing: bool) -> bool {
+        crate::backend::quickjs_backend::wants_lines(
+            &self.event_handlers,
+            &self.lines_scopes,
+            buffer_id,
+            composing,
+        )
     }
 
     /// Check if the plugin thread is still alive

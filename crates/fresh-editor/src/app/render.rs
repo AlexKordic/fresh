@@ -544,6 +544,14 @@ impl Editor {
                             crate::services::plugins::hooks::HookArgs::RenderStart { buffer_id },
                         );
 
+                        // No batch for a buffer no `lines_changed` handler
+                        // wants (`setLinesChangedScope`): the walk below copies
+                        // every line it offers. Nothing is marked seen, so the
+                        // lines are offered once a plugin does want them.
+                        if !pm_guard.wants_lines(buffer_id, composing_in_any_split) {
+                            return 0;
+                        }
+
                         let visible_count = split_area.height as usize;
                         // What the pane can show, in bytes at four per column:
                         // the offer covers the visible rows, and a row holds a

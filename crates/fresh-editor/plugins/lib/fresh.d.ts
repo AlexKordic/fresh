@@ -3536,6 +3536,18 @@ interface EditorAPI {
 	*/
 	off(eventName: string, handlerName: string): void;
 	/**
+	* Limit the `lines_changed` batches this plugin's handlers get to the
+	* buffers it decorates; the editor builds no batch that no handler
+	* wants. `composing: true` covers the buffers a split shows composed
+	* (page view), `buffers` lists buffer ids. `null`, the default, asks
+	* for every buffer. Each call replaces the plugin's scope, and a buffer
+	* it adds has its visible lines offered again.
+	*/
+	setLinesChangedScope(scope: {
+		composing?: boolean;
+		buffers?: number[];
+	} | null): boolean;
+	/**
 	* Get an environment variable
 	*/
 	getEnv(name: string): string | null;

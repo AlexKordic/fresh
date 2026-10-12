@@ -274,6 +274,19 @@ function isEnabledForBuffer(state: BufferDiffState): boolean {
   return isGlobalEnabled();
 }
 
+/**
+ * Ask for `lines_changed` batches for the buffers the diff is on in, and no
+ * others: `recompute` ignores the rest, and the editor builds no batch that
+ * nobody wants. Called whenever a buffer's enabled state can change.
+ */
+function scopeLinesChanged(): void {
+  const buffers: number[] = [];
+  for (const state of states.values()) {
+    if (isEnabledForBuffer(state)) buffers.push(state.bufferId);
+  }
+  editor.setLinesChangedScope({ buffers });
+}
+
 // =============================================================================
 // Reference loading
 // =============================================================================
@@ -1198,6 +1211,7 @@ function ensureState(bufferId: number): BufferDiffState | null {
     lastDetail: "full",
   };
   states.set(bufferId, state);
+  scopeLinesChanged();
   return state;
 }
 
@@ -1218,6 +1232,7 @@ async function setMode(bufferId: number, mode: DiffMode): Promise<void> {
   // global toggle is off.
   state.override = true;
   storeOverride(bufferId, true);
+  scopeLinesChanged();
   storeMode(bufferId, mode);
   dropReference(state);
   await recompute(bufferId);
@@ -1260,6 +1275,7 @@ function live_diff_toggle_buffer(): void {
   const newEnabled = !isEnabledForBuffer(state);
   state.override = newEnabled;
   storeOverride(bid, newEnabled);
+  scopeLinesChanged();
   syncBufferToEnabledState(state);
   editor.setStatus(editor.t(newEnabled ? "status.buffer_enabled" : "status.buffer_disabled"));
 }
@@ -1272,6 +1288,7 @@ registerHandler("live_diff_toggle_buffer", live_diff_toggle_buffer);
 function live_diff_toggle_global(): void {
   const newEnabled = !isGlobalEnabled();
   setGlobalEnabled(newEnabled);
+  scopeLinesChanged();
   for (const state of states.values()) {
     if (state.override === null) {
       syncBufferToEnabledState(state);
@@ -1509,6 +1526,7 @@ editor.on("after_delete", (args) => {
 // driven by Fresh's external-file-watch reload (which doesn't go through
 // after_insert/after_delete). This is the hook that makes the live-diff
 // view update when a coding agent rewrites the file on disk.
+scopeLinesChanged();
 editor.on("lines_changed", (args) => {
   if (!states.has(args.buffer_id)) return true;
   scheduleRecompute(args.buffer_id).catch((e) => editor.error(`live-diff: ${e}`));
@@ -1549,6 +1567,7 @@ editor.on("after_file_revert", (args) => {
 
 editor.on("buffer_closed", (args) => {
   states.delete(args.buffer_id);
+  scopeLinesChanged();
   return true;
 });
 

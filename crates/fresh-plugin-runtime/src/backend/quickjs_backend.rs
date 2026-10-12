@@ -773,6 +773,80 @@ pub struct PluginHandler {
     pub handler_name: String,
 }
 
+/// The buffers a plugin wants `lines_changed` batches for, as it set them
+/// with `editor.setLinesChangedScope`. A plugin that never set one wants
+/// every buffer's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinesScope {
+    /// Buffers shown composed (page view) in some split.
+    pub composing: bool,
+    /// These buffers.
+    pub buffers: Vec<BufferId>,
+}
+
+impl LinesScope {
+    pub fn covers(&self, buffer_id: BufferId, composing: bool) -> bool {
+        (self.composing && composing) || self.buffers.contains(&buffer_id)
+    }
+}
+
+/// Each plugin's [`LinesScope`], shared the way [`EventHandlerRegistry`] is:
+/// the plugin thread sets it, the editor thread reads it before it builds a
+/// `lines_changed` batch, and the plugin thread reads it again to skip the
+/// handlers of plugins that don't want that batch.
+pub type LinesScopeRegistry = Arc<RwLock<HashMap<String, LinesScope>>>;
+
+/// The scope `setLinesChangedScope` was given, unless it isn't one. A field
+/// left out or `null` is the empty default.
+fn parse_lines_scope(value: &serde_json::Value) -> Option<LinesScope> {
+    let fields = value.as_object()?;
+    let composing = match fields.get("composing") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(composing) => composing.as_bool()?,
+    };
+    let buffers = match fields.get("buffers") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(ids) => ids
+            .as_array()?
+            .iter()
+            .map(|id| id.as_u64().map(|id| BufferId(id as usize)))
+            .collect::<Option<_>>()?,
+    };
+    Some(LinesScope { composing, buffers })
+}
+
+/// Whether the handlers `plugin_name` registered want `lines_changed`
+/// batches for `buffer_id`.
+fn plugin_wants_lines(
+    scopes: &HashMap<String, LinesScope>,
+    plugin_name: &str,
+    buffer_id: BufferId,
+    composing: bool,
+) -> bool {
+    scopes
+        .get(plugin_name)
+        .is_none_or(|scope| scope.covers(buffer_id, composing))
+}
+
+/// Whether any `lines_changed` handler wants the lines of `buffer_id`;
+/// `composing` is whether a split shows it composed. Never waits: while the
+/// plugin thread is writing either registry the answer is yes, and the
+/// batch is built as if no plugin had a scope.
+pub fn wants_lines(
+    handlers: &EventHandlerRegistry,
+    scopes: &LinesScopeRegistry,
+    buffer_id: BufferId,
+    composing: bool,
+) -> bool {
+    let (Ok(handlers), Ok(scopes)) = (handlers.try_read(), scopes.try_read()) else {
+        return true;
+    };
+    handlers.get("lines_changed").is_some_and(|list| {
+        list.iter()
+            .any(|h| plugin_wants_lines(&scopes, &h.plugin_name, buffer_id, composing))
+    })
+}
+
 /// Parse an `AnimationRect` from a JS object. Missing fields are treated
 /// as 0, which renders as a zero-area rect the runner drops immediately.
 fn parse_animation_rect(
@@ -832,6 +906,8 @@ pub struct JsEditorApi {
     registered_actions: Rc<RefCell<HashMap<String, PluginHandler>>>,
     #[qjs(skip_trace)]
     event_handlers: EventHandlerRegistry,
+    #[qjs(skip_trace)]
+    lines_scopes: LinesScopeRegistry,
     #[qjs(skip_trace)]
     next_request_id: Rc<RefCell<u64>>,
     #[qjs(skip_trace)]
@@ -2620,6 +2696,63 @@ impl JsEditorApi {
         {
             list.retain(|h| h.handler_name != handler_name);
         }
+    }
+
+    /// Limit the `lines_changed` batches this plugin's handlers get to the
+    /// buffers it decorates; the editor builds no batch that no handler
+    /// wants. `composing: true` covers the buffers a split shows composed
+    /// (page view), `buffers` lists buffer ids. `null`, the default, asks
+    /// for every buffer. Each call replaces the plugin's scope, and a buffer
+    /// it adds has its visible lines offered again.
+    pub fn set_lines_changed_scope<'js>(
+        &self,
+        ctx: rquickjs::Ctx<'js>,
+        #[plugin_api(ts_type = "{ composing?: boolean; buffers?: number[] } | null")]
+        scope: rquickjs::Value<'js>,
+    ) -> rquickjs::Result<bool> {
+        let scope = if scope.is_null() || scope.is_undefined() {
+            None
+        } else {
+            let value: serde_json::Value = rquickjs_serde::from_value(scope).map_err(|e| {
+                rquickjs::Error::new_from_js_message("serialize", "", &e.to_string())
+            })?;
+            let Some(scope) = parse_lines_scope(&value) else {
+                return Err(throw_js(
+                    &ctx,
+                    "setLinesChangedScope: expected { composing?: boolean, buffers?: number[] } or null",
+                ));
+            };
+            Some(scope)
+        };
+        let previous = {
+            let mut scopes = self.lines_scopes.write().expect("lines_scopes poisoned");
+            match &scope {
+                Some(scope) => scopes.insert(self.plugin_name.clone(), scope.clone()),
+                None => scopes.remove(&self.plugin_name),
+            }
+        };
+        // Lines the editor already offered other plugins are not offered
+        // again on their own: re-offer the buffers the new scope adds.
+        // Narrowing a scope needs nothing.
+        match (previous, &scope) {
+            (Some(_), None) => {
+                let _ = self.command_sender.send(PluginCommand::RefreshAllLines);
+            }
+            (Some(previous), Some(scope)) if scope.composing && !previous.composing => {
+                let _ = self.command_sender.send(PluginCommand::RefreshAllLines);
+            }
+            (Some(previous), Some(scope)) => {
+                for &buffer_id in &scope.buffers {
+                    if !previous.buffers.contains(&buffer_id) {
+                        let _ = self
+                            .command_sender
+                            .send(PluginCommand::RefreshLines { buffer_id });
+                    }
+                }
+            }
+            (None, _) => {}
+        }
+        Ok(true)
     }
 
     // === Environment ===
@@ -9057,6 +9190,9 @@ pub struct QuickJsBackend {
     /// Shared with the editor thread so it can cheaply check
     /// "does anyone listen to this hook?" — see `EventHandlerRegistry`.
     event_handlers: EventHandlerRegistry,
+    /// Which buffers each plugin wants `lines_changed` for; see
+    /// `LinesScopeRegistry`.
+    lines_scopes: LinesScopeRegistry,
     /// Registered actions: action_name -> PluginHandler
     registered_actions: Rc<RefCell<HashMap<String, PluginHandler>>>,
     /// Editor state snapshot (read-only access)
@@ -9583,6 +9719,7 @@ impl QuickJsBackend {
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let search_handles: SearchHandleRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let event_handlers: EventHandlerRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let lines_scopes: LinesScopeRegistry = Arc::new(RwLock::new(HashMap::new()));
         Self::with_state_responses_and_resources(
             state_snapshot,
             command_sender,
@@ -9591,11 +9728,13 @@ impl QuickJsBackend {
             async_resource_owners,
             search_handles,
             event_handlers,
+            lines_scopes,
         )
     }
 
     /// Create a new QuickJS backend with editor state, shared pending responses,
     /// and a shared async resource owner map
+    #[allow(clippy::too_many_arguments)]
     pub fn with_state_responses_and_resources(
         state_snapshot: Arc<RwLock<EditorStateSnapshot>>,
         command_sender: mpsc::Sender<PluginCommand>,
@@ -9604,6 +9743,7 @@ impl QuickJsBackend {
         async_resource_owners: AsyncResourceOwners,
         search_handles: SearchHandleRegistry,
         event_handlers: EventHandlerRegistry,
+        lines_scopes: LinesScopeRegistry,
     ) -> Result<Self> {
         tracing::debug!("QuickJsBackend::new: creating QuickJS runtime");
 
@@ -9678,6 +9818,7 @@ impl QuickJsBackend {
             main_context,
             plugin_contexts,
             event_handlers,
+            lines_scopes,
             registered_actions,
             state_snapshot,
             command_sender,
@@ -9712,6 +9853,7 @@ impl QuickJsBackend {
             command_sender: self.command_sender.clone(),
             registered_actions: Rc::clone(&self.registered_actions),
             event_handlers: Arc::clone(&self.event_handlers),
+            lines_scopes: Arc::clone(&self.lines_scopes),
             next_request_id: Rc::clone(&self.next_request_id),
             callback_contexts: Rc::clone(&self.callback_contexts),
             services: self.services.clone(),
@@ -9939,6 +10081,10 @@ impl QuickJsBackend {
             // without scanning a stale empty Vec.
             handlers_map.retain(|_, list| !list.is_empty());
         }
+        self.lines_scopes
+            .write()
+            .expect("lines_scopes poisoned")
+            .remove(plugin_name);
 
         // 3. Remove registered actions for this plugin
         self.registered_actions
@@ -10196,11 +10342,33 @@ impl QuickJsBackend {
             .expect("event_handlers poisoned")
             .get(event_name)
             .cloned();
+        // A `lines_changed` batch goes to the plugins whose scope covers its
+        // buffer: the editor builds one when any handler wants it, not only
+        // for the handlers that do. The scopes are copied because a handler
+        // may set its plugin's scope while the batch is handed out.
+        let lines_scopes = (event_name == "lines_changed").then(|| {
+            let buffer_id = event_data.get("buffer_id").and_then(|v| v.as_u64());
+            let composing = event_data
+                .get("is_composing_in_any_split")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let scopes = self
+                .lines_scopes
+                .read()
+                .expect("lines_scopes poisoned")
+                .clone();
+            (buffer_id.map(|id| BufferId(id as usize)), composing, scopes)
+        });
         if let Some(handler_pairs) = handlers {
             let plugin_contexts = self.plugin_contexts.borrow();
             for handler in &handler_pairs {
                 if target.is_some_and(|t| t != handler.plugin_name) {
                     continue;
+                }
+                if let Some((Some(buffer_id), composing, scopes)) = &lines_scopes {
+                    if !plugin_wants_lines(scopes, &handler.plugin_name, *buffer_id, *composing) {
+                        continue;
+                    }
                 }
                 let Some(context) = plugin_contexts.get(&handler.plugin_name) else {
                     continue;
@@ -11400,6 +11568,119 @@ mod tests {
         }
         got.sort();
         assert_eq!(got, vec!["alpha got 7", "beta got 7"]);
+    }
+
+    #[tokio::test]
+    async fn lines_changed_goes_to_the_plugins_whose_scope_covers_the_buffer() {
+        // Three plugins take `lines_changed`: one for composed buffers, one
+        // for buffer 2, and one that never set a scope and so takes all.
+        let (mut backend, rx) = create_test_backend();
+        for (name, scope) in [
+            (
+                "compose",
+                "editor.setLinesChangedScope({ composing: true });",
+            ),
+            ("diff", "editor.setLinesChangedScope({ buffers: [2] });"),
+            ("any", ""),
+        ] {
+            backend
+                .execute_js(
+                    &format!(
+                        r#"
+                const editor = getEditor();
+                {scope}
+                globalThis.onLines = function(data) {{
+                    editor.setStatus("{name} " + data.buffer_id);
+                }};
+                editor.on("lines_changed", "onLines");
+            "#
+                    ),
+                    &format!("{name}.js"),
+                )
+                .unwrap();
+        }
+        while rx.try_recv().is_ok() {}
+
+        for (buffer, composing, expected) in [
+            (1, false, vec!["any 1"]),
+            (1, true, vec!["any 1", "compose 1"]),
+            (2, false, vec!["any 2", "diff 2"]),
+        ] {
+            let batch = serde_json::json!({
+                "buffer_id": buffer,
+                "lines": [],
+                "epoch": 0,
+                "is_composing_in_any_split": composing,
+            });
+            backend.emit("lines_changed", &batch).await.unwrap();
+            let mut got: Vec<String> = Vec::new();
+            while let Ok(cmd) = rx.try_recv() {
+                if let PluginCommand::SetStatus { message } = cmd {
+                    got.push(message);
+                }
+            }
+            got.sort();
+            assert_eq!(got, expected, "buffer {buffer}, composing {composing}");
+        }
+
+        // Without the plugin that takes everything, a batch is wanted only
+        // where a scope covers it.
+        let wants = |backend: &QuickJsBackend, buffer, composing| {
+            wants_lines(
+                &backend.event_handlers,
+                &backend.lines_scopes,
+                BufferId(buffer),
+                composing,
+            )
+        };
+        assert!(wants(&backend, 1, false));
+        backend.cleanup_plugin("any");
+        assert!(!wants(&backend, 1, false));
+        assert!(wants(&backend, 1, true));
+        assert!(wants(&backend, 2, false));
+        assert!(!wants(&backend, 3, false));
+        // An unloaded plugin's scope goes with it.
+        backend.cleanup_plugin("diff");
+        assert!(!backend.lines_scopes.read().unwrap().contains_key("diff"));
+        assert!(!wants(&backend, 2, false));
+    }
+
+    #[test]
+    fn widening_a_lines_scope_offers_the_buffers_it_adds_again() {
+        let (mut backend, rx) = create_test_backend();
+        let mut set = |scope: &str| {
+            backend
+                .execute_js(
+                    &format!("getEditor().setLinesChangedScope({scope});"),
+                    "diff.js",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut refreshed: Vec<String> = Vec::new();
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    PluginCommand::RefreshLines { buffer_id } => {
+                        refreshed.push(buffer_id.0.to_string())
+                    }
+                    PluginCommand::RefreshAllLines => refreshed.push("all".into()),
+                    _ => {}
+                }
+            }
+            Ok::<_, String>(refreshed)
+        };
+        // A first scope narrows "every buffer", as does dropping a buffer.
+        assert_eq!(set("{ buffers: [2] }").unwrap(), Vec::<String>::new());
+        assert_eq!(set("{ buffers: [2, 3, 4] }").unwrap(), vec!["3", "4"]);
+        assert_eq!(set("{ buffers: [4] }").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            set("{ buffers: [4], composing: true }").unwrap(),
+            vec!["all"]
+        );
+        assert_eq!(set("null").unwrap(), vec!["all"]);
+        assert!(set("{ buffers: 'all' }").is_err());
+        assert!(set("{ composing: 1 }").is_err());
+        assert!(set("[2]").is_err());
+        // `null` left no scope behind: the plugin takes every buffer again.
+        assert!(!backend.lines_scopes.read().unwrap().contains_key("diff"));
     }
 
     #[tokio::test]

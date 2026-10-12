@@ -58,6 +58,32 @@ getHandlers(event_name: string): string[]
 |------|------|-------------|
 | `event_name` | `string` | Name of the event |
 
+#### `setLinesChangedScope`
+
+Limit the `lines_changed` batches your handlers get to the buffers you
+decorate. Building a batch copies every line it offers, so the editor builds
+none that no handler wants. `composing: true` covers the buffers a split shows
+composed (page view); `buffers` lists buffer ids. `null`, the default, asks for
+every buffer. Each call replaces the plugin's scope, and a buffer it adds has
+its visible lines offered again.
+
+```typescript
+setLinesChangedScope(scope: { composing?: boolean; buffers?: number[] } | null): boolean
+```
+
+**Example:**
+
+```typescript
+// Decorate only the buffers the user turned the feature on in.
+const enabled = new Set<number>();
+function toggle(bufferId: number) {
+  if (!enabled.delete(bufferId)) enabled.add(bufferId);
+  editor.setLinesChangedScope({ buffers: [...enabled] });
+}
+editor.setLinesChangedScope({ buffers: [] });
+editor.on("lines_changed", (data) => { /* data.buffer_id is in `enabled` */ });
+```
+
 ## Window / Orchestrator events
 
 These events fire as the editor's window set changes. (The

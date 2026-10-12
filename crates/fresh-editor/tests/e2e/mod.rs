@@ -179,6 +179,7 @@ pub mod line_number_bugs;
 #[cfg(feature = "plugins")]
 pub mod line_numbers_override;
 pub mod line_wrapping;
+pub mod lines_changed_scope;
 pub mod list_clamp_no_spurious_select;
 pub mod live_grep;
 pub mod locale;

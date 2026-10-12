@@ -3112,6 +3112,9 @@ function computeRowWidths(bufferId: number, lines: LineInfoLike[]): boolean {
 
 
 // Register hooks
+// Batches only matter for composed buffers (the handler drops the rest), so
+// the editor builds none for any other buffer.
+editor.setLinesChangedScope({ composing: true });
 editor.on("lines_changed", (data) => {
   // Gate on the batch's OWN compose flag, not on `getBufferInfo`. The two
   // answer the same question, but only this one is guaranteed to be about the
