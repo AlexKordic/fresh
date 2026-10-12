@@ -32,7 +32,7 @@ include!(concat!(env!("OUT_DIR"), "/test_roots.rs"));
 fn generated_root_list_matches_the_directory() {
     // Declared in Cargo.toml as their own targets instead (feature-gated).
     // Kept in step with the same list in build.rs.
-    const SEPARATE_TARGETS: &[&str] = &["scene_parity"];
+    const SEPARATE_TARGETS: &[&str] = &["scene_golden", "scene_parity", "scene_socket"];
 
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut on_disk: Vec<String> = std::fs::read_dir(&dir)

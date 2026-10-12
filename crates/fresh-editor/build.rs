@@ -192,7 +192,7 @@ fn generate_test_roots() {
 
     // Declared in Cargo.toml as their own targets instead, because they are
     // feature-gated; pulling them in here would build them unconditionally.
-    const SEPARATE_TARGETS: &[&str] = &["scene_parity"];
+    const SEPARATE_TARGETS: &[&str] = &["scene_golden", "scene_parity", "scene_socket"];
 
     // Forward slashes, even on Windows: this path is about to be written into
     // a Rust string literal, and `D:\a\fresh\...` makes `\a` and `\f` look
