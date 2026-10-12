@@ -1,30 +1,31 @@
-//! The web scene's JSON, byte for byte, across a set of scenarios.
+//! The scenes the bridges send, across a set of scenarios.
 //!
-//! The bridge's insides change (how it renders, how it gathers the scene);
-//! what it sends a browser must not. Each scenario's scene — the browser's
-//! (`scene_value`) and the grid client's (`scene_value_grid`) — is compared
-//! with the file recorded for it in `tests/fixtures/scene_golden/`, as the
-//! exact text `serde_json` writes, with the scratch directory's path replaced
-//! by `$WORK` and the pacing hint `poll.active` (whether a timer happens to be
-//! pending) masked. `UPDATE_SCENE_GOLDEN=1` records the files again.
+//! The bridges' insides change (how they render, how they gather and encode
+//! the scene); what they send must not. Each scenario's scene is compared
+//! with the files recorded for it in `tests/fixtures/scene_golden/`, with
+//! the scratch directory's path replaced by `$WORK`:
 //!
-//! The editor runs in a scratch HOME with a config that turns off what moves
-//! on its own (the welcome screen, the orchestrator dock, update checks), so
-//! two runs see the same scene.
+//! - `<name>.web.json`: the browser's scene (`scene_value`), as the exact
+//!   text `serde_json` writes, with the pacing hint `poll.active` (whether a
+//!   timer happens to be pending) masked;
+//! - `<name>.app.txt`: the scene File Commander's app builds from its socket's
+//!   protobuf messages, decoded with types generated from `scene.proto`
+//!   (`scene_proto/`), as text (`Client::dump`). A new client's hello and a
+//!   client that got every frame since the first scenario must build the
+//!   same scene.
 //!
-//! The same scenarios check File Commander's socket encoding against the grid
-//! scene: protobuf decoded with types generated from `scene.proto`
-//! (`scene_proto/`), from a new client's hello and from a client that got
-//! every frame since the first scenario. `scene.proto` itself must be what the
-//! encoders write.
+//! `UPDATE_SCENE_GOLDEN=1` records the files again. The editor runs in a
+//! scratch HOME with a config that turns off what moves on its own (the
+//! welcome screen, the orchestrator dock, update checks), so two runs see the
+//! same scene. `scene.proto` itself must be what the encoders write.
 
 #[path = "scene_proto/fresh.scene.v1.rs"]
 #[allow(clippy::all)]
 mod scene_proto;
-#[path = "scene_proto/check.rs"]
-mod check;
+#[path = "scene_proto/client.rs"]
+mod client;
 
-use fresh::webui::{apply_step, build_editor, scene_value, scene_value_grid, wire_schema, WireProbe};
+use fresh::webui::{apply_step, build_editor, scene_value, wire_schema, WireProbe};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -113,55 +114,43 @@ fn web_scene_json_is_unchanged() {
     let mut mismatches = Vec::new();
     // A client that gets every frame, from the first scenario on.
     let mut probe = WireProbe::new(&ed);
-    let mut client = check::Client::default();
+    let mut client = client::Client::default();
     let mut copied = 0;
     for (name, steps) in scenarios() {
         for step in &steps {
             apply_step(&mut ed, step);
         }
         settle(&mut ed);
-        for (kind, scene) in [
-            ("web", scene_value(&mut ed, COLS, ROWS)),
-            ("grid", scene_value_grid(&mut ed, COLS, ROWS)),
-        ] {
-            let text = scene
-                .to_string()
-                .replace(&work_text, "$WORK")
-                .replace(&work.display().to_string(), "$WORK")
-                .replace(r#""poll":{"active":true}"#, r#""poll":{"active":"?"}"#)
-                .replace(r#""poll":{"active":false}"#, r#""poll":{"active":"?"}"#);
-            let path = dir.join(format!("{name}.{kind}.json"));
-            if update {
-                std::fs::write(&path, &text).expect("write golden");
-            } else {
-                let expected = std::fs::read_to_string(&path).unwrap_or_default();
-                if expected != text {
-                    let at = expected.bytes().zip(text.bytes()).take_while(|(a, b)| a == b).count();
-                    let from = at.saturating_sub(80);
-                    mismatches.push(format!(
-                        "{name}.{kind}: differs at byte {at}\n  recorded: {}\n  now:      {}",
-                        expected.get(from..(at + 120).min(expected.len())).unwrap_or(""),
-                        text.get(from..(at + 120).min(text.len())).unwrap_or("")
-                    ));
-                }
+        let text = scene_value(&mut ed, COLS, ROWS)
+            .to_string()
+            .replace(&work_text, "$WORK")
+            .replace(&work.display().to_string(), "$WORK")
+            .replace(r#""poll":{"active":true}"#, r#""poll":{"active":"?"}"#)
+            .replace(r#""poll":{"active":false}"#, r#""poll":{"active":"?"}"#);
+        let path = dir.join(format!("{name}.web.json"));
+        if update {
+            std::fs::write(&path, &text).expect("write golden");
+        } else {
+            let expected = std::fs::read_to_string(&path).unwrap_or_default();
+            if expected != text {
+                let at = expected.bytes().zip(text.bytes()).take_while(|(a, b)| a == b).count();
+                let from = at.saturating_sub(80);
+                mismatches.push(format!(
+                    "{name}.web: differs at byte {at}\n  recorded: {}\n  now:      {}",
+                    expected.get(from..(at + 120).min(expected.len())).unwrap_or(""),
+                    text.get(from..(at + 120).min(text.len())).unwrap_or("")
+                ));
             }
         }
-        // File Commander's socket, after the recorded scenes: its options
-        // (native menus) change what the browser's scene shows.
-        let grid = scene_value_grid(&mut ed, COLS, ROWS);
+        // File Commander's socket, after the browser's scene: the app's scene
+        // has no menu row, which changes what the browser's would show.
         if let Some((kind, payload)) = probe.next(&mut ed, COLS, ROWS) {
             client.receive(kind, &payload);
             copied += client.rows_copied;
         }
-        for diff in check::compare(&grid, &client) {
-            mismatches.push(format!("{name}, frames since the first: {diff}"));
-        }
-        let mut fresh = check::Client::default();
+        let mut fresh = client::Client::default();
         let (kind, payload) = WireProbe::new(&ed).next(&mut ed, COLS, ROWS).expect("a hello");
         fresh.receive(kind, &payload);
-        for diff in check::compare(&grid, &fresh) {
-            mismatches.push(format!("{name}, a new client's hello: {diff}"));
-        }
         let mask = |text: String| text.replace(&work_text, "$WORK").replace(&work.display().to_string(), "$WORK");
         let (hello, frames) = (mask(fresh.dump()), mask(client.dump()));
         if frames != hello {

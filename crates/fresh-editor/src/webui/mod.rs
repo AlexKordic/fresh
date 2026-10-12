@@ -134,67 +134,15 @@ pub const DEFAULT_SIZE: (u16, u16) = (140, 44);
 /// therefore requires a rebuild.
 const INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/webui-index.html"));
 
-/// One connection the bridge serves: a browser's TCP socket (`fresh --web`,
-/// the parity harnesses). File Commander's native editor has a socket and a
-/// protocol of its own (`SceneBridge`).
-type Conn = TcpStream;
-
-/// What the connected front end asked the scene to carry — set by a
-/// `configure` message, or by the `/ws` upgrade's query (`?grid=1&menus=native`)
-/// so the hello already has it. One set per bridge: FC's socket serves one app.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SceneOptions {
-    /// Ship the whole frame as cells, chrome included, as `regions.grid` (one
-    /// array of runs per row, diffed per row). For a front end that draws
-    /// Fresh's own surfaces from cells until it has native ones; the panes then
-    /// carry their geometry but no cells of their own.
-    pub grid: bool,
-    /// The front end shows Fresh's menus in its own menu bar.
-    pub native_menus: bool,
-    /// Each frame carries timing for the front end's latency telemetry (`t`):
-    /// how many of the client's messages were applied before it was built, how
-    /// long building and diffing took, the bytes of earlier frames still queued
-    /// ahead of it, wheel lines still owed, the top line.
-    pub telemetry: bool,
-    /// The client applies `regions.grid.copy`: grid rows it already has,
-    /// named by where they were in its previous frame. A scroll then sends
-    /// only the rows that came into view.
-    pub row_copies: bool,
-}
-
-/// What a frame's telemetry reports about building the scene it came from.
-#[derive(Clone, Copy, Debug)]
-struct FrameTiming {
-    build_ms: f64,
-    times: SceneTimes,
-    owed: u32,
-    top: usize,
-    /// The process's CPU time so far (user and system).
-    cpu_ms: f64,
-    /// Allocations and bytes of the previous push, from building its scene to
-    /// queueing its frames (`alloc-stats` builds only). The previous push,
-    /// because this frame's own encoding allocates after its timing is set.
-    prev_allocs: Option<(u64, u64)>,
-}
-
-/// The process's CPU time so far, user and system, in milliseconds.
-fn process_cpu_ms() -> f64 {
-    #[cfg(unix)]
-    {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-        // SAFETY: getrusage fills the struct it is given.
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
-            return 0.0;
-        }
-        // SAFETY: zeroed, then filled by a successful getrusage.
-        let usage = unsafe { usage.assume_init() };
-        let ms = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
-        ms(usage.ru_utime) + ms(usage.ru_stime)
-    }
-    #[cfg(not(unix))]
-    {
-        0.0
-    }
+/// Who a scene is gathered for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SceneFor {
+    /// A browser: pane interiors as cells; it draws the chrome from the model.
+    Browser,
+    /// File Commander's app (`SceneBridge`): the whole frame as cells, chrome
+    /// included, and no menu row while no menu is open — the app has Fresh's
+    /// menus in its own menu bar.
+    App,
 }
 
 /// Where part of building a scene went, for telemetry: rendering the editor
@@ -204,34 +152,6 @@ fn process_cpu_ms() -> f64 {
 struct SceneTimes {
     render_ms: f64,
     grid_ms: f64,
-}
-
-impl SceneOptions {
-    /// Read the options from a `configure` message.
-    fn from_message(v: &Value) -> Self {
-        Self {
-            grid: v.get("grid").and_then(|b| b.as_bool()).unwrap_or(false),
-            native_menus: v.get("nativeMenus").and_then(|b| b.as_bool()).unwrap_or(false),
-            telemetry: v.get("telemetry").and_then(|b| b.as_bool()).unwrap_or(false),
-            row_copies: v.get("rowCopies").and_then(|b| b.as_bool()).unwrap_or(false),
-        }
-    }
-
-    /// Read the options from the query of a `/ws` request path, if it has one.
-    fn from_ws_path(path: &str) -> Option<Self> {
-        let query = path.strip_prefix("/ws?")?;
-        let mut options = Self::default();
-        for pair in query.split('&') {
-            match pair {
-                "grid=1" => options.grid = true,
-                "menus=native" => options.native_menus = true,
-                "telemetry=1" => options.telemetry = true,
-                "copies=1" => options.row_copies = true,
-                _ => {}
-            }
-        }
-        Some(options)
-    }
 }
 
 /// Cap on the clipboard text exposed in the scene (`ClipboardSync`). Anything
@@ -409,6 +329,7 @@ pub fn scene_value(editor: &mut Editor, cols: u16, rows: u16) -> Value {
 /// encoding the last one took (`alloc-stats` builds).
 pub struct WireProbe {
     source: SceneSource,
+    grid: GridHasher,
     encoded: wire::EncodedScene,
     client: wire::ClientScene,
     body: Vec<u8>,
@@ -422,6 +343,7 @@ impl WireProbe {
     pub fn new(editor: &Editor) -> Self {
         Self {
             source: SceneSource::new(editor),
+            grid: GridHasher::default(),
             encoded: wire::EncodedScene::default(),
             client: wire::ClientScene::default(),
             body: Vec::new(),
@@ -433,17 +355,11 @@ impl WireProbe {
     /// The next message for the editor's scene at `cols` × `rows`: its type
     /// and payload, `None` for a frame with nothing new.
     pub fn next(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> Option<(u64, Vec<u8>)> {
-        let options = SceneOptions {
-            grid: true,
-            native_menus: true,
-            row_copies: true,
-            telemetry: false,
-        };
         let source = &mut self.source;
-        let model = SceneModel::gather(editor, &mut source.renderer, cols, rows, options, &mut SceneTimes::default());
+        let model = SceneModel::gather(editor, &mut source.renderer, cols, rows, SceneFor::App, &mut SceneTimes::default());
         let (seq, text) = source.clip.current(editor);
         let before = crate::alloc_stats::counts();
-        let grid = source.grid.frame(model.buf);
+        let grid = self.grid.frame(model.buf);
         self.encoded.encode(&model, wire::Clipboard { seq, text });
         self.body.clear();
         let message = if self.seq == 0 {
@@ -463,21 +379,6 @@ impl WireProbe {
 /// `scene.proto`, as File Commander's socket encoding writes it. For tests.
 pub fn wire_schema() -> String {
     wire::schema()
-}
-
-/// The whole scene a grid client with native menus gets (File Commander's
-/// options), grid rows included, without a tick. For tests.
-pub fn scene_value_grid(editor: &mut Editor, cols: u16, rows: u16) -> Value {
-    let options = SceneOptions {
-        grid: true,
-        native_menus: true,
-        ..SceneOptions::default()
-    };
-    let (mut renderer, mut hasher) = (SceneRenderer::new(), GridHasher::default());
-    let (mut scene, grid) =
-        scene_parts(editor, &mut renderer, &mut hasher, cols, rows, options, &mut SceneTimes::default());
-    GridFrame::embed(grid.as_ref(), &mut scene);
-    scene
 }
 
 /// Render the SAME editor the way the TUI would — chrome drawn into cells — and
@@ -544,8 +445,9 @@ pub struct BridgePoll {
     /// A client joined, left, or reported a new viewport, so the host should
     /// refit the shared grid — see [`WebBridge::wanted_size`].
     pub resize_dirty: bool,
-    /// A client that frames were held back from caught up, so the host should
-    /// push the scene now even though the editor didn't change.
+    /// File Commander's app caught up after frames were held back from it, so
+    /// the host should push the scene now even though the editor didn't change
+    /// (`SceneBridge`; browsers are never held back).
     pub frame_owed: bool,
 }
 
@@ -567,8 +469,6 @@ pub struct BridgePoll {
 /// which the daemon mins against its attached terminals.
 pub struct WebBridge {
     listener: TcpListener,
-    /// What the connected front end asked the scene to carry.
-    options: SceneOptions,
     /// Host part of the bind address — only the fallback for the WS-upgrade
     /// Origin check when a request carries no Host header (the check prefers
     /// the request's Host header; see `origin_host_matches`).
@@ -592,8 +492,6 @@ pub struct WebBridge {
     /// workspace, attached terminals — that a silent replacement would drop on
     /// the floor, so the route is refused there instead.
     allow_reset: bool,
-    /// Allocations of the last push, for the next frame's telemetry.
-    last_push_allocs: Option<(u64, u64)>,
 }
 
 impl WebBridge {
@@ -611,25 +509,13 @@ impl WebBridge {
             .to_string();
         Ok(Self {
             listener,
-            options: SceneOptions::default(),
             bind_host,
             pending: Vec::new(),
             ws: Vec::new(),
             source: SceneSource::new(editor),
             files: files.to_vec(),
             allow_reset,
-            last_push_allocs: None,
         })
-    }
-
-    /// Switch to `options`. Turning native menus off gives the active window
-    /// its configured menu row back.
-    fn set_options(&mut self, editor: &mut Editor, options: SceneOptions) {
-        if self.options.native_menus && !options.native_menus {
-            let show = editor.config().editor.show_menu_bar;
-            editor.active_window_mut().menu_bar_visible = show;
-        }
-        self.options = options;
     }
 
     /// True while a browser is connected or a request is mid-assembly. The
@@ -680,25 +566,12 @@ impl WebBridge {
         while i < self.ws.len() {
             match self.ws[i].drain_messages() {
                 Ok(msgs) => {
-                    self.ws[i].received += msgs.len() as u64;
                     for m in &msgs {
                         let v: Value = serde_json::from_str(m).unwrap_or_else(|_| json!({}));
                         let kind = v.get("type").and_then(|t| t.as_str());
                         if kind == Some("resize") {
                             if self.ws[i].note_resize(&v) {
                                 out.resize_dirty = true;
-                            }
-                        } else if kind == Some("applied") {
-                            if self.ws[i].note_applied(&v) {
-                                out.frame_owed = true;
-                            }
-                        } else if kind == Some("configure") {
-                            // Changes what the scene carries, not the editor;
-                            // `mutated` gets the reshaped scene pushed now.
-                            let options = SceneOptions::from_message(&v);
-                            if options != self.options {
-                                self.set_options(editor, options);
-                                out.mutated = true;
                             }
                         } else {
                             inputs.push(v);
@@ -712,14 +585,6 @@ impl WebBridge {
                     out.resize_dirty = true;
                 }
             }
-        }
-
-        // A front end's options last as long as it does: when the last client
-        // leaves (or one turns native menus off), the menu row comes back for
-        // the terminals.
-        if self.ws.is_empty() && self.options != SceneOptions::default() {
-            self.set_options(editor, SceneOptions::default());
-            out.mutated = true;
         }
 
         // 2) Accept new connections into the pending pool (nonblocking).
@@ -762,11 +627,6 @@ impl WebBridge {
                 }
                 Pump::Ready(req) => {
                     let conn = self.pending.remove(i);
-                    // A `/ws?…` upgrade names its options up front, so the
-                    // hello it gets already has the scene it wants.
-                    if let Some(options) = SceneOptions::from_ws_path(&req.path) {
-                        self.set_options(editor, options);
-                    }
                     match serve_request(
                         conn.stream,
                         &req,
@@ -777,7 +637,6 @@ impl WebBridge {
                         &mut self.source,
                         &self.bind_host,
                         self.allow_reset,
-                        self.options,
                     ) {
                         Ok(Served::WsClient(session)) => {
                             let mut session = *session;
@@ -820,44 +679,20 @@ impl WebBridge {
     /// Each client's diff is against ITS OWN last-sent cache (they connected at
     /// different times), so one shared scene still yields correct per-client
     /// frames. A client whose push fails is dropped.
-    ///
-    /// Returns true while a client is owed a frame it was held back from
-    /// (`FRAMES_AHEAD`): the host pushes again when one catches up
-    /// (`BridgePoll::frame_owed`) or, failing that, on its own cadence. While
-    /// no client can take a frame, nothing is built.
-    pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> bool {
+    pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) {
         if self.ws.is_empty() {
-            return false;
+            return;
         }
-        if !self.ws.iter().any(WsSession::ready) {
-            for session in &mut self.ws {
-                session.held = true;
-            }
-            return true;
-        }
-        let allocs_before = crate::alloc_stats::counts();
-        let started = Instant::now();
-        let mut times = SceneTimes::default();
-        let (scene, grid) = build_scene(editor, &mut self.source, cols, rows, self.options, &mut times);
-        let timing = self.options.telemetry.then(|| FrameTiming {
-            build_ms: started.elapsed().as_secs_f64() * 1000.0,
-            times,
-            owed: editor.pending_wheel_lines(),
-            top: editor.active_top_line(),
-            cpu_ms: process_cpu_ms(),
-            prev_allocs: self.last_push_allocs,
-        });
+        let scene = build_scene(editor, &mut self.source, cols, rows);
         let mut i = 0;
         while i < self.ws.len() {
-            if let Err(e) = self.ws[i].push_diff(&scene, grid.as_ref(), timing, self.options.row_copies) {
+            if let Err(e) = self.ws[i].push_diff(&scene) {
                 eprintln!("[webui] ws push failed, dropping client: {e}");
                 self.ws.remove(i);
             } else {
                 i += 1;
             }
         }
-        self.last_push_allocs = crate::alloc_stats::since(allocs_before);
-        self.ws.iter().any(|session| session.held)
     }
 
     /// Heartbeat + drain buffered outbound bytes for EACH client — a periodic
@@ -928,7 +763,10 @@ impl HostedBridge {
 
     pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> bool {
         match self {
-            HostedBridge::Web(b) => b.push_scene(editor, cols, rows),
+            HostedBridge::Web(b) => {
+                b.push_scene(editor, cols, rows);
+                false
+            }
             #[cfg(unix)]
             HostedBridge::Scene(b) => b.push_scene(editor, cols, rows),
         }
@@ -969,8 +807,6 @@ pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
     );
 
     let mut next_tick = Instant::now();
-    // A client is owed a frame it was held back from (`push_scene`).
-    let mut held = false;
 
     loop {
         // 0) Drain nested-forward command requests (file/dir opens, and the
@@ -1011,14 +847,11 @@ pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
             // (animations / LSP spinner — `poll_active`, refreshed on the fast
             // cadence below). An unchanged scene diffs to nothing anyway;
             // skipping the build keeps connected-but-idle sessions near 0% CPU.
-            // A frame held back from a client that fell behind is owed too.
-            if had_input || needs_render || active_hint || held {
-                held = bridge.push_scene(&mut editor, cols, rows);
+            if had_input || needs_render || active_hint {
+                bridge.push_scene(&mut editor, cols, rows);
             }
             let interval = if active_hint { TICK_ACTIVE } else { TICK_IDLE };
             next_tick = Instant::now() + interval;
-        } else if poll.frame_owed {
-            held = bridge.push_scene(&mut editor, cols, rows);
         }
 
         // 4) Heartbeat / flush; a reap here shrank the constraint set, so refit.
@@ -1076,7 +909,7 @@ impl HttpRequest {
 
 /// A connection whose request bytes are still arriving.
 struct PendingConn {
-    stream: Conn,
+    stream: TcpStream,
     buf: Vec<u8>,
     since: Instant,
 }
@@ -1171,7 +1004,7 @@ enum Served {
 /// editor over HTTP (see below).
 #[allow(clippy::too_many_arguments)]
 fn serve_request(
-    mut stream: Conn,
+    mut stream: TcpStream,
     req: &HttpRequest,
     editor: &mut Editor,
     cols: &mut u16,
@@ -1180,7 +1013,6 @@ fn serve_request(
     source: &mut SceneSource,
     bind_host: &str,
     allow_reset: bool,
-    options: SceneOptions,
 ) -> Result<Served> {
     // Serve the response blocking for simplicity — but bound the write. `GET /`
     // returns the whole embedded page (~200 KB), so a client that stops reading
@@ -1192,12 +1024,12 @@ fn serve_request(
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(HTTP_READ_DEADLINE))?;
     let wants_ws = req.method == "GET"
-        && (req.path == "/ws" || req.path.starts_with("/ws?"))
+        && req.path == "/ws"
         && req
             .header("upgrade")
             .is_some_and(|u| u.to_ascii_lowercase().contains("websocket"));
     if wants_ws {
-        return match upgrade_ws(stream, req, editor, *cols, *rows, source, bind_host, options)? {
+        return match upgrade_ws(stream, req, editor, *cols, *rows, source, bind_host)? {
             Some(session) => Ok(Served::WsClient(Box::new(session))),
             None => Ok(Served::Http { mutated: false }),
         };
@@ -1232,7 +1064,6 @@ fn serve_request(
         files,
         source,
         allow_reset,
-        options,
     )?;
     Ok(Served::Http { mutated })
 }
@@ -1244,7 +1075,7 @@ fn serve_request(
 /// whether the route may have mutated editor state.
 #[allow(clippy::too_many_arguments)]
 fn handle_http(
-    stream: &mut Conn,
+    stream: &mut TcpStream,
     req: &HttpRequest,
     editor: &mut Editor,
     cols: &mut u16,
@@ -1252,7 +1083,6 @@ fn handle_http(
     files: &[PathBuf],
     source: &mut SceneSource,
     allow_reset: bool,
-    options: SceneOptions,
 ) -> Result<bool> {
     let body_json = || serde_json::from_slice::<Value>(&req.body).unwrap_or_else(|_| json!({}));
     match (req.method.as_str(), req.path.as_str()) {
@@ -1270,7 +1100,7 @@ fn handle_http(
             Ok(false)
         }
         ("GET", "/state") => {
-            let s = tick_scene(editor, source, *cols, *rows, options).to_string();
+            let s = tick_scene(editor, source, *cols, *rows).to_string();
             respond(stream, "200 OK", "application/json", s.as_bytes())?;
             Ok(false)
         }
@@ -1285,7 +1115,7 @@ fn handle_http(
             | "/resize"),
         ) => {
             apply_message(editor, &p[1..], &body_json(), cols, rows);
-            let s = tick_scene(editor, source, *cols, *rows, options).to_string();
+            let s = tick_scene(editor, source, *cols, *rows).to_string();
             respond(stream, "200 OK", "application/json", s.as_bytes())?;
             Ok(true)
         }
@@ -1704,14 +1534,13 @@ fn origin_host_matches(origin: &str, host_header: Option<&str>, bind_host: &str)
 /// request — every client joins (shared-view mirroring, see the module docs).
 #[allow(clippy::too_many_arguments)]
 fn upgrade_ws(
-    mut stream: Conn,
+    mut stream: TcpStream,
     req: &HttpRequest,
     editor: &mut Editor,
     cols: u16,
     rows: u16,
     source: &mut SceneSource,
     bind_host: &str,
-    options: SceneOptions,
 ) -> Result<Option<WsSession>> {
     if let Some(origin) = req.header("origin") {
         if !origin_host_matches(origin, req.header("host"), bind_host) {
@@ -1742,8 +1571,8 @@ fn upgrade_ws(
     stream.set_nonblocking(true)?;
     let mut session = WsSession::new(stream);
     tick_only(editor);
-    let (scene, grid) = build_scene(editor, source, cols, rows, options, &mut SceneTimes::default());
-    session.send_hello(&scene, grid.as_ref())?;
+    let scene = build_scene(editor, source, cols, rows);
+    session.send_hello(&scene)?;
     Ok(Some(session))
 }
 
@@ -1842,17 +1671,6 @@ fn ws_encode(opcode: u8, payload: &[u8]) -> Vec<u8> {
 /// stall is absorbed, not a real one.
 const WS_OUTBUF_CAP: usize = 8 << 20; // 8 MiB
 
-/// Frames a client that reports what it applied (`applied`) may have sent to
-/// it but not yet applied. Past this, newer frames are held back, and once it
-/// catches up it gets one frame with the newest scene: a client that falls
-/// behind skips to the present instead of working through every frame in
-/// between, each one older than the last by the time it is shown.
-const FRAMES_AHEAD: u64 = 2;
-
-/// How long a client with frames held back may go without reporting before
-/// frames go out regardless, so a lost `applied` can't freeze its view.
-const APPLIED_TIMEOUT: Duration = Duration::from_millis(500);
-
 /// THE WebSocket client, plus the diff cache backing the region-diff protocol
 /// (see the module docs). The cache holds an 8-byte fingerprint of every unit
 /// last sent — top-level scalars, each `regions.<key>` except panes, and each
@@ -1862,7 +1680,7 @@ const APPLIED_TIMEOUT: Duration = Duration::from_millis(500);
 /// ONLY by this session's hello/push path — HTTP routes build their own full
 /// scenes independently and never touch it.
 struct WsSession {
-    stream: Conn,
+    stream: TcpStream,
     /// Inbound bytes not yet parsed into complete frames.
     inbuf: Vec<u8>,
     /// Encoded outbound frames the socket hasn't accepted yet. Writes are
@@ -1876,8 +1694,6 @@ struct WsSession {
     top: HashMap<&'static str, u64>,
     regions: HashMap<String, u64>,
     panes: Vec<u64>,
-    /// Row fingerprints of `regions.grid`, diffed per row like `panes`.
-    grid: Vec<u64>,
     /// Liveness clock: the last time ANY inbound bytes arrived (input, a pong,
     /// a ping — all count). Refreshed in `drain_messages`; read by `heartbeat`
     /// to reap a peer that has gone silent past `WS_LIVENESS_TIMEOUT`.
@@ -1890,19 +1706,6 @@ struct WsSession {
     /// client first reports (seeded to the current effective size on join so it
     /// doesn't transiently shrink the grid before its real viewport arrives).
     want: Option<(u16, u16)>,
-    /// Messages received from this client so far, every kind: a frame's
-    /// telemetry reports it as `ack`, so the client knows which of its inputs
-    /// the frame already shows.
-    received: u64,
-    /// The last frame the client reported applying (`applied`), once it
-    /// reports at all. Only a client that reports has frames held back
-    /// (`FRAMES_AHEAD`); a browser never does.
-    applied: Option<u64>,
-    /// A frame was held back from this client: it is owed the newest scene
-    /// as soon as it can take one.
-    held: bool,
-    /// When the last frame was queued, for `APPLIED_TIMEOUT`.
-    sent_at: Instant,
 }
 
 /// Fingerprint a JSON value for change detection by streaming its serialization
@@ -1931,24 +1734,11 @@ fn value_fingerprint(v: &Value) -> u64 {
     hw.0.finish()
 }
 
-/// The grid rows that changed but that the client already has at another
-/// index of its previous frame, as `[to, from, count]` runs: rows `to..to+count`
-/// become its previous rows `from..from+count`. A scroll moves rows rather
-/// than changing them, so this names nearly all of them in one run, and only
-/// the rows that came into view (and any whose content changed, such as a
-/// scrollbar's) are sent in full. The client applies every run to its
-/// previous rows before the rows sent in full.
-fn grid_copies(old: &[u64], new: &[u64]) -> Vec<[usize; 3]> {
-    let mut runs = Vec::new();
-    wire::grid_copies_into(old, new, &mut HashMap::new(), &mut runs);
-    runs
-}
-
 /// Top-level scene keys diffed as single units ("regions" is handled per key).
 const TOP_KEYS: [&str; 5] = ["w", "h", "theme", "clipboard", "windowId"];
 
 impl WsSession {
-    fn new(stream: Conn) -> Self {
+    fn new(stream: TcpStream) -> Self {
         Self {
             stream,
             inbuf: Vec::new(),
@@ -1959,32 +1749,10 @@ impl WsSession {
             top: HashMap::new(),
             regions: HashMap::new(),
             panes: Vec::new(),
-            grid: Vec::new(),
             last_recv: Instant::now(),
             last_ping: Instant::now(),
             want: None,
-            received: 0,
-            applied: None,
-            held: false,
-            sent_at: Instant::now(),
         }
-    }
-
-    /// Whether a frame may go out now: unless the client reports what it
-    /// applied and is `FRAMES_AHEAD` frames behind (and has reported lately).
-    fn ready(&self) -> bool {
-        self.applied.is_none_or(|applied| {
-            self.seq.saturating_sub(applied) < FRAMES_AHEAD
-                || self.sent_at.elapsed() >= APPLIED_TIMEOUT
-        })
-    }
-
-    /// Note the client's `applied` (`seq`, the frame it applied). True when it
-    /// is owed a held-back frame and can take it now.
-    fn note_applied(&mut self, v: &Value) -> bool {
-        let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
-        self.applied = Some(self.applied.map_or(seq, |applied| applied.max(seq)));
-        self.held && self.ready()
     }
 
     /// Record this client's wanted grid size from a `resize` message, applying
@@ -2024,85 +1792,34 @@ impl WsSession {
         Ok(())
     }
 
-    /// `{"type":"hello","seq":0,"scene":<full scene>,"acks":true}` — sent once
-    /// per connection; seeds the diff cache and restarts `seq`. `acks` tells
-    /// the client it may report each message it applied (`applied`), and then
-    /// gets the newest scene rather than every frame when it falls behind.
-    fn send_hello(&mut self, scene: &Value, grid: Option<&GridFrame<'_>>) -> std::io::Result<()> {
+    /// `{"type":"hello","seq":0,"scene":<full scene>}` — sent once per
+    /// connection; seeds the diff cache and restarts `seq`.
+    fn send_hello(&mut self, scene: &Value) -> std::io::Result<()> {
         self.seq = 0;
-        self.diff(scene, grid, false); // seed the cache; the hello carries the full scene
-        let mut msg = json!({ "type": "hello", "seq": 0, "scene": scene, "acks": true });
-        GridFrame::embed(grid, &mut msg["scene"]);
-        let msg = msg.to_string();
+        self.diff(scene); // seed the cache; the hello carries the full scene
+        let msg = json!({ "type": "hello", "seq": 0, "scene": scene }).to_string();
         self.enqueue(0x1, msg.as_bytes());
         self.flush()
     }
 
     /// Diff `scene` against the last-sent one and push a
     /// `{"type":"frame","seq":N,"changed":{...}}` if anything changed.
-    ///
-    /// A client too far behind (`ready`) gets nothing now: the cache keeps
-    /// what it last sent, and the frame after it catches up carries
-    /// everything that changed since.
-    fn push_diff(
-        &mut self,
-        scene: &Value,
-        grid: Option<&GridFrame<'_>>,
-        timing: Option<FrameTiming>,
-        row_copies: bool,
-    ) -> std::io::Result<()> {
-        if !self.ready() {
-            self.held = true;
-            return self.flush();
-        }
-        self.held = false;
-        let started = Instant::now();
-        let changed = self.diff(scene, grid, row_copies);
+    fn push_diff(&mut self, scene: &Value) -> std::io::Result<()> {
+        let changed = self.diff(scene);
         if changed.is_empty() {
             return self.flush(); // still drain any backlog from earlier frames
         }
-        let ahead = self.applied.map_or(0, |applied| self.seq.saturating_sub(applied));
         self.seq += 1;
-        self.sent_at = Instant::now();
-        let mut msg = json!({ "type": "frame", "seq": self.seq, "changed": Value::Object(changed) });
-        if let Some(timing) = timing {
-            msg["t"] = json!({
-                "ack": self.received,
-                // Bytes of earlier frames still waiting for the socket: this
-                // frame reaches the client only after them.
-                "queued": self.outbuf.len(),
-                // Earlier frames sent that the client had not applied yet.
-                "ahead": ahead,
-                "build_ms": timing.build_ms,
-                // Of building: rendering the editor, and hashing the grid's rows.
-                "render_ms": timing.times.render_ms,
-                "grid_ms": timing.times.grid_ms,
-                "diff_ms": started.elapsed().as_secs_f64() * 1000.0,
-                "owed": timing.owed,
-                "top": timing.top,
-                "cpu_ms": timing.cpu_ms,
-            });
-            if let Some((allocs, bytes)) = timing.prev_allocs {
-                msg["t"]["prev_allocs"] = json!(allocs);
-                msg["t"]["prev_alloc_bytes"] = json!(bytes);
-            }
-        }
-        let msg = msg.to_string();
+        let msg = json!({ "type": "frame", "seq": self.seq, "changed": Value::Object(changed) })
+            .to_string();
         self.enqueue(0x1, msg.as_bytes());
         self.flush()
     }
 
     /// Compute the changed-paths map and update the cache. A changed value
     /// replaces the previous one wholesale (null is a legal value — regions
-    /// are frequently null). Grid rows come from `grid` and are compared by
-    /// their cells' hashes; with `row_copies`, a row the client already has at
-    /// another index is named by that index instead (`grid_copies`).
-    fn diff(
-        &mut self,
-        scene: &Value,
-        grid: Option<&GridFrame<'_>>,
-        row_copies: bool,
-    ) -> serde_json::Map<String, Value> {
+    /// are frequently null).
+    fn diff(&mut self, scene: &Value) -> serde_json::Map<String, Value> {
         let mut changed = serde_json::Map::new();
         for k in TOP_KEYS {
             let v = scene.get(k).cloned().unwrap_or(Value::Null);
@@ -2118,7 +1835,7 @@ impl WsSession {
             .and_then(|r| r.as_object())
             .unwrap_or(&empty);
         for (k, v) in regions {
-            if k == "panes" || k == "grid" {
+            if k == "panes" {
                 continue; // diffed one level deeper below
             }
             let h = value_fingerprint(v);
@@ -2144,31 +1861,6 @@ impl WsSession {
             changed.insert("regions.panes.len".to_string(), json!(new_hashes.len()));
         }
         self.panes = new_hashes;
-        // The full-frame grid (`SceneOptions::grid`) is the biggest unit of
-        // all; typing changes a row or two, so it goes per row, and a row's
-        // runs are built only when it is sent.
-        let grid_hashes: &[u64] = grid.map_or(&[], |g| g.hashes);
-        let copies = if row_copies {
-            grid_copies(&self.grid, grid_hashes)
-        } else {
-            Vec::new()
-        };
-        let copied = |i: usize| copies.iter().any(|&[to, _, n]| (to..to + n).contains(&i));
-        if let Some(grid) = grid {
-            for (i, h) in grid_hashes.iter().enumerate() {
-                if self.grid.get(i) != Some(h) && !copied(i) {
-                    changed.insert(format!("regions.grid.{i}"), grid.row(i));
-                }
-            }
-        }
-        if !copies.is_empty() {
-            changed.insert("regions.grid.copy".to_string(), json!(copies));
-        }
-        if grid_hashes.len() != self.grid.len() {
-            changed.insert("regions.grid.len".to_string(), json!(grid_hashes.len()));
-        }
-        self.grid.clear();
-        self.grid.extend_from_slice(grid_hashes);
         changed
     }
 
@@ -2281,7 +1973,7 @@ impl WsSession {
     }
 }
 
-fn respond(stream: &mut Conn, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
+fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
     // No CORS header: the frontend is served from this same origin, so it needs
     // none, and `Access-Control-Allow-Origin: *` would let any site the user
     // visits read `/state` (live buffer contents) cross-origin. Same-origin
@@ -2426,7 +2118,6 @@ impl ratatui::backend::Backend for SceneBackend {
 pub(crate) struct SceneSource {
     clip: ClipboardSync,
     renderer: SceneRenderer,
-    grid: GridHasher,
 }
 
 impl SceneSource {
@@ -2434,7 +2125,6 @@ impl SceneSource {
         Self {
             clip: ClipboardSync::new(editor),
             renderer: SceneRenderer::new(),
-            grid: GridHasher::default(),
         }
     }
 }
@@ -2484,17 +2174,9 @@ fn scrollbar_markers(editor: &Editor, leaf: crate::model::event::LeafId) -> Vec<
         .unwrap_or_default()
 }
 
-fn cells_json(buf: &Buffer, r: Rect) -> Value {
-    runs_json(buf, r, false)
-}
-
-/// The whole frame for a grid client (`SceneOptions::grid`), kept as cells
-/// until a row is sent: a scroll sends a dozen of its rows, so building runs
-/// for all of them would be wasted. Rows are told apart by a hash of their
-/// cells, which the clients' diff caches keep. A row's runs are as
-/// `cells_json` makes them, except that a run leaves out what is off — `b`,
-/// `i`, `u`, `r` when false, `fg` and `bg` when the terminal default — which
-/// halves a typical row.
+/// The whole frame for File Commander's app (`SceneFor::App`): the rendered
+/// cells and a hash of each row, which the app's diff (`wire::ClientScene`)
+/// keeps to send only the rows the app lacks.
 struct GridFrame<'a> {
     buf: &'a Buffer,
     hashes: &'a [u64],
@@ -2547,31 +2229,8 @@ impl GridHasher {
     }
 }
 
-impl<'a> GridFrame<'a> {
-    /// Row `i`'s runs.
-    fn row(&self, i: usize) -> Value {
-        let area = self.buf.area;
-        let rect = Rect::new(area.x, area.y + i as u16, area.width, 1);
-        match runs_json(self.buf, rect, true) {
-            Value::Array(mut rows) if !rows.is_empty() => rows.swap_remove(0),
-            _ => json!([]),
-        }
-    }
-
-    /// Every row's runs, for a scene sent whole.
-    fn rows(&self) -> Value {
-        runs_json(self.buf, self.buf.area, true)
-    }
-
-    /// Put every row into `scene` as `regions.grid`.
-    fn embed(grid: Option<&GridFrame<'_>>, scene: &mut Value) {
-        if let (Some(grid), Some(regions)) = (grid, scene.get_mut("regions")) {
-            regions["grid"] = grid.rows();
-        }
-    }
-}
-
-fn runs_json(buf: &Buffer, r: Rect, compact: bool) -> Value {
+/// Slice the rendered cells inside `r` into rows of styled runs.
+fn cells_json(buf: &Buffer, r: Rect) -> Value {
     let mut rows = Vec::with_capacity(r.height as usize);
     for y in r.y..r.y.saturating_add(r.height) {
         let mut runs: Vec<Value> = Vec::new();
@@ -2585,35 +2244,14 @@ fn runs_json(buf: &Buffer, r: Rect, compact: bool) -> Value {
                      bg: &Option<String>,
                      m: Modifier| {
             if !text.is_empty() {
-                if compact {
-                    let mut run = serde_json::Map::new();
-                    run.insert("t".into(), Value::String(std::mem::take(text)));
-                    for (key, color) in [("fg", fg), ("bg", bg)] {
-                        if let Some(color) = color {
-                            run.insert(key.into(), Value::String(color.clone()));
-                        }
-                    }
-                    for (key, flag) in [
-                        ("b", Modifier::BOLD),
-                        ("i", Modifier::ITALIC),
-                        ("u", Modifier::UNDERLINED),
-                        ("r", Modifier::REVERSED),
-                    ] {
-                        if m.contains(flag) {
-                            run.insert(key.into(), Value::Bool(true));
-                        }
-                    }
-                    runs.push(Value::Object(run));
-                } else {
-                    runs.push(json!({
-                        "t": text,
-                        "fg": fg, "bg": bg,
-                        "b": m.contains(Modifier::BOLD),
-                        "i": m.contains(Modifier::ITALIC),
-                        "u": m.contains(Modifier::UNDERLINED),
-                        "r": m.contains(Modifier::REVERSED),
-                    }));
-                }
+                runs.push(json!({
+                    "t": text,
+                    "fg": fg, "bg": bg,
+                    "b": m.contains(Modifier::BOLD),
+                    "i": m.contains(Modifier::ITALIC),
+                    "u": m.contains(Modifier::UNDERLINED),
+                    "r": m.contains(Modifier::REVERSED),
+                }));
                 text.clear();
             }
         };
@@ -2669,34 +2307,16 @@ fn poll_active(editor: &Editor) -> bool {
 /// clipboard `seq` bumps on actual text changes (hash compare), so it cannot
 /// double-increment no matter which path — `GET /state` or WS push — builds
 /// the scene.
-fn build_scene<'s>(
-    editor: &mut Editor,
-    source: &'s mut SceneSource,
-    cols: u16,
-    rows: u16,
-    options: SceneOptions,
-    times: &mut SceneTimes,
-) -> (Value, Option<GridFrame<'s>>) {
-    let (mut scene, grid) =
-        scene_parts(editor, &mut source.renderer, &mut source.grid, cols, rows, options, times);
+fn build_scene(editor: &mut Editor, source: &mut SceneSource, cols: u16, rows: u16) -> Value {
+    let mut scene = scene_json_with(editor, &mut source.renderer, cols, rows);
     source.clip.attach(editor, &mut scene);
-    (scene, grid)
+    scene
 }
 
-/// Tick, then build the browser-facing scene, whole. Called per HTTP request
-/// (as always); the WS hello and push loop build their own so an idle tick
-/// doesn't pay for a render and a grid goes out row by row.
-fn tick_scene(
-    editor: &mut Editor,
-    source: &mut SceneSource,
-    cols: u16,
-    rows: u16,
-    options: SceneOptions,
-) -> Value {
+/// Tick, then build the browser-facing scene. Called per HTTP request.
+fn tick_scene(editor: &mut Editor, source: &mut SceneSource, cols: u16, rows: u16) -> Value {
     tick_only(editor);
-    let (mut scene, grid) = build_scene(editor, source, cols, rows, options, &mut SceneTimes::default());
-    GridFrame::embed(grid.as_ref(), &mut scene);
-    scene
+    build_scene(editor, source, cols, rows)
 }
 
 /// Run one render with chrome kept out of the cells.
@@ -2716,9 +2336,13 @@ fn with_chrome_suppressed<T>(editor: &mut Editor, f: impl FnOnce(&mut Editor) ->
 }
 
 fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
-    let (mut renderer, mut grid) = (SceneRenderer::new(), GridHasher::default());
-    let options = SceneOptions::default();
-    scene_parts(editor, &mut renderer, &mut grid, cols, rows, options, &mut SceneTimes::default()).0
+    scene_json_with(editor, &mut SceneRenderer::new(), cols, rows)
+}
+
+/// The browser's scene, rendered with `renderer`.
+fn scene_json_with(editor: &mut Editor, renderer: &mut SceneRenderer, cols: u16, rows: u16) -> Value {
+    let model = SceneModel::gather(editor, renderer, cols, rows, SceneFor::Browser, &mut SceneTimes::default());
+    scene_json_value(&model)
 }
 
 /// The colors a front end draws Fresh's chrome with, from the active theme
@@ -2834,25 +2458,24 @@ impl<'r> SceneModel<'r> {
         renderer: &'r mut SceneRenderer,
         cols: u16,
         rows: u16,
-        options: SceneOptions,
+        target: SceneFor,
         times: &mut SceneTimes,
     ) -> Self {
-        // A front end with its own menu bar has no use for Fresh's menu row, so
-        // the frame starts at row 0. Only while no menu is open: a menu opened from
-        // the keyboard (`menu_activate`) still shows itself, the way a hidden bar
-        // auto-shows in the terminal.
-        if options.native_menus && editor.menu_state().active_menu.is_none() {
+        // The app has Fresh's menus in its own menu bar and no use for the menu
+        // row, so its frame starts at row 0. Only while no menu is open: a menu
+        // opened from the keyboard (`menu_activate`) still shows itself, the way
+        // a hidden bar auto-shows in the terminal.
+        if target == SceneFor::App && editor.menu_state().active_menu.is_none() {
             let window = editor.active_window_mut();
             window.menu_bar_visible = false;
             window.menu_bar_auto_shown = false;
         }
-        // A grid client draws Fresh's chrome from cells, so its render keeps the
-        // chrome; everyone else gets pane interiors only and draws chrome natively.
+        // The app gets the whole frame as cells, chrome included; a browser
+        // gets pane interiors only and draws the chrome natively.
         let started = Instant::now();
-        let (buf, cursor) = if options.grid {
-            renderer.render(editor, cols, rows)
-        } else {
-            with_chrome_suppressed(editor, |e| renderer.render(e, cols, rows))
+        let (buf, cursor) = match target {
+            SceneFor::App => renderer.render(editor, cols, rows),
+            SceneFor::Browser => with_chrome_suppressed(editor, |e| renderer.render(e, cols, rows)),
         };
         times.render_ms = started.elapsed().as_secs_f64() * 1000.0;
         let (w, h) = (buf.area.width, buf.area.height);
@@ -2976,7 +2599,7 @@ impl<'r> SceneModel<'r> {
 
 /// The scene a browser gets, from the model: the JSON every web front end
 /// reads (see the module docs).
-fn scene_json_value(model: &SceneModel<'_>, options: SceneOptions) -> Value {
+fn scene_json_value(model: &SceneModel<'_>) -> Value {
     let buf = model.buf;
     let (w, h) = (buf.area.width, buf.area.height);
     let popups = serde_json::to_value(&model.popups).unwrap_or_else(|_| json!([]));
@@ -3012,8 +2635,8 @@ fn scene_json_value(model: &SceneModel<'_>, options: SceneOptions) -> Value {
                 "buffer": pane.buffer,
                 "content": rect_json(content),
                 "gutterWidth": gw,
-                "gutter": if gw > 0 && !options.grid { cells_json(buf, gutter_rect) } else { Value::Null },
-                "cells": if options.grid { Value::Null } else { cells_json(buf, text_rect) },
+                "gutter": if gw > 0 { cells_json(buf, gutter_rect) } else { Value::Null },
+                "cells": cells_json(buf, text_rect),
                 "tabBar": serde_json::to_value(pane.tab_bar.bar).unwrap_or(Value::Null),
                 "tabs": serde_json::to_value(&pane.tab_bar.tabs).unwrap_or_else(|_| json!([])),
                 "vscroll": rect_json(pane.vscroll),
@@ -3109,9 +2732,6 @@ fn scene_json_value(model: &SceneModel<'_>, options: SceneOptions) -> Value {
         "keybindingEditor": keybinding_editor,
         "settings": settings,
         "cursor": model.cursor.map(|(x, y)| json!({ "x": x, "y": y })),
-        // The whole frame as cells, for a grid client (`SceneOptions::grid`):
-        // filled in from the `GridFrame` when the scene goes out whole.
-        "grid": Value::Null,
         // Pacing hint: when something is animating / an LSP spinner is live /
         // a timer is pending, the server ticks fast (TICK_ACTIVE), otherwise
         // idles (TICK_IDLE, just to pick up async LSP/file events). Kept in
@@ -3119,26 +2739,6 @@ fn scene_json_value(model: &SceneModel<'_>, options: SceneOptions) -> Value {
         "poll": json!({ "active": model.poll_active }),
     });
     json!({ "w": w, "h": h, "windowId": model.window_id, "regions": regions, "theme": theme })
-}
-
-/// The scene a client gets as JSON, and for a grid client its cells (`SceneOptions::grid`),
-/// which the scene's `regions.grid` leaves out: frames send only the rows a client
-/// lacks, and a whole scene puts them all in (`GridFrame::embed`).
-fn scene_parts<'r>(
-    editor: &mut Editor,
-    renderer: &'r mut SceneRenderer,
-    hasher: &'r mut GridHasher,
-    cols: u16,
-    rows: u16,
-    options: SceneOptions,
-    times: &mut SceneTimes,
-) -> (Value, Option<GridFrame<'r>>) {
-    let model = SceneModel::gather(editor, renderer, cols, rows, options, times);
-    let scene = scene_json_value(&model, options);
-    let started = Instant::now();
-    let grid = options.grid.then(|| hasher.frame(model.buf));
-    times.grid_ms = started.elapsed().as_secs_f64() * 1000.0;
-    (scene, grid)
 }
 
 /// The digit a browser's physical `code` names — `"Digit1"` → `'1'`. Every
@@ -3438,81 +3038,8 @@ fn indexed_rgb(i: u8) -> Rgb {
 #[cfg(test)]
 mod tests {
     use super::{
-        digit_row_char, host_only, origin_host_matches, try_parse_request, SceneOptions,
-        HTTP_REQUEST_CAP,
+        digit_row_char, host_only, origin_host_matches, try_parse_request, HTTP_REQUEST_CAP,
     };
-    use super::{WsSession, FRAMES_AHEAD};
-    use serde_json::{json, Value};
-
-    /// A session on one end of a loopback connection; keep the other end alive.
-    fn session() -> (WsSession, std::net::TcpStream) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        server.set_nonblocking(true).unwrap();
-        (WsSession::new(server), client)
-    }
-
-    fn scene(status: u64) -> Value {
-        json!({ "w": 10, "h": 2, "regions": { "statusbar": status } })
-    }
-
-    #[test]
-    fn frames_wait_for_a_client_that_reports_what_it_applied() {
-        let (mut session, _client) = session();
-        session.send_hello(&scene(0), None).unwrap();
-        // A client that never reports gets every frame.
-        for n in 1..=4 {
-            session.push_diff(&scene(n), None, None, false).unwrap();
-        }
-        assert_eq!(session.seq, 4);
-        // Once it reports, at most FRAMES_AHEAD frames go out unapplied.
-        assert!(!session.note_applied(&json!({ "type": "applied", "seq": 4 })));
-        for n in 5..=9 {
-            session.push_diff(&scene(n), None, None, false).unwrap();
-        }
-        assert_eq!(session.seq, 4 + FRAMES_AHEAD);
-        assert!(session.held);
-        // Catching up owes it one frame, and that frame has the newest scene.
-        assert!(session.note_applied(&json!({ "type": "applied", "seq": 4 + FRAMES_AHEAD })));
-        session.push_diff(&scene(9), None, None, false).unwrap();
-        assert_eq!(session.seq, 5 + FRAMES_AHEAD);
-        assert!(!session.held);
-        assert!(session.diff(&scene(9), None, false).is_empty());
-    }
-
-    #[test]
-    fn scene_options_come_from_the_upgrade_query_or_a_message() {
-        assert_eq!(SceneOptions::from_ws_path("/ws"), None);
-        assert_eq!(
-            SceneOptions::from_ws_path("/ws?grid=1&menus=native"),
-            Some(SceneOptions {
-                grid: true,
-                native_menus: true,
-                telemetry: false,
-                row_copies: false
-            })
-        );
-        assert_eq!(
-            SceneOptions::from_ws_path("/ws?other=2"),
-            Some(SceneOptions::default())
-        );
-        let message = serde_json::json!({"type": "configure", "grid": true});
-        assert_eq!(
-            SceneOptions::from_message(&message),
-            SceneOptions {
-                grid: true,
-                native_menus: false,
-                telemetry: false,
-                row_copies: false
-            }
-        );
-        assert!(
-            SceneOptions::from_ws_path("/ws?grid=1&telemetry=1")
-                .unwrap()
-                .telemetry
-        );
-    }
 
     #[test]
     fn rendered_cells_read_as_a_terminal_drawn_from_scratch_holds_them() {
@@ -3538,42 +3065,6 @@ mod tests {
         let mut ours = buf.clone();
         super::as_drawn_from_scratch(&mut ours);
         assert_eq!(&ours, terminal.buffer());
-    }
-
-    #[test]
-    fn rows_that_moved_are_named_by_where_they_were() {
-        use super::grid_copies;
-        // Lines 1..6 scrolled by two: four rows moved up, two came into view.
-        assert_eq!(grid_copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 5, 6, 7, 8]), vec![[0, 2, 4]]);
-        // A row that changed (a scrollbar's) splits the run; rows that stayed
-        // where they were need nothing.
-        assert_eq!(
-            grid_copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 9, 6, 5, 6]),
-            vec![[0, 2, 2], [3, 5, 1]]
-        );
-        assert!(grid_copies(&[1, 2], &[1, 2]).is_empty());
-    }
-
-    #[test]
-    fn a_scrolled_grid_sends_only_the_rows_that_came_into_view() {
-        use super::GridHasher;
-        use ratatui::buffer::Buffer;
-        let (first, scrolled, again) = (
-            Buffer::with_lines(["a", "b", "c", "d"]),
-            Buffer::with_lines(["c", "d", "e", "f"]),
-            Buffer::with_lines(["e", "f", "g", "h"]),
-        );
-        let (mut session, _client) = session();
-        session.send_hello(&scene(0), Some(&GridHasher::default().frame(&first))).unwrap();
-        let changed = session.diff(&scene(0), Some(&GridHasher::default().frame(&scrolled)), true);
-        assert_eq!(changed["regions.grid.copy"], json!([[0, 2, 2]]));
-        assert_eq!(changed["regions.grid.2"], json!([{ "t": "e" }]));
-        assert_eq!(changed["regions.grid.3"], json!([{ "t": "f" }]));
-        assert!(!changed.contains_key("regions.grid.0"));
-        // A client that didn't ask for copies gets every changed row.
-        let changed = session.diff(&scene(0), Some(&GridHasher::default().frame(&again)), false);
-        assert!(changed.contains_key("regions.grid.0"));
-        assert!(!changed.contains_key("regions.grid.copy"));
     }
 
     #[test]

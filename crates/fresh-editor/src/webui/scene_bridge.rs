@@ -14,9 +14,8 @@
 use super::wire::{self, kind, ClientScene, EncodedScene, Field, Reader, Timing, WireError};
 use super::{
     apply_action, apply_kbedit, apply_key, apply_mouse, apply_paste, apply_resize_want,
-    apply_settings, apply_widget, process_cpu_ms, BridgePoll, GridFrame, KeyInput, MouseInput,
-    SceneModel, SceneOptions, SceneSource, SceneTimes, SettingsClick, APPLIED_TIMEOUT,
-    FRAMES_AHEAD, WS_OUTBUF_CAP,
+    apply_settings, apply_widget, BridgePoll, GridFrame, GridHasher, KeyInput, MouseInput,
+    SceneFor, SceneModel, SceneSource, SceneTimes, SettingsClick, WS_OUTBUF_CAP,
 };
 use crate::app::Editor;
 use anyhow::Result;
@@ -24,11 +23,35 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The socket's buffers each way: macOS gives a Unix socket 8 KiB, a
 /// fraction of one frame.
 const SOCKET_BUFFER: libc::c_int = 4 << 20;
+
+/// Frames an app may have been sent but not yet applied (`Applied`). Past
+/// this, newer frames are held back, and once it catches up it gets one
+/// frame with the newest scene: an app that falls behind skips to the
+/// present instead of working through every frame in between, each one
+/// older than the last by the time it is shown.
+const FRAMES_AHEAD: u64 = 2;
+
+/// How long an app with frames held back may go without reporting before
+/// frames go out regardless, so a lost `Applied` can't freeze its view.
+const APPLIED_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The process's CPU time so far, user and system, in milliseconds.
+fn process_cpu_ms() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage fills the struct it is given.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return 0.0;
+    }
+    // SAFETY: zeroed, then filled by a successful getrusage.
+    let usage = unsafe { usage.assume_init() };
+    let ms = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+    ms(usage.ru_utime) + ms(usage.ru_stime)
+}
 
 /// File Commander's scene socket, bound at the path a session's handshake
 /// names (`fc_scene`).
@@ -36,8 +59,10 @@ pub struct SceneBridge {
     listener: UnixListener,
     path: PathBuf,
     clients: Vec<SceneClient>,
-    /// The renderer, the grid hasher and the clipboard mirror.
+    /// The renderer and the clipboard mirror.
     source: SceneSource,
+    /// The grid's row hashes, kept between frames.
+    grid: GridHasher,
     /// The last push's scene, encoded once for every client.
     encoded: EncodedScene,
     /// Allocations of the last push, for the next frame's telemetry.
@@ -91,6 +116,7 @@ impl SceneBridge {
             path: path.to_path_buf(),
             clients: Vec::new(),
             source: SceneSource::new(editor),
+            grid: GridHasher::default(),
             encoded: EncodedScene::default(),
             last_push_allocs: None,
         })
@@ -174,17 +200,11 @@ impl SceneBridge {
         let allocs_before = crate::alloc_stats::counts();
         let started = Instant::now();
         let mut times = SceneTimes::default();
-        let options = SceneOptions {
-            grid: true,
-            native_menus: true,
-            row_copies: true,
-            telemetry: false,
-        };
         let source = &mut self.source;
-        let model = SceneModel::gather(editor, &mut source.renderer, cols, rows, options, &mut times);
+        let model = SceneModel::gather(editor, &mut source.renderer, cols, rows, SceneFor::App, &mut times);
         let (clip_seq, clip_text) = source.clip.current(editor);
         let grid_started = Instant::now();
-        let grid = source.grid.frame(model.buf);
+        let grid = self.grid.frame(model.buf);
         times.grid_ms = grid_started.elapsed().as_secs_f64() * 1000.0;
         let build_ms = started.elapsed().as_secs_f64() * 1000.0;
         let encode_started = Instant::now();

@@ -1384,8 +1384,11 @@ impl RowScratch {
 }
 
 /// The grid rows that changed but that the client already has at another
-/// index, as `[to, from, count]` runs (see `super::grid_copies`), into
-/// buffers kept between frames.
+/// index of its previous frame, as `[to, from, count]` runs: rows
+/// `to..to+count` become its previous rows `from..from+count`. A scroll moves
+/// rows rather than changing them, so this names nearly all of them in one
+/// run, and only the rows that came into view (and any whose content changed,
+/// such as a scrollbar's) are sent in full. Into buffers kept between frames.
 pub(crate) fn grid_copies_into(
     old: &[u64],
     new: &[u64],
@@ -1551,6 +1554,22 @@ mod tests {
 
     fn proto_path() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/webui/scene.proto")
+    }
+
+    fn copies(old: &[u64], new: &[u64]) -> Vec<[usize; 3]> {
+        let mut runs = Vec::new();
+        grid_copies_into(old, new, &mut std::collections::HashMap::new(), &mut runs);
+        runs
+    }
+
+    #[test]
+    fn rows_that_moved_are_named_by_where_they_were() {
+        // Lines 1..6 scrolled by two: four rows moved up, two came into view.
+        assert_eq!(copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 5, 6, 7, 8]), vec![[0, 2, 4]]);
+        // A row that changed (a scrollbar's) splits the run; rows that stayed
+        // where they were need nothing.
+        assert_eq!(copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 9, 6, 5, 6]), vec![[0, 2, 2], [3, 5, 1]]);
+        assert!(copies(&[1, 2], &[1, 2]).is_empty());
     }
 
     /// `scene.proto` is what the encoders write. `UPDATE_SCENE_PROTO=1`
