@@ -162,6 +162,20 @@ fn web_scene_json_is_unchanged() {
         for diff in check::compare(&grid, &fresh) {
             mismatches.push(format!("{name}, a new client's hello: {diff}"));
         }
+        let mask = |text: String| text.replace(&work_text, "$WORK").replace(&work.display().to_string(), "$WORK");
+        let (hello, frames) = (mask(fresh.dump()), mask(client.dump()));
+        if frames != hello {
+            mismatches.push(format!("{name}: the frames since the first built another scene than a new client's hello\n{}", first_difference(&hello, &frames)));
+        }
+        let path = dir.join(format!("{name}.app.txt"));
+        if update {
+            std::fs::write(&path, &hello).expect("write golden");
+        } else {
+            let expected = std::fs::read_to_string(&path).unwrap_or_default();
+            if expected != hello {
+                mismatches.push(format!("{name}.app: {}", first_difference(&expected, &hello)));
+            }
+        }
     }
     // Encoding a scene allocates nothing once the buffers have grown: the
     // regions, panes and rows go straight into buffers kept between frames.
@@ -182,6 +196,17 @@ fn web_scene_json_is_unchanged() {
     drop(std::fs::remove_dir_all(&root));
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n\n"));
     assert!(copied > 0, "scrolling sent rows the client had as copies");
+}
+
+/// Where two texts part, with a line of context from each.
+fn first_difference(expected: &str, actual: &str) -> String {
+    let line = expected.lines().zip(actual.lines()).take_while(|(a, b)| a == b).count();
+    format!(
+        "differs at line {}\n  recorded: {}\n  now:      {}",
+        line + 1,
+        expected.lines().nth(line).unwrap_or("(end)"),
+        actual.lines().nth(line).unwrap_or("(end)")
+    )
 }
 
 /// `src/webui/scene.proto` is what the encoders write (regenerate the test

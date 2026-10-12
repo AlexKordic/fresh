@@ -127,6 +127,41 @@ impl Client {
     }
 }
 
+impl Client {
+    /// The scene as text, a line per part, for golden files: each grid row as
+    /// its text and its runs (byte length:style), everything else as the
+    /// decoded message prints.
+    pub fn dump(&self) -> String {
+        let mut out = format!("size {}x{} window {}\n", self.width, self.height, self.window_id);
+        out.push_str(&format!("cursor {:?}\ntheme {:?}\n", self.cursor, self.theme));
+        for (i, row) in self.grid.iter().enumerate() {
+            let runs: Vec<String> =
+                row.run_bytes.iter().zip(&row.run_styles).map(|(n, style)| format!("{n}:{style:x}")).collect();
+            out.push_str(&format!("grid[{i}] {:?} {}\n", row.text, runs.join(" ")));
+        }
+        for (i, pane) in self.panes.iter().enumerate() {
+            out.push_str(&format!("pane[{i}] {pane:?}\n"));
+        }
+        for (i, menu) in self.menus.iter().enumerate() {
+            out.push_str(&format!("menu[{i}] {menu:?}\n"));
+        }
+        for (i, separator) in self.separators.iter().enumerate() {
+            out.push_str(&format!("separator[{i}] {separator:?}\n"));
+        }
+        for (i, popup) in self.popups.iter().enumerate() {
+            out.push_str(&format!("popup[{i}] {popup:?}\n"));
+        }
+        out.push_str(&format!("status {:?}\n", self.status));
+        out.push_str(&format!("fileExplorer {:?}\n", self.file_explorer));
+        out.push_str(&format!("palette {:?}\n", self.palette));
+        out.push_str(&format!("trustDialog {:?}\n", self.trust_dialog));
+        out.push_str(&format!("contextMenu {:?}\n", self.context_menu));
+        out.push_str(&format!("keybindingEditor {:?}\n", self.keybinding_editor));
+        out.push_str(&format!("settings {:?}\n", self.settings));
+        out
+    }
+}
+
 /// The differences found, as `path: json …, protobuf …`.
 struct Diffs(Vec<String>);
 
