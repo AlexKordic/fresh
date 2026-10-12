@@ -1152,11 +1152,18 @@ impl Editor {
         &self.menu_state
     }
 
-    /// The keybinding accelerator for an action (e.g. "Ctrl+S"), if any.
-    pub(crate) fn accelerator_for(&self, action: &str) -> Option<String> {
-        self.keybindings.read().ok().and_then(|kb| {
-            kb.find_keybinding_for_action(action, crate::input::keybindings::KeyContext::Normal)
-        })
+    /// The keymap, read-locked: what `menu_view` takes the menus'
+    /// accelerators and their cache's generation from.
+    pub(crate) fn keybindings_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, crate::input::keybindings::KeybindingResolver> {
+        self.keybindings.read().unwrap()
+    }
+
+    /// The config menus' expansion generation, while one is cached
+    /// (`ExpandedMenusCache::generation`).
+    pub(crate) fn expanded_menus_generation(&self) -> Option<u64> {
+        self.expanded_menus_cache.generation()
     }
 
     /// Whether a buffer has unsaved changes (for the tab's modified dot).

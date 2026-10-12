@@ -74,7 +74,24 @@ pub struct MenuEntry {
     pub visible: bool,
     pub x: Option<u16>,
     pub w: Option<u16>,
-    pub items: Vec<MenuItemView>,
+    /// Shared with the editor's cache (`MenuItemsCache`): the items change
+    /// only with the menus, the keymap or the menu context, not per frame.
+    pub items: std::rc::Rc<Vec<MenuItemView>>,
+}
+
+/// Each menu's label, visibility and items as `menu_view` last built them,
+/// and what they were built from. Building them clones every menu and looks
+/// up every item's accelerator, which a frame should not pay for when none
+/// of these changed.
+pub(crate) struct MenuItemsCache {
+    /// The config menus' expansion (`ExpandedMenusCache::generation`).
+    config_menus: u64,
+    plugin_menus: Vec<fresh_core::menu::Menu>,
+    themes_dir: std::path::PathBuf,
+    context: fresh_core::menu::MenuContext,
+    /// The keymap (`KeybindingResolver::generation`).
+    keybindings: u64,
+    menus: Vec<(String, bool, std::rc::Rc<Vec<MenuItemView>>)>,
 }
 
 /// The currently open dropdown's cell geometry, read off the shell tree that
@@ -126,7 +143,11 @@ pub struct MenuView {
     pub dropdown: Option<DropdownView>,
 }
 
-fn item_view(editor: &Editor, item: &fresh_core::menu::MenuItem) -> MenuItemView {
+fn item_view(
+    editor: &Editor,
+    accelerators: &crate::input::keybindings::AcceleratorIndex,
+    item: &fresh_core::menu::MenuItem,
+) -> MenuItemView {
     use fresh_core::menu::MenuItem::*;
     match item {
         Separator { .. } => MenuItemView::Sep,
@@ -140,7 +161,7 @@ fn item_view(editor: &Editor, item: &fresh_core::menu::MenuItem) -> MenuItemView
             label: label.clone(),
             action: action.clone(),
             args: args.clone(),
-            accel: editor.accelerator_for(action),
+            accel: accelerators.get(action),
             // Same enabled/checked logic the TUI description uses — one source.
             enabled: crate::view::ui::menu::is_menu_item_enabled(
                 item,
@@ -152,7 +173,10 @@ fn item_view(editor: &Editor, item: &fresh_core::menu::MenuItem) -> MenuItemView
         },
         Submenu { label, items } => MenuItemView::Submenu {
             label: label.clone(),
-            items: items.iter().map(|i| item_view(editor, i)).collect(),
+            items: items
+                .iter()
+                .map(|i| item_view(editor, accelerators, i))
+                .collect(),
         },
         DynamicSubmenu { label, .. } => MenuItemView::Submenu {
             label: label.clone(),
@@ -197,28 +221,30 @@ impl Editor {
             crate::view::shell::rect_of(ui, key, Rect::new(0, 0, f.width, f.height))
         };
 
-        // Same expanded menu list the TUI renderer uses (config + plugin menus),
-        // so the two frontends never diverge on which menus/items exist.
         let menus: Vec<MenuEntry> = self
-            .all_menus_expanded()
-            .iter()
+            .menu_items()
+            .into_iter()
             .enumerate()
-            .map(|(i, m)| {
-                let label = rect_of(&menu_label_key(i));
+            .map(|(i, (label, visible, items))| {
+                let rect = rect_of(&menu_label_key(i));
                 MenuEntry {
-                    label: m.label.clone(),
-                    visible: crate::view::ui::menu::is_menu_visible(m, &self.menu_state().context),
-                    x: label.map(|r| r.x),
-                    w: label.map(|r| r.width),
-                    items: m.items.iter().map(|it| item_view(self, it)).collect(),
+                    label,
+                    visible,
+                    x: rect.map(|r| r.x),
+                    w: rect.map(|r| r.width),
+                    items,
                 }
             })
             .collect();
 
         // The open chain: level by level, each box and its rows as the tree
         // laid them out. Rows are keyed by depth and index, so their
-        // rectangles come straight back without a walk.
-        let (_, levels) = self.menu_description();
+        // rectangles come straight back without a walk. With no menu open
+        // there is no chain, and no need to describe the menus for one.
+        let levels = match self.menu_state().active_menu {
+            Some(_) => self.menu_description().1,
+            None => Vec::new(),
+        };
         let rows_of = |depth: usize, n: usize| -> Vec<(usize, Rect)> {
             (0..n)
                 .filter_map(|i| rect_of(&dropdown_item_key(depth, i)).map(|r| (i, r)))
@@ -271,6 +297,57 @@ impl Editor {
             submenu_path: ms.submenu_path.clone(),
             dropdown,
         }
+    }
+
+    /// Each menu's label, visibility and items: the same expanded menu list
+    /// the TUI renderer uses (config + plugin menus), so the two frontends
+    /// never diverge on which menus and items exist. Kept in
+    /// `menu_items_cache` until the menus, the keymap or the menu context
+    /// change.
+    fn menu_items(&self) -> Vec<(String, bool, std::rc::Rc<Vec<MenuItemView>>)> {
+        let keybindings = self.keybindings_read();
+        let context = &self.menu_state().context;
+        let config_menus = self.expanded_menus_generation();
+        let mut cache = self.menu_items_cache.borrow_mut();
+        if let (Some(cached), Some(config_menus)) = (cache.as_ref(), config_menus) {
+            if cached.config_menus == config_menus
+                && cached.keybindings == keybindings.generation()
+                && cached.context == *context
+                && cached.plugin_menus == self.menu_state().plugin_menus
+                && cached.themes_dir == self.menu_state().themes_dir
+            {
+                return cached.menus.clone();
+            }
+        }
+        let accelerators =
+            keybindings.accelerator_index(crate::input::keybindings::KeyContext::Normal);
+        let menus: Vec<_> = self
+            .all_menus_expanded()
+            .iter()
+            .map(|m| {
+                let items: Vec<MenuItemView> = m
+                    .items
+                    .iter()
+                    .map(|it| item_view(self, &accelerators, it))
+                    .collect();
+                (
+                    m.label.clone(),
+                    crate::view::ui::menu::is_menu_visible(m, context),
+                    std::rc::Rc::new(items),
+                )
+            })
+            .collect();
+        // An expansion not cached yet (before the first frame describes the
+        // menus) is rebuilt by every call, so it is not cached here either.
+        *cache = config_menus.map(|config_menus| MenuItemsCache {
+            config_menus,
+            plugin_menus: self.menu_state().plugin_menus.clone(),
+            themes_dir: self.menu_state().themes_dir.clone(),
+            context: context.clone(),
+            keybindings: keybindings.generation(),
+            menus: menus.clone(),
+        });
+        menus
     }
 }
 

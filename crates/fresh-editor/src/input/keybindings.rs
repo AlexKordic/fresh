@@ -1685,6 +1685,50 @@ pub struct KeybindingResolver {
     /// than at dispatch is what makes the option's documented promise
     /// ("frees up Alt+letter keybindings for other actions") true.
     menu_mnemonics_enabled: bool,
+
+    /// Changes whenever the bindings may have: every resolver gets a new value
+    /// when built, and every `pub` method that takes `&mut self` takes another.
+    /// What caches a lookup (`Editor::menu_view`'s accelerators) compares it.
+    generation: u64,
+}
+
+/// A value no resolver has had: what [`KeybindingResolver::generation`] takes
+/// on every change.
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What a binding's action is when looking a key up by action: its variant,
+/// or, for a plugin action, its name (every plugin action is one variant).
+#[derive(PartialEq, Eq, Hash)]
+enum ActionIdentity {
+    Variant(std::mem::Discriminant<Action>),
+    Plugin(String),
+}
+
+impl ActionIdentity {
+    fn of(action: &Action) -> Self {
+        match action {
+            Action::PluginAction(name) => ActionIdentity::Plugin(name.clone()),
+            other => ActionIdentity::Variant(std::mem::discriminant(other)),
+        }
+    }
+}
+
+/// Every action's displayed key in one context, as
+/// [`KeybindingResolver::find_keybinding_for_action`] would answer it, built in
+/// one pass over the bindings ([`KeybindingResolver::accelerator_index`]).
+pub struct AcceleratorIndex {
+    keys: HashMap<ActionIdentity, String>,
+}
+
+impl AcceleratorIndex {
+    /// The key shown for `action_name`, if it is bound.
+    pub fn get(&self, action_name: &str) -> Option<String> {
+        let action = Action::from_str(action_name, &HashMap::new())?;
+        self.keys.get(&ActionIdentity::of(&action)).cloned()
+    }
 }
 
 /// One source layer of bindings, in decreasing precedence: the user's
@@ -1742,6 +1786,11 @@ fn warn_invalid_key(key: &str, action: &str) {
 }
 
 impl KeybindingResolver {
+    /// Changes whenever the bindings may have (see the field).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Create a new resolver from configuration
     pub fn new(config: &Config) -> Self {
         let mut resolver = Self {
@@ -1758,6 +1807,7 @@ impl KeybindingResolver {
             mode_shortcuts: HashMap::new(),
             mode_binding_scopes: HashMap::new(),
             menu_mnemonics_enabled: config.editor.menu_bar_mnemonics,
+            generation: next_generation(),
         };
 
         // Load bindings from the active keymap (with inheritance resolution) into default_bindings
@@ -2048,6 +2098,7 @@ impl KeybindingResolver {
         modifiers: KeyModifiers,
         action: Action,
     ) {
+        self.generation = next_generation();
         if self
             .removed_bindings
             .contains(&(context.clone(), (key_code, modifiers)))
@@ -2067,6 +2118,7 @@ impl KeybindingResolver {
         sequence: Vec<(KeyCode, KeyModifiers)>,
         action: Action,
     ) {
+        self.generation = next_generation();
         if self
             .removed_chords
             .contains(&(context.clone(), sequence.clone()))
@@ -2081,6 +2133,7 @@ impl KeybindingResolver {
 
     /// Clear all plugin default bindings (single-key and chord) for a specific mode
     pub fn clear_plugin_defaults_for_mode(&mut self, mode_name: &str) {
+        self.generation = next_generation();
         let context = KeyContext::Mode(mode_name.to_string());
         self.plugin_defaults.remove(&context);
         self.plugin_chord_defaults.remove(&context);
@@ -2098,6 +2151,7 @@ impl KeybindingResolver {
         modifiers: KeyModifiers,
         widgets: Vec<String>,
     ) {
+        self.generation = next_generation();
         self.mode_binding_scopes
             .entry(mode_name.to_string())
             .or_default()
@@ -2122,6 +2176,7 @@ impl KeybindingResolver {
         key_code: KeyCode,
         modifiers: KeyModifiers,
     ) {
+        self.generation = next_generation();
         self.mode_shortcuts
             .entry(mode_name.to_string())
             .or_default()
@@ -2140,6 +2195,7 @@ impl KeybindingResolver {
     /// Mark (or unmark) a plugin mode as inheriting Normal-context bindings
     /// for keys it doesn't bind itself.
     pub fn set_mode_inherits_normal_bindings(&mut self, mode_name: &str, inherit: bool) {
+        self.generation = next_generation();
         if inherit {
             self.inheriting_modes.insert(mode_name.to_string());
         } else {
@@ -2827,25 +2883,7 @@ impl KeybindingResolver {
 
             if !matches.is_empty() {
                 // Sort to get deterministic order: prefer fewer modifiers, then by key
-                matches.sort_by(|(key_a, mod_a), (key_b, mod_b)| {
-                    // Compare by number of modifiers first (prefer simpler bindings)
-                    let mod_count_a = mod_a.bits().count_ones();
-                    let mod_count_b = mod_b.bits().count_ones();
-                    match mod_count_a.cmp(&mod_count_b) {
-                        std::cmp::Ordering::Equal => {
-                            // Then by modifier bits (for consistent ordering)
-                            match mod_a.bits().cmp(&mod_b.bits()) {
-                                std::cmp::Ordering::Equal => {
-                                    // Finally by key code
-                                    Self::key_code_sort_key(key_a)
-                                        .cmp(&Self::key_code_sort_key(key_b))
-                                }
-                                other => other,
-                            }
-                        }
-                        other => other,
-                    }
-                });
+                matches.sort_by(Self::shown_binding_order);
 
                 let (key_code, modifiers) = matches[0];
                 return Some(format_keybinding(&key_code, &modifiers));
@@ -2853,6 +2891,54 @@ impl KeybindingResolver {
         }
 
         None
+    }
+
+    /// The order a binding is picked to show for its action in: fewer
+    /// modifiers first (simpler bindings), then by modifier bits, then by key.
+    fn shown_binding_order(
+        (key_a, mod_a): &(KeyCode, KeyModifiers),
+        (key_b, mod_b): &(KeyCode, KeyModifiers),
+    ) -> std::cmp::Ordering {
+        mod_a
+            .bits()
+            .count_ones()
+            .cmp(&mod_b.bits().count_ones())
+            .then(mod_a.bits().cmp(&mod_b.bits()))
+            .then(Self::key_code_sort_key(key_a).cmp(&Self::key_code_sort_key(key_b)))
+    }
+
+    /// Every action's shown key in `context`, as `find_keybinding_for_action`
+    /// answers it, in one pass: the same maps in the same order, the first
+    /// that binds an action deciding its key, and within a map the first
+    /// binding (in the map's order) that no other precedes.
+    pub fn accelerator_index(&self, context: KeyContext) -> AcceleratorIndex {
+        let mut keys = HashMap::new();
+        let maps = [
+            self.bindings.get(&context),
+            self.bindings.get(&KeyContext::Global),
+            self.default_bindings.get(&context),
+            self.default_bindings.get(&KeyContext::Global),
+        ];
+        for map in maps.into_iter().flatten() {
+            let mut best: HashMap<ActionIdentity, (KeyCode, KeyModifiers)> = HashMap::new();
+            for (binding, action) in map {
+                match best.entry(ActionIdentity::of(action)) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(*binding);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if Self::shown_binding_order(binding, slot.get()).is_lt() {
+                            slot.insert(*binding);
+                        }
+                    }
+                }
+            }
+            for (identity, (code, modifiers)) in best {
+                keys.entry(identity)
+                    .or_insert_with(|| format_keybinding(&code, &modifiers));
+            }
+        }
+        AcceleratorIndex { keys }
     }
 
     /// Generate a sort key for KeyCode to ensure deterministic ordering
@@ -3547,6 +3633,7 @@ impl KeybindingResolver {
 
     /// Reload bindings from config (for hot reload)
     pub fn reload(&mut self, config: &Config) {
+        self.generation = next_generation();
         self.bindings.clear();
         for binding in &config.keybindings {
             if let Some(key_code) = Self::parse_key(&binding.key) {
@@ -3571,6 +3658,43 @@ impl KeybindingResolver {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_accelerator_index_answers_as_the_lookup_does() {
+        let config = crate::config::Config::default();
+        let resolver = KeybindingResolver::new(&config);
+        let index = resolver.accelerator_index(KeyContext::Normal);
+        // Every action a binding names, and one nothing binds.
+        let mut names: Vec<String> = [
+            resolver.bindings.values(),
+            resolver.default_bindings.values(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|map| map.values().map(|action| action.to_action_str()))
+        .collect();
+        names.push("no_such_plugin_action".to_string());
+        names.sort();
+        names.dedup();
+        assert!(names.len() > 100, "the default keymap binds many actions");
+        for name in &names {
+            assert_eq!(
+                index.get(name),
+                resolver.find_keybinding_for_action(name, KeyContext::Normal),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generation_changes_with_the_bindings() {
+        let config = crate::config::Config::default();
+        let mut resolver = KeybindingResolver::new(&config);
+        let built = resolver.generation();
+        assert_ne!(KeybindingResolver::new(&config).generation(), built, "each resolver has its own");
+        resolver.set_mode_inherits_normal_bindings("some-mode", true);
+        assert_ne!(resolver.generation(), built);
+    }
 
     #[test]
     fn a_compact_entry_binds_what_its_split_field_equivalent_binds() {

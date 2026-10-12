@@ -1620,6 +1620,8 @@ pub struct Editor {
     pub(crate) prose_reveal: std::cell::RefCell<
         HashMap<crate::widgets::PanelKey, std::rc::Rc<fresh_ui::behavior::anchor::Anchor>>,
     >,
+    /// `menu_view`'s items, kept until what they are built from changes.
+    pub(crate) menu_items_cache: std::cell::RefCell<Option<crate::view::scene::MenuItemsCache>>,
 }
 
 /// Sentinel `BufferId` registered with the widget registry for the

@@ -22,9 +22,15 @@ impl MenuContext {
         }
     }
 
-    /// Set a named boolean state.
-    pub fn set(&mut self, name: impl Into<String>, value: bool) -> &mut Self {
-        self.states.insert(name.into(), value);
+    /// Set a named boolean state. Updating a state already set allocates
+    /// nothing: the editor sets every state on every frame.
+    pub fn set(&mut self, name: impl AsRef<str> + Into<String>, value: bool) -> &mut Self {
+        match self.states.get_mut(name.as_ref()) {
+            Some(state) => *state = value,
+            None => {
+                self.states.insert(name.into(), value);
+            }
+        }
         self
     }
 
@@ -35,7 +41,7 @@ impl MenuContext {
 
     /// Builder-style setter.
     pub fn with(mut self, name: impl Into<String>, value: bool) -> Self {
-        self.set(name, value);
+        self.states.insert(name.into(), value);
         self
     }
 }

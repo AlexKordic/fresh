@@ -796,6 +796,7 @@ impl Editor {
             widget_drag: None,
             prose_reveal: std::cell::RefCell::new(HashMap::new()),
             tree_projections: std::cell::RefCell::new(HashMap::new()),
+            menu_items_cache: std::cell::RefCell::new(None),
         };
 
         // The plugin per-window filesystem registry is populated on the first

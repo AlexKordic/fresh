@@ -16,6 +16,9 @@ use crate::view::theme::ThemeRegistry;
 #[derive(Default)]
 pub struct ExpandedMenusCache {
     cached: Option<(Arc<ThemeRegistry>, MenuConfig)>,
+    /// Raised whenever the cached expansion is replaced or dropped, so what
+    /// is built from it (`Editor::menu_view`'s items) can tell it changed.
+    generation: u64,
 }
 
 impl ExpandedMenusCache {
@@ -33,6 +36,7 @@ impl ExpandedMenusCache {
             menu.expand_dynamic_items(themes_dir);
         }
         self.cached = Some((Arc::clone(registry), menus));
+        self.generation += 1;
     }
 
     /// The currently-cached expansion, or `None` if not yet built / just
@@ -44,5 +48,11 @@ impl ExpandedMenusCache {
     /// Drop the cached expansion. The next `update` will rebuild.
     pub fn invalidate(&mut self) {
         self.cached = None;
+        self.generation += 1;
+    }
+
+    /// The expansion's generation while one is cached (see the field).
+    pub fn generation(&self) -> Option<u64> {
+        self.cached.as_ref().map(|_| self.generation)
     }
 }
