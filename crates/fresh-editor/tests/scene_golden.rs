@@ -11,8 +11,20 @@
 //! The editor runs in a scratch HOME with a config that turns off what moves
 //! on its own (the welcome screen, the orchestrator dock, update checks), so
 //! two runs see the same scene.
+//!
+//! The same scenarios check File Commander's socket encoding against the grid
+//! scene: protobuf decoded with types generated from `scene.proto`
+//! (`scene_proto/`), from a new client's hello and from a client that got
+//! every frame since the first scenario. `scene.proto` itself must be what the
+//! encoders write.
 
-use fresh::webui::{apply_step, build_editor, scene_value, scene_value_grid};
+#[path = "scene_proto/fresh.scene.v1.rs"]
+#[allow(clippy::all)]
+mod scene_proto;
+#[path = "scene_proto/check.rs"]
+mod check;
+
+use fresh::webui::{apply_step, build_editor, scene_value, scene_value_grid, wire_schema, WireProbe};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -35,6 +47,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         ("open", vec![]),
         ("typed", vec![json!({"key": "End"}), json!({"type": " // edited"})]),
         ("paged", vec![json!({"key": "PageDown"}), json!({"key": "PageDown"})]),
+        ("scrolled", vec![json!({"kind": "scrolldown", "col": 20, "row": 10})]),
         ("palette", vec![json!({"action": "command_palette"}), json!({"type": "split"})]),
         ("palette_closed", vec![json!({"key": "Escape"})]),
         ("menu", vec![json!({"action": "menu_open", "args": {"name": "File"}})]),
@@ -98,6 +111,10 @@ fn web_scene_json_is_unchanged() {
         std::fs::create_dir_all(&dir).expect("golden dir");
     }
     let mut mismatches = Vec::new();
+    // A client that gets every frame, from the first scenario on.
+    let mut probe = WireProbe::new(&ed);
+    let mut client = check::Client::default();
+    let mut copied = 0;
     for (name, steps) in scenarios() {
         for step in &steps {
             apply_step(&mut ed, step);
@@ -129,7 +146,48 @@ fn web_scene_json_is_unchanged() {
                 }
             }
         }
+        // File Commander's socket, after the recorded scenes: its options
+        // (native menus) change what the browser's scene shows.
+        let grid = scene_value_grid(&mut ed, COLS, ROWS);
+        if let Some((kind, payload)) = probe.next(&mut ed, COLS, ROWS) {
+            client.receive(kind, &payload);
+            copied += client.rows_copied;
+        }
+        for diff in check::compare(&grid, &client) {
+            mismatches.push(format!("{name}, frames since the first: {diff}"));
+        }
+        let mut fresh = check::Client::default();
+        let (kind, payload) = WireProbe::new(&ed).next(&mut ed, COLS, ROWS).expect("a hello");
+        fresh.receive(kind, &payload);
+        for diff in check::compare(&grid, &fresh) {
+            mismatches.push(format!("{name}, a new client's hello: {diff}"));
+        }
+    }
+    // Encoding a scene allocates nothing once the buffers have grown: the
+    // regions, panes and rows go straight into buffers kept between frames.
+    #[cfg(feature = "alloc-stats")]
+    {
+        for _ in 0..3 {
+            apply_step(&mut ed, &json!({"key": "PageDown"}));
+            settle(&mut ed);
+            drop(probe.next(&mut ed, COLS, ROWS));
+        }
+        drop(probe.next(&mut ed, COLS, ROWS));
+        assert_eq!(probe.last_encode_allocs, Some((0, 0)), "encoding an unchanged scene");
+        apply_step(&mut ed, &json!({"key": "PageUp"}));
+        settle(&mut ed);
+        drop(probe.next(&mut ed, COLS, ROWS));
+        assert_eq!(probe.last_encode_allocs, Some((0, 0)), "encoding a frame after paging");
     }
     drop(std::fs::remove_dir_all(&root));
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n\n"));
+    assert!(copied > 0, "scrolling sent rows the client had as copies");
+}
+
+/// `src/webui/scene.proto` is what the encoders write (regenerate the test
+/// types with `scene_proto/generate.sh` after it changes).
+#[test]
+fn scene_proto_is_what_the_encoders_write() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/webui/scene.proto");
+    assert_eq!(std::fs::read_to_string(path).unwrap_or_default(), wire_schema());
 }

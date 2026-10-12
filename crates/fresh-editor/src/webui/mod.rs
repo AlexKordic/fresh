@@ -109,6 +109,8 @@ use serde_json::{json, Value};
 
 use crate::app::Editor;
 use crate::view::scene::Rgb;
+
+mod wire;
 use crate::config;
 use crate::config_io::DirectoryContext;
 use crate::model::filesystem::{FileSystem, StdFileSystem};
@@ -386,9 +388,9 @@ impl ClipboardSync {
         h.finish()
     }
 
-    /// Attach the clipboard object to a scene, bumping `seq` if the editor's
-    /// clipboard text changed. The text is never logged.
-    fn attach(&mut self, editor: &Editor, scene: &mut Value) {
+    /// The clipboard's copy number and its text (capped), bumping the number
+    /// if the editor's clipboard text changed. The text is never logged.
+    fn current<'e>(&mut self, editor: &'e Editor) -> (u64, &'e str) {
         let text = editor.clipboard_text();
         let h = Self::hash(text);
         if h != self.last_hash {
@@ -399,7 +401,13 @@ impl ClipboardSync {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        scene["clipboard"] = json!({ "seq": self.seq, "text": &text[..end] });
+        (self.seq, &text[..end])
+    }
+
+    /// Attach the clipboard object to a scene (see `current`).
+    fn attach(&mut self, editor: &Editor, scene: &mut Value) {
+        let (seq, text) = self.current(editor);
+        scene["clipboard"] = json!({ "seq": seq, "text": text });
     }
 }
 
@@ -510,6 +518,67 @@ pub fn scene_value(editor: &mut Editor, cols: u16, rows: u16) -> Value {
     scene_json(editor, cols, rows)
 }
 
+/// File Commander's socket encoding of the scene, for tests: the messages a
+/// client gets — a `ServerHello`, then `Frame`s — and the allocations
+/// encoding the last one took (`alloc-stats` builds).
+pub struct WireProbe {
+    source: SceneSource,
+    encoded: wire::EncodedScene,
+    client: wire::ClientScene,
+    body: Vec<u8>,
+    seq: u64,
+    /// Allocations and bytes of encoding the last message: the scene's parts
+    /// once, then the client's frame (rendering and the views not counted).
+    pub last_encode_allocs: Option<(u64, u64)>,
+}
+
+impl WireProbe {
+    pub fn new(editor: &Editor) -> Self {
+        Self {
+            source: SceneSource::new(editor),
+            encoded: wire::EncodedScene::default(),
+            client: wire::ClientScene::default(),
+            body: Vec::new(),
+            seq: 0,
+            last_encode_allocs: None,
+        }
+    }
+
+    /// The next message for the editor's scene at `cols` × `rows`: its type
+    /// and payload, `None` for a frame with nothing new.
+    pub fn next(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> Option<(u64, Vec<u8>)> {
+        let options = SceneOptions {
+            grid: true,
+            native_menus: true,
+            row_copies: true,
+            telemetry: false,
+        };
+        let source = &mut self.source;
+        let model = SceneModel::gather(editor, &mut source.renderer, cols, rows, options, &mut SceneTimes::default());
+        let (seq, text) = source.clip.current(editor);
+        let before = crate::alloc_stats::counts();
+        let grid = source.grid.frame(model.buf);
+        self.encoded.encode(&model, wire::Clipboard { seq, text });
+        self.body.clear();
+        let message = if self.seq == 0 {
+            self.client.write_hello(&mut self.body, &self.encoded, Some(&grid), None);
+            Some(wire::kind::SERVER_HELLO)
+        } else {
+            self.client
+                .write_frame(&mut self.body, self.seq, &self.encoded, Some(&grid), None)
+                .then_some(wire::kind::FRAME)
+        };
+        self.last_encode_allocs = crate::alloc_stats::since(before);
+        self.seq += 1;
+        message.map(|kind| (kind, self.body.clone()))
+    }
+}
+
+/// `scene.proto`, as File Commander's socket encoding writes it. For tests.
+pub fn wire_schema() -> String {
+    wire::schema()
+}
+
 /// The whole scene a grid client with native menus gets (File Commander's
 /// options), grid rows included, without a tick. For tests.
 pub fn scene_value_grid(editor: &mut Editor, cols: u16, rows: u16) -> Value {
@@ -518,8 +587,9 @@ pub fn scene_value_grid(editor: &mut Editor, cols: u16, rows: u16) -> Value {
         native_menus: true,
         ..SceneOptions::default()
     };
-    let mut renderer = SceneRenderer::new();
-    let (mut scene, grid) = scene_parts(editor, &mut renderer, cols, rows, options, &mut SceneTimes::default());
+    let (mut renderer, mut hasher) = (SceneRenderer::new(), GridHasher::default());
+    let (mut scene, grid) =
+        scene_parts(editor, &mut renderer, &mut hasher, cols, rows, options, &mut SceneTimes::default());
     GridFrame::embed(grid.as_ref(), &mut scene);
     scene
 }
@@ -1956,26 +2026,8 @@ fn value_fingerprint(v: &Value) -> u64 {
 /// scrollbar's) are sent in full. The client applies every run to its
 /// previous rows before the rows sent in full.
 fn grid_copies(old: &[u64], new: &[u64]) -> Vec<[usize; 3]> {
-    let mut at: HashMap<u64, usize> = HashMap::with_capacity(old.len());
-    for (i, h) in old.iter().enumerate() {
-        at.entry(*h).or_insert(i);
-    }
-    let mut runs: Vec<[usize; 3]> = Vec::new();
-    for (i, h) in new.iter().enumerate() {
-        if old.get(i) == Some(h) {
-            continue;
-        }
-        // Rows moved together stay together: extend the run before this row.
-        if let Some(run) = runs.last_mut() {
-            if run[0] + run[2] == i && old.get(run[1] + run[2]) == Some(h) {
-                run[2] += 1;
-                continue;
-            }
-        }
-        if let Some(&from) = at.get(h) {
-            runs.push([i, from, 1]);
-        }
-    }
+    let mut runs = Vec::new();
+    wire::grid_copies_into(old, new, &mut HashMap::new(), &mut runs);
     runs
 }
 
@@ -2191,9 +2243,9 @@ impl WsSession {
         // The full-frame grid (`SceneOptions::grid`) is the biggest unit of
         // all; typing changes a row or two, so it goes per row, and a row's
         // runs are built only when it is sent.
-        let grid_hashes: Vec<u64> = grid.map(|g| g.hashes.clone()).unwrap_or_default();
+        let grid_hashes: &[u64] = grid.map_or(&[], |g| g.hashes);
         let copies = if row_copies {
-            grid_copies(&self.grid, &grid_hashes)
+            grid_copies(&self.grid, grid_hashes)
         } else {
             Vec::new()
         };
@@ -2211,7 +2263,8 @@ impl WsSession {
         if grid_hashes.len() != self.grid.len() {
             changed.insert("regions.grid.len".to_string(), json!(grid_hashes.len()));
         }
-        self.grid = grid_hashes;
+        self.grid.clear();
+        self.grid.extend_from_slice(grid_hashes);
         changed
     }
 
@@ -2469,6 +2522,7 @@ impl ratatui::backend::Backend for SceneBackend {
 pub(crate) struct SceneSource {
     clip: ClipboardSync,
     renderer: SceneRenderer,
+    grid: GridHasher,
 }
 
 impl SceneSource {
@@ -2476,6 +2530,7 @@ impl SceneSource {
         Self {
             clip: ClipboardSync::new(editor),
             renderer: SceneRenderer::new(),
+            grid: GridHasher::default(),
         }
     }
 }
@@ -2538,44 +2593,57 @@ fn cells_json(buf: &Buffer, r: Rect) -> Value {
 /// halves a typical row.
 struct GridFrame<'a> {
     buf: &'a Buffer,
+    hashes: &'a [u64],
+}
+
+/// Hashes a frame's grid rows into buffers kept between frames.
+#[derive(Default)]
+pub(crate) struct GridHasher {
     hashes: Vec<u64>,
+    row: RowBytes,
+}
+
+/// A row's cells as bytes, hashed in one pass: hashing each cell's fields one
+/// by one costs a millisecond for a large grid.
+#[derive(Default)]
+struct RowBytes(Vec<u8>);
+
+impl std::hash::Hasher for RowBytes {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+    fn finish(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write(&self.0);
+        hasher.finish()
+    }
+}
+
+impl GridHasher {
+    fn frame<'a>(&'a mut self, buf: &'a Buffer) -> GridFrame<'a> {
+        use std::hash::{Hash, Hasher};
+        let area = buf.area;
+        self.hashes.clear();
+        for y in area.y..area.y.saturating_add(area.height) {
+            self.row.0.clear();
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buf.cell(Position::new(x, y)) {
+                    cell.symbol().hash(&mut self.row);
+                    cell.fg.hash(&mut self.row);
+                    cell.bg.hash(&mut self.row);
+                    cell.modifier.hash(&mut self.row);
+                }
+            }
+            self.hashes.push(self.row.finish());
+        }
+        GridFrame {
+            buf,
+            hashes: &self.hashes,
+        }
+    }
 }
 
 impl<'a> GridFrame<'a> {
-    fn new(buf: &'a Buffer) -> Self {
-        use std::hash::{Hash, Hasher};
-        /// A row's cells as bytes, hashed in one pass: hashing each cell's
-        /// fields one by one costs a millisecond for a large grid.
-        struct RowBytes(Vec<u8>);
-        impl Hasher for RowBytes {
-            fn write(&mut self, bytes: &[u8]) {
-                self.0.extend_from_slice(bytes);
-            }
-            fn finish(&self) -> u64 {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                hasher.write(&self.0);
-                hasher.finish()
-            }
-        }
-        let area = buf.area;
-        let mut row = RowBytes(Vec::with_capacity(area.width as usize * 32));
-        let hashes = (area.y..area.y.saturating_add(area.height))
-            .map(|y| {
-                row.0.clear();
-                for x in area.x..area.x.saturating_add(area.width) {
-                    if let Some(cell) = buf.cell(Position::new(x, y)) {
-                        cell.symbol().hash(&mut row);
-                        cell.fg.hash(&mut row);
-                        cell.bg.hash(&mut row);
-                        cell.modifier.hash(&mut row);
-                    }
-                }
-                row.finish()
-            })
-            .collect();
-        Self { buf, hashes }
-    }
-
     /// Row `i`'s runs.
     fn row(&self, i: usize) -> Value {
         let area = self.buf.area;
@@ -2705,7 +2773,8 @@ fn build_scene<'s>(
     options: SceneOptions,
     times: &mut SceneTimes,
 ) -> (Value, Option<GridFrame<'s>>) {
-    let (mut scene, grid) = scene_parts(editor, &mut source.renderer, cols, rows, options, times);
+    let (mut scene, grid) =
+        scene_parts(editor, &mut source.renderer, &mut source.grid, cols, rows, options, times);
     source.clip.attach(editor, &mut scene);
     (scene, grid)
 }
@@ -2743,8 +2812,9 @@ fn with_chrome_suppressed<T>(editor: &mut Editor, f: impl FnOnce(&mut Editor) ->
 }
 
 fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
-    let mut renderer = SceneRenderer::new();
-    scene_parts(editor, &mut renderer, cols, rows, SceneOptions::default(), &mut SceneTimes::default()).0
+    let (mut renderer, mut grid) = (SceneRenderer::new(), GridHasher::default());
+    let options = SceneOptions::default();
+    scene_parts(editor, &mut renderer, &mut grid, cols, rows, options, &mut SceneTimes::default()).0
 }
 
 /// The colors a front end draws Fresh's chrome with, from the active theme
@@ -3153,6 +3223,7 @@ fn scene_json_value(model: &SceneModel<'_>, options: SceneOptions) -> Value {
 fn scene_parts<'r>(
     editor: &mut Editor,
     renderer: &'r mut SceneRenderer,
+    hasher: &'r mut GridHasher,
     cols: u16,
     rows: u16,
     options: SceneOptions,
@@ -3161,7 +3232,7 @@ fn scene_parts<'r>(
     let model = SceneModel::gather(editor, renderer, cols, rows, options, times);
     let scene = scene_json_value(&model, options);
     let started = Instant::now();
-    let grid = options.grid.then(|| GridFrame::new(model.buf));
+    let grid = options.grid.then(|| hasher.frame(model.buf));
     times.grid_ms = started.elapsed().as_secs_f64() * 1000.0;
     (scene, grid)
 }
@@ -3585,7 +3656,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_scrolled_grid_sends_only_the_rows_that_came_into_view() {
-        use super::GridFrame;
+        use super::GridHasher;
         use ratatui::buffer::Buffer;
         let (first, scrolled, again) = (
             Buffer::with_lines(["a", "b", "c", "d"]),
@@ -3593,14 +3664,14 @@ mod tests {
             Buffer::with_lines(["e", "f", "g", "h"]),
         );
         let (mut session, _client) = session();
-        session.send_hello(&scene(0), Some(&GridFrame::new(&first))).unwrap();
-        let changed = session.diff(&scene(0), Some(&GridFrame::new(&scrolled)), true);
+        session.send_hello(&scene(0), Some(&GridHasher::default().frame(&first))).unwrap();
+        let changed = session.diff(&scene(0), Some(&GridHasher::default().frame(&scrolled)), true);
         assert_eq!(changed["regions.grid.copy"], json!([[0, 2, 2]]));
         assert_eq!(changed["regions.grid.2"], json!([{ "t": "e" }]));
         assert_eq!(changed["regions.grid.3"], json!([{ "t": "f" }]));
         assert!(!changed.contains_key("regions.grid.0"));
         // A client that didn't ask for copies gets every changed row.
-        let changed = session.diff(&scene(0), Some(&GridFrame::new(&again)), false);
+        let changed = session.diff(&scene(0), Some(&GridHasher::default().frame(&again)), false);
         assert!(changed.contains_key("regions.grid.0"));
         assert!(!changed.contains_key("regions.grid.copy"));
     }

@@ -1,0 +1,655 @@
+// The scene channel of File Commander's sessions: protobuf messages in a
+// type-length-value stream (type and length as varints) over the session's
+// Unix socket. Generated from crates/fresh-editor/src/webui/wire.rs, which
+// writes these messages; a test keeps this file equal to it.
+syntax = "proto3";
+package fresh.scene.v1;
+
+// A rectangle of cells.
+message Rect {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 w = 3;
+  uint32 h = 4;
+}
+
+// A top-level menu and its items.
+message MenuEntry {
+  string label = 1;
+  bool visible = 2;
+  optional uint32 x = 3;
+  optional uint32 w = 4;
+  repeated MenuItem items = 5;
+}
+
+message TabView {
+  optional uint64 buffer_id = 1;
+  string label = 2;
+  bool active = 3;
+  bool modified = 4;
+  Rect rect = 5;
+  Rect close_rect = 6;
+}
+
+message TabBarView {
+  Rect bar = 1;
+  repeated TabView tabs = 2;
+}
+
+message StatusSegment {
+  string name = 1;
+  optional string key = 2;
+  string text = 3;
+  uint32 x = 4;
+  uint32 w = 5;
+  string side = 6;
+}
+
+message StatusView {
+  Rect rect = 1;
+  repeated StatusSegment segments = 2;
+}
+
+message SuggestionView {
+  string text = 1;
+  optional string description = 2;
+  optional string keybinding = 3;
+  bool disabled = 4;
+}
+
+message SearchOptionView {
+  string name = 1;
+  string label = 2;
+  optional string shortcut = 3;
+  bool active = 4;
+  uint32 x = 5;
+  uint32 w = 6;
+}
+
+message SearchOptionsView {
+  uint32 row = 1;
+  repeated SearchOptionView options = 2;
+}
+
+// The command palette or another prompt, without its plugin toolbar.
+message PaletteView {
+  string query = 1;
+  string message = 2;
+  string prompt_type = 3;
+  bool overlay = 4;
+  string title = 5;
+  string status = 6;
+  optional uint64 selected = 7;
+  uint64 scroll_start = 8;
+  uint64 visible_count = 9;
+  uint64 total = 10;
+  Rect outer_rect = 11;
+  Rect list_rect = 12;
+  Rect preview_rect = 13;
+  repeated SuggestionView suggestions = 14;
+  SearchOptionsView search_options = 15;
+}
+
+message PopupItemView {
+  string text = 1;
+  optional string detail = 2;
+  optional string icon = 3;
+  bool disabled = 4;
+}
+
+// A styled span of a popup's line; colors 0xRRGGBB, left out for the default.
+message PopupSpanView {
+  string text = 1;
+  optional uint32 fg = 2;
+  optional uint32 bg = 3;
+  bool bold = 4;
+  bool italic = 5;
+  bool underline = 6;
+  bool reverse = 7;
+}
+
+message ScenePopup {
+  string kind = 1;
+  optional string title = 2;
+  optional string description = 3;
+  Rect rect = 4;
+  Rect content_rect = 5;
+  uint64 scroll_offset = 6;
+  PopupContent content = 7;
+}
+
+message FileRow {
+  string name = 1;
+  uint64 depth = 2;
+  bool is_dir = 3;
+  bool expanded = 4;
+}
+
+message FileExplorerView {
+  Rect rect = 1;
+  string title = 2;
+  uint64 scroll_offset = 3;
+  uint64 viewport_height = 4;
+  optional uint64 selected = 5;
+  repeated uint64 viewport_rows = 6;
+  repeated FileRow rows = 7;
+}
+
+message TrustOptionView {
+  string label = 1;
+  string description = 2;
+  bool selected = 3;
+  string data = 4;
+  Rect rect = 5;
+}
+
+message TrustDialogView {
+  Rect dialog = 1;
+  string title = 2;
+  string path = 3;
+  string triggers = 4;
+  bool cancellable = 5;
+  repeated TrustOptionView options = 6;
+  Rect ok = 7;
+  string ok_label = 8;
+  Rect quit = 9;
+  string quit_label = 10;
+}
+
+message ContextMenuView {
+  string kind = 1;
+  uint32 x = 2;
+  uint32 y = 3;
+  uint64 highlighted = 4;
+  repeated string items = 5;
+}
+
+message KbSearchView {
+  bool active = 1;
+  bool focused = 2;
+  string mode = 3;
+  string query = 4;
+  string key_display = 5;
+}
+
+message KbEditDialog {
+  string title = 1;
+  uint64 focus_area = 2;
+  string key_display = 3;
+  bool key_capturing = 4;
+  string action_text = 5;
+  optional string action_error = 6;
+  repeated string autocomplete = 7;
+  optional uint64 autocomplete_selected = 8;
+  string context = 9;
+  repeated string context_options = 10;
+  repeated string conflicts = 11;
+  bool save_focused = 12;
+  bool cancel_focused = 13;
+}
+
+message KbConfirm {
+  repeated string buttons = 1;
+  uint64 selected = 2;
+}
+
+message KeybindingEditorView {
+  string title = 1;
+  string config_path = 2;
+  repeated string keymaps = 3;
+  KbSearchView search = 4;
+  string context_filter = 5;
+  bool context_filtered = 6;
+  string source_filter = 7;
+  bool source_filtered = 8;
+  string count = 9;
+  bool has_changes = 10;
+  repeated KbRow rows = 11;
+  uint64 selected = 12;
+  uint32 scroll_offset = 13;
+  uint32 viewport = 14;
+  bool showing_help = 15;
+  KbEditDialog edit_dialog = 16;
+  KbConfirm confirm = 17;
+}
+
+message MapEntryView {
+  string key = 1;
+  string display = 2;
+}
+
+message SettingItemView {
+  uint64 index = 1;
+  string path = 2;
+  string name = 3;
+  optional string description = 4;
+  optional string section = 5;
+  bool section_start = 6;
+  bool modified = 7;
+  bool read_only = 8;
+  bool nullable = 9;
+  bool is_null = 10;
+  bool selected = 11;
+  SettingControl control = 12;
+}
+
+message SettingsCategoryView {
+  uint64 index = 1;
+  string name = 2;
+  bool selected = 3;
+  bool expandable = 4;
+  bool expanded = 5;
+  repeated string sections = 6;
+  bool nested = 7;
+}
+
+message SettingsSearchResultView {
+  string name = 1;
+  string category = 2;
+}
+
+message EntryDialogView {
+  string title = 1;
+  bool is_new = 2;
+  repeated SettingItemView items = 3;
+  uint64 selected_item = 4;
+  bool focus_on_buttons = 5;
+  uint64 focused_button = 6;
+  bool no_delete = 7;
+}
+
+message SettingsView {
+  string title = 1;
+  string focus = 2;
+  string target_layer = 3;
+  repeated SettingsCategoryView categories = 4;
+  repeated SettingItemView items = 5;
+  repeated string footer_buttons = 6;
+  uint64 footer_selected = 7;
+  bool search_active = 8;
+  string search_query = 9;
+  repeated SettingsSearchResultView search_results = 10;
+  uint64 search_selected = 11;
+  EntryDialogView entry_dialog = 12;
+  bool showing_help = 13;
+  bool showing_confirm = 14;
+  bool showing_reset = 15;
+}
+
+// A plugin's mark on a pane's scrollbar: its row on the track, 0xRRGGBB.
+message ScrollbarMarker {
+  uint32 row = 1;
+  uint32 color = 2;
+}
+
+// A pane: where its content and scrollbar are, its tab bar, the thumb.
+message Pane {
+  uint64 leaf = 1;
+  optional uint64 buffer = 2;
+  Rect content = 3;
+  uint32 gutter_width = 4;
+  TabBarView tab_bar = 5;
+  Rect vscroll = 6;
+  uint64 thumb_start = 7;
+  uint64 thumb_end = 8;
+  repeated ScrollbarMarker markers = 9;
+}
+
+// A line between panes.
+message Separator {
+  bool vertical = 1;
+  uint32 x = 2;
+  uint32 y = 3;
+  uint32 len = 4;
+}
+
+// The colors chrome is drawn with, 0xRRGGBB, each left out for the default.
+message Theme {
+  string name = 1;
+  optional uint32 bg = 2;
+  optional uint32 fg = 3;
+  optional uint32 accent = 4;
+  optional uint32 muted = 5;
+  optional uint32 selection_bg = 6;
+  optional uint32 menu_bg = 7;
+  optional uint32 menu_fg = 8;
+  optional uint32 menu_hi = 9;
+  optional uint32 menu_highlight_fg = 10;
+  optional uint32 popup_bg = 11;
+  optional uint32 popup_fg = 12;
+  optional uint32 border = 13;
+  optional uint32 status_bg = 14;
+  optional uint32 status_fg = 15;
+  optional uint32 tab_active_bg = 16;
+}
+
+// A frame's timing (telemetry on): which of the client's messages it
+// shows, where building it went, what waited ahead of it, Fresh's CPU
+// time, and the previous push's allocations (an alloc-stats build).
+message Timing {
+  uint64 ack = 1;
+  double build_ms = 2;
+  double render_ms = 3;
+  double grid_ms = 4;
+  double encode_ms = 5;
+  uint64 queued = 6;
+  uint64 ahead = 7;
+  uint32 owed = 8;
+  uint64 top = 9;
+  double cpu_ms = 10;
+  optional uint64 prev_allocs = 11;
+  optional uint64 prev_alloc_bytes = 12;
+}
+
+message MenuAction {
+  string label = 1;
+  string action = 2;
+  string args_json = 3;
+  optional string accel = 4;
+  bool enabled = 5;
+  optional bool checked = 6;
+}
+message MenuSeparator {
+}
+message MenuSubmenu {
+  string label = 1;
+  repeated MenuItem items = 2;
+}
+message MenuLabel {
+  string label = 1;
+}
+// A menu item: an action, a separator, a submenu or a label. An action's
+// arguments are the keymap's JSON, handed back untouched with the action.
+message MenuItem {
+  oneof item {
+    MenuAction action = 1;
+    MenuSeparator separator = 2;
+    MenuSubmenu submenu = 3;
+    MenuLabel label = 4;
+  }
+}
+
+message PopupList {
+  repeated PopupItemView items = 1;
+  uint64 selected = 2;
+}
+message PopupLines {
+  repeated PopupLine lines = 1;
+}
+// A popup's content: a list to pick from, or styled lines.
+message PopupContent {
+  oneof content {
+    PopupList list = 1;
+    PopupLines lines = 2;
+  }
+}
+
+message KbSection {
+  string name = 1;
+  bool collapsed = 2;
+  uint64 count = 3;
+  bool selected = 4;
+}
+message KbBinding {
+  string key = 1;
+  string action = 2;
+  string description = 3;
+  string context = 4;
+  string source = 5;
+  bool selected = 6;
+}
+// A row of the keybinding editor: a section header or a binding.
+message KbRow {
+  oneof row {
+    KbSection section = 1;
+    KbBinding binding = 2;
+  }
+}
+
+message SettingToggle {
+  bool checked = 1;
+}
+message SettingNumber {
+  double value = 1;
+  optional double min = 2;
+  optional double max = 3;
+  bool integer = 4;
+  bool percent = 5;
+}
+message SettingDropdown {
+  uint64 selected = 1;
+  repeated string options = 2;
+  bool open = 3;
+}
+message SettingText {
+  string value = 1;
+  bool editing = 2;
+  string placeholder = 3;
+}
+message SettingTextList {
+  repeated string items = 1;
+  optional uint64 focused = 2;
+}
+message SettingDualList {
+  repeated string included = 1;
+  repeated string available = 2;
+  uint64 included_cursor = 3;
+  uint64 available_cursor = 4;
+  string active_column = 5;
+}
+message SettingMap {
+  repeated MapEntryView entries = 1;
+  optional string column = 2;
+  bool no_add = 3;
+  optional uint64 focused = 4;
+  bool add_focused = 5;
+}
+message SettingObjectArray {
+  repeated string entries = 1;
+  optional uint64 focused = 2;
+  bool add_focused = 3;
+}
+message SettingJson {
+  string value = 1;
+}
+message SettingComplex {
+  string type_name = 1;
+}
+// A setting's control.
+message SettingControl {
+  oneof control {
+    SettingToggle toggle = 1;
+    SettingNumber number = 2;
+    SettingDropdown dropdown = 3;
+    SettingText text = 4;
+    SettingTextList text_list = 5;
+    SettingDualList dual_list = 6;
+    SettingMap map = 7;
+    SettingObjectArray object_array = 8;
+    SettingJson json = 9;
+    SettingComplex complex = 10;
+  }
+}
+
+// One line of a popup: its spans.
+message PopupLine {
+  repeated PopupSpanView spans = 1;
+}
+// The clipboard's latest copy; seq rises with every new copy.
+message Clipboard {
+  uint64 seq = 1;
+  string text = 2;
+}
+// The cell the hardware cursor is on.
+message Cursor {
+  uint32 x = 1;
+  uint32 y = 2;
+}
+// One row of the grid: its text once, and its runs as byte lengths into that
+// text, each with a style: fg | bg << 25 | flags << 50, a color being
+// 0x1RRGGBB (0 for the terminal default) and the flags bold 1, italic 2,
+// underline 4, reverse 8.
+message GridRow {
+  uint32 index = 1;
+  string text = 2;
+  repeated uint32 run_bytes = 3;
+  repeated uint64 run_styles = 4;
+}
+message PaneUpdate {
+  uint32 index = 1;
+  Pane pane = 2;
+}
+// A region's update: present when it changed; without its value when it is
+// gone.
+message MenusUpdate {
+  repeated MenuEntry menus = 1;
+}
+message StatusBarUpdate {
+  StatusView value = 1;
+}
+message FileExplorerUpdate {
+  FileExplorerView value = 1;
+}
+message SeparatorsUpdate {
+  repeated Separator separators = 1;
+}
+message PopupsUpdate {
+  repeated ScenePopup popups = 1;
+}
+message PaletteUpdate {
+  PaletteView value = 1;
+}
+message TrustDialogUpdate {
+  TrustDialogView value = 1;
+}
+message ContextMenuUpdate {
+  ContextMenuView value = 1;
+}
+message KeybindingEditorUpdate {
+  KeybindingEditorView value = 1;
+}
+message SettingsUpdate {
+  SettingsView value = 1;
+}
+// What changed since the last frame the client got; a ServerHello's frame
+// carries everything. Copies name grid rows the client already has, as
+// [to, from, count] triples: rows to..to+count become its previous rows
+// from..from+count, applied before the rows sent in full.
+message Frame {
+  uint64 seq = 1;
+  optional uint32 width = 2;
+  optional uint32 height = 3;
+  optional uint64 window_id = 4;
+  Theme theme = 5;
+  Clipboard clipboard = 6;
+  Cursor cursor = 7;
+  optional uint32 grid_len = 8;
+  repeated uint32 copies = 9;
+  repeated GridRow rows = 10;
+  optional uint32 pane_len = 11;
+  repeated PaneUpdate panes = 12;
+  MenusUpdate menus = 13;
+  StatusBarUpdate status_bar = 14;
+  FileExplorerUpdate file_explorer = 15;
+  SeparatorsUpdate separators = 16;
+  PopupsUpdate popups = 17;
+  PaletteUpdate palette = 18;
+  TrustDialogUpdate trust_dialog = 19;
+  ContextMenuUpdate context_menu = 20;
+  KeybindingEditorUpdate keybinding_editor = 21;
+  SettingsUpdate settings = 22;
+  Timing timing = 23;
+}
+// Type 1: the answer to a ClientHello, with the whole scene.
+message ServerHello {
+  uint32 version = 1;
+  Frame scene = 2;
+}
+// Type 3: why Fresh is closing the connection.
+message Error {
+  string reason = 1;
+}
+// Type 16: the client's first message. Telemetry asks for frame timing.
+message ClientHello {
+  uint32 version = 1;
+  bool telemetry = 2;
+}
+// Type 17: a key, as a browser names it (key), the physical key (code), and
+// the modifiers held.
+message Key {
+  string key = 1;
+  string code = 2;
+  bool ctrl = 3;
+  bool alt = 4;
+  bool meta = 5;
+  bool shift = 6;
+}
+enum MouseKind {
+  MOUSE_KIND_UNKNOWN = 0;
+  MOUSE_KIND_DOWN = 1;
+  MOUSE_KIND_UP = 2;
+  MOUSE_KIND_DRAG = 3;
+  MOUSE_KIND_MOVED = 4;
+  MOUSE_KIND_SCROLL_UP = 5;
+  MOUSE_KIND_SCROLL_DOWN = 6;
+  MOUSE_KIND_SCROLL_LEFT = 7;
+  MOUSE_KIND_SCROLL_RIGHT = 8;
+}
+enum MouseButton {
+  MOUSE_BUTTON_LEFT = 0;
+  MOUSE_BUTTON_RIGHT = 1;
+  MOUSE_BUTTON_MIDDLE = 2;
+}
+// Type 18: a mouse event on a cell, n times (wheel notches), with the click
+// count the client counted.
+message Mouse {
+  MouseKind kind = 1;
+  MouseButton button = 2;
+  uint32 col = 3;
+  uint32 row = 4;
+  uint32 n = 5;
+  uint64 count = 6;
+  bool ctrl = 7;
+  bool alt = 8;
+  bool shift = 9;
+}
+// Type 19: the grid size the client wants.
+message Resize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+// Type 20: text to paste.
+message Paste {
+  string text = 1;
+}
+// Type 21: an action by name, with the arguments a menu item gave it.
+message Action {
+  string name = 1;
+  string args_json = 2;
+}
+// Type 22: a click on a widget of a surface (the palette's toolbar).
+message Widget {
+  string surface = 1;
+  optional string key = 2;
+}
+// Type 23: a click in the settings modal: what was hit (kind), its indices,
+// a double click, an entry dialog's button.
+message SettingsClick {
+  string kind = 1;
+  uint64 a = 2;
+  uint64 b = 3;
+  bool double = 4;
+  string button = 5;
+}
+// Type 24: a click on a row of the keybinding editor.
+message KbEditClick {
+  optional uint64 row = 1;
+}
+// Type 25: frame timing on or off.
+message Configure {
+  bool telemetry = 1;
+}
+// Type 26: the last frame the client applied.
+message Applied {
+  uint64 seq = 1;
+}

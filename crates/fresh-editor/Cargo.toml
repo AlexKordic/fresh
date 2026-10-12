@@ -321,6 +321,9 @@ fresh-gui = { workspace = true, optional = true }
 fresh-update.workspace = true
 proptest = "1.9"
 tempfile = "3.25"
+# Decodes the scene channel's protobuf in tests, with types generated from
+# src/webui/scene.proto (tests/scene_proto/generate.sh).
+prost = "0.14"
 insta = { version = "1.46", features = ["yaml"] }
 vt100 = "0.16"  # Virtual terminal emulator for testing real ANSI output
 ctor = "0.6.3"
