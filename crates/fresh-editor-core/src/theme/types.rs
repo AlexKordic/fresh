@@ -1043,7 +1043,7 @@ pub struct SyntaxColors {
 }
 
 /// Comprehensive theme structure with all UI colors
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     /// Theme name (e.g., "dark", "light", "high-contrast")
     pub name: String,

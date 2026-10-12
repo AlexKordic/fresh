@@ -1506,7 +1506,7 @@ pub enum ViewTokenWireKind {
 /// `Color::Indexed(N)` round-trips through the `"Indexed:N"` form so
 /// 256-color values from a ratatui `Color` survive the
 /// `ViewTokenStyle` boundary.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize, TS)]
 #[serde(untagged)]
 #[ts(export)]
 pub enum TokenColor {
@@ -1522,7 +1522,7 @@ pub enum TokenColor {
 /// This allows plugins to specify styling for tokens that don't have a source
 /// mapping (sourceOffset: None), such as annotation headers in git blame.
 /// For tokens with sourceOffset: Some(_), syntax highlighting is applied instead.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize, Default, TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct ViewTokenStyle {

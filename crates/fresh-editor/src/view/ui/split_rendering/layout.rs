@@ -15,6 +15,7 @@ use ratatui::layout::Rect;
 use std::collections::HashMap;
 
 /// Anchor describing where to start rendering within a slice of view lines.
+#[derive(Clone, Copy)]
 pub(super) struct ViewAnchor {
     pub start_line_idx: usize,
 }

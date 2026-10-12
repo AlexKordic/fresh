@@ -7,7 +7,7 @@ use std::ops::Range;
 pub use fresh_core::overlay::{OverlayHandle, OverlayNamespace};
 
 /// Overlay face - defines the visual appearance of an overlay
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum OverlayFace {
     /// Underline with a specific style
     Underline { color: Color, style: UnderlineStyle },
@@ -129,7 +129,7 @@ impl OverlayFace {
 }
 
 /// Style of underline
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnderlineStyle {
     /// Straight line
     Straight,

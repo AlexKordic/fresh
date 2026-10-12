@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 /// Mapping from visual row to buffer positions for mouse click handling
 /// Each entry represents one visual row with byte position info for click handling
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ViewLineMapping {
     /// Source byte offset for each character (None for injected/virtual content)
     pub char_source_bytes: Vec<Option<usize>>,

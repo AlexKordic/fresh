@@ -373,6 +373,10 @@ pub struct EditorState {
     /// Debug mode: reveal highlight/overlay spans (WordPerfect-style)
     pub debug_highlight_mode: bool,
 
+    /// Rows of this buffer drawn in earlier frames, reused while their inputs
+    /// are unchanged (`view::ui::split_rendering::RowCache`).
+    pub(crate) row_cache: crate::view::ui::split_rendering::RowCache,
+
     /// Debounced semantic highlight cache
     pub reference_highlight_overlay: ReferenceHighlightOverlay,
 
@@ -529,6 +533,7 @@ impl EditorState {
             reference_highlighter: ReferenceHighlighter::new(),
             is_composite_buffer: false,
             debug_highlight_mode: false,
+            row_cache: Default::default(),
             reference_highlight_overlay: ReferenceHighlightOverlay::new(),
             bracket_highlight_overlay: BracketHighlightOverlay::new(),
             cursor_line_overlay: CursorLineOverlay::new(),

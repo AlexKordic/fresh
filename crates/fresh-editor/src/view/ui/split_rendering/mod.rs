@@ -26,6 +26,7 @@ mod orchestration;
 // display list and calls them one `Host` at a time instead, so that a pane's
 // rectangle is the one layout gave it.
 pub(crate) use orchestration::reconcile::pane_text_width;
+pub(crate) use orchestration::render_line::RowCache;
 pub(crate) use orchestration::render_buffer::wrap_index_geometry_for;
 pub(crate) use orchestration::{
     content_pass, paint_leaf, prepare_content, reconcile_panes, ContentPass, FrameFacts,
@@ -493,6 +494,7 @@ mod tests {
             rainbow_indentation: false,
             cell_theme_map: &mut dummy_theme_map,
             screen_width: 0,
+            row_cache: None,
         });
 
         (
@@ -606,6 +608,7 @@ mod tests {
             rainbow_indentation: false,
             cell_theme_map: &mut dummy_theme_map,
             screen_width: 0,
+            row_cache: None,
         })
     }
 
@@ -3275,6 +3278,7 @@ mod tests {
             rainbow_indentation: false,
             cell_theme_map: &mut Vec::new(),
             screen_width: 0,
+            row_cache: None,
         })
     }
 

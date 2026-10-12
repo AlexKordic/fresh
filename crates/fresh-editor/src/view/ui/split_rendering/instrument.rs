@@ -91,3 +91,43 @@ pub(crate) fn count_composite_build() {
         c.set(v);
     });
 }
+
+/// What the row cache did on this thread: rows taken from it, and rows a
+/// cached render drew (`render_line::row_cache`). Differences between two
+/// snapshots are what the frames between them cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowCacheCounts {
+    pub reused: u64,
+    pub drawn: u64,
+}
+
+impl RowCacheCounts {
+    /// What happened between `earlier` and `self`.
+    pub fn since(self, earlier: RowCacheCounts) -> RowCacheCounts {
+        RowCacheCounts {
+            reused: self.reused - earlier.reused,
+            drawn: self.drawn - earlier.drawn,
+        }
+    }
+}
+
+thread_local! {
+    static ROW_CACHE: Cell<RowCacheCounts> = const { Cell::new(RowCacheCounts { reused: 0, drawn: 0 }) };
+}
+
+/// The row cache's counts as they stand on this thread.
+pub fn row_cache_counts() -> RowCacheCounts {
+    ROW_CACHE.with(|c| c.get())
+}
+
+pub(crate) fn count_row(reused: bool) {
+    ROW_CACHE.with(|c| {
+        let mut v = c.get();
+        if reused {
+            v.reused += 1;
+        } else {
+            v.drawn += 1;
+        }
+        c.set(v);
+    });
+}

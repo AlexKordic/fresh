@@ -22,7 +22,11 @@ use cells::{render_line_cells, CellPassInput};
 use trailing::{fill_eof_rows, render_implicit_trailing_line, PostRowAccumulator, PostRowContext};
 
 mod cells;
+mod row_cache;
 mod trailing;
+
+pub(crate) use row_cache::RowCache;
+use row_cache::{shared_key, CachedRow, RowInputs, RowKeys, SharedInputs};
 
 use crate::app::types::ViewLineMapping;
 use crate::config::IndentationGuideMode;
@@ -99,6 +103,42 @@ pub(crate) struct LineRenderInput<'a> {
     pub cell_theme_map: &'a mut Vec<crate::app::types::CellThemeInfo>,
     /// Screen width for cell_theme_map indexing
     pub screen_width: u16,
+    /// The buffer's rows from earlier frames (see `row_cache`), when the
+    /// caller keeps them.
+    pub row_cache: Option<&'a mut RowCache>,
+}
+
+/// `LineRenderInput` without the two things it lends mutably, so one render
+/// can be drawn twice (see `render_view_lines`).
+#[derive(Clone, Copy)]
+struct RowArgs<'a> {
+    state: &'a EditorState,
+    margin: &'a crate::view::margin::MarginConfig,
+    theme: &'a Theme,
+    view_lines: &'a [ViewLine],
+    view_anchor: ViewAnchor,
+    render_area: Rect,
+    gutter_width: usize,
+    selection: &'a SelectionContext,
+    decorations: &'a DecorationContext,
+    visible_line_count: usize,
+    lsp_waiting: bool,
+    is_active: bool,
+    line_wrap: bool,
+    estimated_lines: usize,
+    left_column: usize,
+    relative_line_numbers: bool,
+    session_mode: bool,
+    software_cursor_only: bool,
+    show_line_numbers: bool,
+    byte_offset_mode: bool,
+    show_tilde: bool,
+    effective_editor_bg: Color,
+    highlight_current_line: bool,
+    indentation_guide: IndentationGuideMode,
+    indentation_guide_glyph: &'a str,
+    rainbow_indentation: bool,
+    screen_width: u16,
 }
 
 /// Software-cursor screen position, tracked across all per-line passes.
@@ -476,8 +516,6 @@ fn append_blank_line_guides(
 }
 
 pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput {
-    use crate::view::folding::indent_folding;
-
     let LineRenderInput {
         state,
         margin,
@@ -507,7 +545,195 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         rainbow_indentation,
         cell_theme_map,
         screen_width,
+        row_cache,
     } = input;
+    let args = RowArgs {
+        state,
+        margin,
+        theme,
+        view_lines,
+        view_anchor,
+        render_area,
+        gutter_width,
+        selection,
+        decorations,
+        visible_line_count,
+        lsp_waiting,
+        is_active,
+        line_wrap,
+        estimated_lines,
+        left_column,
+        relative_line_numbers,
+        session_mode,
+        software_cursor_only,
+        show_line_numbers,
+        byte_offset_mode,
+        show_tilde,
+        effective_editor_bg,
+        highlight_current_line,
+        indentation_guide,
+        indentation_guide_glyph,
+        rainbow_indentation,
+        screen_width,
+    };
+    // Debug builds draw a frame the cache served once more without it and
+    // require the two to agree, so a row whose key misses an input fails the
+    // tests rather than showing stale content.
+    #[cfg(debug_assertions)]
+    let row_cache = match row_cache {
+        Some(cache) => {
+            let mut uncached_map = cell_theme_map.clone();
+            let uncached = render_rows(args, &mut uncached_map, None);
+            let cached = render_rows(args, cell_theme_map, Some(cache));
+            check_cached_render(&uncached, &cached, &uncached_map, cell_theme_map);
+            return cached;
+        }
+        None => None,
+    };
+    render_rows(args, cell_theme_map, row_cache)
+}
+
+/// A frame the row cache served must be the frame drawn without it.
+#[cfg(debug_assertions)]
+fn check_cached_render(
+    uncached: &LineRenderOutput,
+    cached: &LineRenderOutput,
+    uncached_map: &[crate::app::types::CellThemeInfo],
+    cached_map: &[crate::app::types::CellThemeInfo],
+) {
+    for (row, (a, b)) in uncached.lines.iter().zip(&cached.lines).enumerate() {
+        assert!(
+            a == b,
+            "row cache: row {row} differs\n  drawn:  {a:?}\n  cached: {b:?}"
+        );
+    }
+    assert_eq!(
+        uncached.lines.len(),
+        cached.lines.len(),
+        "row cache: row count"
+    );
+    assert_eq!(
+        uncached.view_line_mappings, cached.view_line_mappings,
+        "row cache: view line mappings"
+    );
+    assert_eq!(uncached.cursor, cached.cursor, "row cache: cursor");
+    assert_eq!(
+        uncached.last_line_end, cached.last_line_end,
+        "row cache: last line end"
+    );
+    assert_eq!(
+        uncached.content_lines_rendered, cached.content_lines_rendered,
+        "row cache: rows"
+    );
+    if let Some(i) = (0..uncached_map.len()).find(|&i| uncached_map[i] != cached_map[i]) {
+        panic!(
+            "row cache: theme inspector cell {i} differs\n  drawn:  {:?}\n  cached: {:?}",
+            uncached_map[i], cached_map[i]
+        );
+    }
+}
+
+/// The theme inspector's cells a row's content covers — from the gutter's
+/// right edge to the pane's, on the row's screen line — when the map records
+/// and the row is inside the pane.
+fn content_theme_cells(
+    map_len: usize,
+    screen_width: u16,
+    render_area: Rect,
+    gutter_width: usize,
+    current_row: u16,
+) -> Option<std::ops::Range<usize>> {
+    if screen_width == 0 || current_row >= render_area.height {
+        return None;
+    }
+    let line = (render_area.y + current_row) as usize * screen_width as usize;
+    let start = line + render_area.x as usize + gutter_width.min(render_area.width as usize);
+    let end = line + render_area.x as usize + render_area.width as usize;
+    (end <= map_len).then_some(start..end)
+}
+
+/// Where a row can come from the row cache: its first and last source bytes
+/// and the last one in drawing order, when it is one the cache may hold (see
+/// `row_cache`): no ANSI, not cut short, holding no cursor and not on the
+/// cursor's logical line — neither drawing any of it nor counted on it, as a
+/// row without a line number is when the row above it is.
+#[allow(clippy::too_many_arguments)]
+fn cacheable_row(
+    view_line: &ViewLine,
+    on_cursor_line: bool,
+    ansi_active: bool,
+    max_chars_to_process: usize,
+    selection: &SelectionContext,
+    cursor_line_start_byte: usize,
+    cursor_line_end_byte: usize,
+    buffer_len: usize,
+) -> Option<(usize, usize, usize)> {
+    if on_cursor_line
+        || ansi_active
+        || view_line.text.contains('\x1b')
+        || view_line.visual_width() > max_chars_to_process
+    {
+        return None;
+    }
+    let mut bytes = view_line.char_source_bytes.iter().flatten().copied();
+    let first = bytes.next()?;
+    let (mut lo, mut hi, mut last) = (first, first, first);
+    for byte in bytes {
+        lo = lo.min(byte);
+        hi = hi.max(byte);
+        last = byte;
+    }
+    if lo < cursor_line_end_byte && hi >= cursor_line_start_byte {
+        return None;
+    }
+    let chars = view_line.char_source_bytes.len();
+    let after_last = view_line.char_source_bytes.get(chars).copied().flatten();
+    let last_unmapped = view_line
+        .char_source_bytes
+        .last()
+        .is_some_and(Option::is_none);
+    let holds_cursor = selection.cursor_positions.iter().any(|&p| {
+        (lo..=hi + 1).contains(&p) || after_last == Some(p) || (last_unmapped && p >= buffer_len)
+    });
+    (!holds_cursor).then_some((lo, hi, last))
+}
+
+fn render_rows(
+    args: RowArgs<'_>,
+    cell_theme_map: &mut Vec<crate::app::types::CellThemeInfo>,
+    mut row_cache: Option<&mut RowCache>,
+) -> LineRenderOutput {
+    use crate::view::folding::indent_folding;
+
+    let RowArgs {
+        state,
+        margin,
+        theme,
+        view_lines,
+        view_anchor,
+        render_area,
+        gutter_width,
+        selection,
+        decorations,
+        visible_line_count,
+        lsp_waiting,
+        is_active,
+        line_wrap,
+        estimated_lines,
+        left_column,
+        relative_line_numbers,
+        session_mode,
+        software_cursor_only,
+        show_line_numbers,
+        byte_offset_mode,
+        show_tilde,
+        effective_editor_bg,
+        highlight_current_line,
+        indentation_guide,
+        indentation_guide_glyph,
+        rainbow_indentation,
+        screen_width,
+    } = args;
 
     prefill_cell_theme_map(cell_theme_map, screen_width, render_area, gutter_width);
 
@@ -532,6 +758,47 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
     // of a soft-wrapped paragraph (issue #1790). Computed by direct byte scan.
     let cursor_line_end_byte =
         indent_folding::line_end_byte_or_ceiling(&state.buffer, primary_cursor_position);
+
+    // Rows reused from earlier frames (see `row_cache`). Not while a block
+    // selection or the highlight debug view is on: both reach every cell.
+    if let Some(cache) = row_cache.as_deref_mut() {
+        cache.begin(theme);
+    }
+    // Rows this render took from the cache and drew. Past its first
+    // `JUMP_PROBE_ROWS`, a render stores rows only while it reuses at least
+    // one in five: one that reuses fewer has jumped (a page, a goto) or shifts
+    // every row below an edit, and the next frame will not draw those rows
+    // again. A still frame after a jump reuses the stored rows and stores more,
+    // until the screen is cached.
+    const JUMP_PROBE_ROWS: usize = 8;
+    let (mut rows_reused, mut rows_drawn) = (0usize, 0usize);
+    let mut row_keys =
+        (row_cache.is_some() && selection.block_rects.is_empty() && !state.debug_highlight_mode)
+            .then(|| {
+                let settings = &state.buffer_settings;
+                let shared = shared_key(&SharedInputs {
+                    left_column,
+                    render_width: render_area.width,
+                    gutter_width,
+                    line_wrap,
+                    lsp_waiting,
+                    is_active,
+                    session_mode,
+                    software_cursor_only,
+                    highlight_current_line,
+                    indentation_guide: &format!("{indentation_guide:?}"),
+                    indentation_guide_glyph,
+                    rainbow_indentation,
+                    effective_editor_bg,
+                    records_theme: screen_width > 0,
+                    tab_size: settings.tab_size,
+                    whitespace: &format!("{:?}", settings.whitespace),
+                    whitespace_in_selection: settings.whitespace_in_selection,
+                    virtual_space: &format!("{:?}", settings.virtual_space),
+                    line_ending: &format!("{:?}", state.buffer.line_ending()),
+                });
+                RowKeys::new(decorations, selection, shared)
+            });
 
     let active_indentation_guide = ActiveIndentationGuide::for_view_lines(
         indentation_guide,
@@ -836,242 +1103,331 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
             })
         };
 
-        // Per-cell pass: walk the line's characters and emit styled spans
-        let cells = render_line_cells(
-            CellPassInput {
-                state,
-                theme,
-                view_line: current_view_line,
-                selection,
-                decorations,
-                gutter_num,
-                block_line_start_byte,
-                current_row,
-                render_area,
-                gutter_width,
-                screen_width,
-                left_col,
-                max_chars_to_process,
-                lsp_waiting,
-                is_active,
-                session_mode,
-                is_on_cursor_line,
-                highlight_current_line,
-                indentation_guide,
-                indentation_guide_glyph,
-                rainbow_indentation,
-                indentation_guide_columns: &guide_columns_buf,
-                active_indentation_guide_col: active_guide_col,
-            },
-            &mut selection_sweep,
-            &mut overlay_sweep,
-            &mut span_cursors,
-            &mut cursor,
-            &mut ansi_parser,
-            cell_theme_map.as_mut_slice(),
-            &mut line_spans,
-            &mut line_view_map,
+        // The row's content: from the cache when an earlier frame drew this
+        // row from the same inputs, else drawn and kept for the next frame.
+        let gutter_spans = line_spans.len();
+        let gutter_cells = line_view_map.len();
+        let theme_cells = content_theme_cells(
+            cell_theme_map.len(),
+            screen_width,
+            render_area,
+            gutter_width,
+            current_row,
         );
-        let mut rendered_cols = cells.rendered_cols;
-
-        // Virtual-space block selections are true rectangles: paint the part
-        // of any block rect that extends past this row's content with the
-        // selection background, so the on-screen rectangle matches what a
-        // block copy/insert will act on. Skips wrapped continuation rows —
-        // block columns are line-relative.
-        if state.buffer_settings.virtual_space.block_beyond_eol()
-            && !selection.block_rects.is_empty()
-            && !matches!(
-                line_start_type,
-                LineStart::AfterBreak | LineStart::AfterInjectedNewline
-            )
-        {
-            let row_len = line_content.trim_end_matches(['\r', '\n']).len();
-            let overlap = selection
-                .block_rects
-                .iter()
-                .filter(|(start_line, _, end_line, end_col)| {
-                    *start_line <= gutter_num && gutter_num <= *end_line && *end_col > row_len
-                })
-                .map(|(_, start_col, _, end_col)| ((*start_col).max(row_len), *end_col))
-                .fold(None::<(usize, usize)>, |acc, (s, e)| match acc {
-                    Some((as_, ae)) => Some((as_.min(s), ae.max(e))),
-                    None => Some((s, e)),
-                });
-            if let Some((sel_start, sel_end)) = overlap {
-                let content_cols = render_area.width.saturating_sub(gutter_width as u16) as usize;
-                let gap = (sel_start - row_len).min(content_cols.saturating_sub(rendered_cols));
-                if gap > 0 {
-                    push_span_with_map(
-                        &mut line_spans,
-                        &mut line_view_map,
-                        " ".repeat(gap),
-                        Style::default(),
-                        None,
-                    );
-                    rendered_cols += gap;
-                }
-                // Match the per-cell sweep: block columns are half-open,
-                // so the rectangle is `sel_end - sel_start` wide — exactly
-                // what `copy_block_selection_text` pads a short line to.
-                let sel_len = (sel_end - sel_start).min(content_cols.saturating_sub(rendered_cols));
-                if sel_len > 0 {
-                    push_span_with_map(
-                        &mut line_spans,
-                        &mut line_view_map,
-                        " ".repeat(sel_len),
-                        Style::default().bg(theme.selection_bg),
-                        None,
-                    );
-                    rendered_cols += sel_len;
-                }
-            }
-        }
-
-        if !line_has_newline {
-            // The end-of-line cursor can only be placed on rows whose final
-            // screen y is already known: empty rows, unwrapped rows, or rows
-            // with empty content (wrapped non-empty rows may still grow).
-            let seg_y = (line_spans.is_empty() || !line_wrap || line_content.is_empty())
-                .then_some(current_row);
-            place_line_end_cursor(
-                &LineEndCursorInput {
-                    view_line: current_view_line,
-                    selection,
-                    buffer_len: state.buffer.len(),
-                    theme,
-                    is_active,
-                    software_cursor_only,
-                    gutter_width,
-                    left_col,
-                    col_offset: cells.col_offset,
-                    seg_y,
-                },
-                &mut cursor,
-                &mut line_spans,
-                &mut line_view_map,
-            );
-        }
-
-        // Where THIS row's text ends. Per row, and `None` until a source cell is
-        // found: a row that draws none, empty or carrying only decoration, has
-        // no text end of its own and must not inherit another row's.
-        let mut row_text_end_x: Option<u16> = None;
-        if !line_spans.is_empty() {
-            let row_end_exclusive = row_end_exclusive(current_view_line, &state.buffer);
-            if let Some(x) = locate_cursor_in_view_map(
-                &line_view_map,
-                primary_cursor_position,
+        let row = row_keys.as_mut().and_then(|keys| {
+            let (first_byte, last_byte, last_drawn) = cacheable_row(
+                current_view_line,
+                is_on_cursor_line,
+                ansi_parser.is_some(),
+                max_chars_to_process,
+                selection,
                 cursor_line_start_byte,
                 cursor_line_end_byte,
-                row_end_exclusive,
-                is_on_cursor_line,
-                current_row,
-                &mut cursor,
-            ) {
-                row_text_end_x = Some(x);
-            }
+                state.buffer.len(),
+            )?;
+            let key = keys.key(&RowInputs {
+                view_line: current_view_line,
+                first_byte,
+                last_byte,
+                overlay_reach: overlay_sweep
+                    .last_bp()
+                    .map_or(first_byte, |bp| bp.min(first_byte)),
+                gutter_num,
+                is_continuation,
+                line_start_byte,
+                guide_columns: &guide_columns_buf,
+                active_guide_column: active_guide_col,
+            });
+            Some((key, last_drawn))
+        });
+        let reused = match (row, row_cache.as_deref_mut()) {
+            (Some((key, last_drawn)), Some(cache)) => cache
+                .get(key)
+                .filter(|cached| {
+                    cached.theme_cell_count() == theme_cells.as_ref().map_or(0, |r| r.len())
+                })
+                .map(|cached| {
+                    // The overlay sweep ends the row where drawing it would.
+                    overlay_sweep.enter_row(
+                        matches!(line_start_type, LineStart::AfterBreak),
+                        current_view_line.source_start_byte,
+                    );
+                    overlay_sweep.advance_to(last_drawn);
+                    line_spans.extend(cached.spans.iter().cloned());
+                    line_view_map.extend_from_slice(&cached.view_map);
+                    if let Some(range) = theme_cells.clone() {
+                        cached.write_theme_cells(&mut cell_theme_map[range]);
+                    }
+                    (cached.text_end_x, cached.newline_indicator_cols)
+                }),
+            _ => None,
+        };
+        if row_cache.is_some() {
+            crate::view::ui::split_rendering::instrument::count_row(reused.is_some());
         }
-
-        let content_width = render_area.width.saturating_sub(gutter_width as u16) as usize;
-        let cursor_line_active = is_on_cursor_line && highlight_current_line && is_active;
-
-        // Draw indentation guides *through* this row at guide columns the
-        // per-cell pass could not reach — i.e. columns past the row's own
-        // leading whitespace. Blank and empty rows have few or no leading-space
-        // cells to restyle, so without this their guides would gap out; here the
-        // missing guide cells (and the plain spaces between them) are synthesised
-        // so guides stay vertically continuous across blank lines. Code rows
-        // never trigger this (their guide columns all fall inside their indent).
-        let row_can_have_guides = current_view_line.source_start_byte.is_some()
-            && !matches!(
-                line_start_type,
-                LineStart::AfterBreak | LineStart::AfterInjectedNewline
-            );
-        if row_can_have_guides {
-            let synth_columns: &[usize] = match indentation_guide {
-                IndentationGuideMode::All => &guide_columns_buf,
-                IndentationGuideMode::Active => active_guide_col.as_slice(),
-                IndentationGuideMode::None => &[],
-            };
-            let mut guide_style = Style::default().fg(theme.indentation_guide_fg);
-            if cursor_line_active {
-                guide_style = guide_style.bg(theme.current_line_bg);
-            } else if cells.first_line_byte_pos.is_some() && cells.last_line_byte_pos.is_some() {
-                // Match the tail fill: a full-width overlay band must run
-                // under the synthesised guide cells too, or blank rows in
-                // the range show a bg hole where the guides sit.
-                if let Some(bg) = overlay_sweep
-                    .fill_overlay()
-                    .and_then(|o| overlay_bg_style(o, theme))
-                    .and_then(|s| s.bg)
-                {
-                    guide_style = guide_style.bg(bg);
-                }
-            }
-            append_blank_line_guides(
-                synth_columns,
-                left_col + rendered_cols,
-                left_col,
-                content_width,
-                guide_glyph_char,
-                guide_style,
-                rainbow_indentation.then_some(theme),
-                state.buffer_settings.tab_size,
-                &mut rendered_cols,
+        let store_row = rows_drawn < JUMP_PROBE_ROWS || rows_reused * 4 >= rows_drawn;
+        match reused {
+            Some(_) => rows_reused += 1,
+            None => rows_drawn += 1,
+        }
+        let (row_text_end_x, newline_indicator_cols) = if let Some(reused) = reused {
+            reused
+        } else {
+            // Per-cell pass: walk the line's characters and emit styled spans
+            let cells = render_line_cells(
+                CellPassInput {
+                    state,
+                    theme,
+                    view_line: current_view_line,
+                    selection,
+                    decorations,
+                    gutter_num,
+                    block_line_start_byte,
+                    current_row,
+                    render_area,
+                    gutter_width,
+                    screen_width,
+                    left_col,
+                    max_chars_to_process,
+                    lsp_waiting,
+                    is_active,
+                    session_mode,
+                    is_on_cursor_line,
+                    highlight_current_line,
+                    indentation_guide,
+                    indentation_guide_glyph,
+                    rainbow_indentation,
+                    indentation_guide_columns: &guide_columns_buf,
+                    active_indentation_guide_col: active_guide_col,
+                },
+                &mut selection_sweep,
+                &mut overlay_sweep,
+                &mut span_cursors,
+                &mut cursor,
+                &mut ansi_parser,
+                cell_theme_map.as_mut_slice(),
                 &mut line_spans,
                 &mut line_view_map,
             );
-        }
+            let mut rendered_cols = cells.rendered_cols;
 
-        // Inline diagnostic text: render after line content (before extend_to_line_end fill).
-        // Only for non-continuation lines that have a diagnostic overlay.
-        if let Some(lsb) = line_start_byte {
-            if let Some((message, diag_style)) = decorations.diagnostic_inline_texts.get(&lsb) {
-                append_inline_diagnostic(
-                    message,
-                    diag_style,
+            // Virtual-space block selections are true rectangles: paint the part
+            // of any block rect that extends past this row's content with the
+            // selection background, so the on-screen rectangle matches what a
+            // block copy/insert will act on. Skips wrapped continuation rows —
+            // block columns are line-relative.
+            if state.buffer_settings.virtual_space.block_beyond_eol()
+                && !selection.block_rects.is_empty()
+                && !matches!(
+                    line_start_type,
+                    LineStart::AfterBreak | LineStart::AfterInjectedNewline
+                )
+            {
+                let row_len = line_content.trim_end_matches(['\r', '\n']).len();
+                let overlap = selection
+                    .block_rects
+                    .iter()
+                    .filter(|(start_line, _, end_line, end_col)| {
+                        *start_line <= gutter_num && gutter_num <= *end_line && *end_col > row_len
+                    })
+                    .map(|(_, start_col, _, end_col)| ((*start_col).max(row_len), *end_col))
+                    .fold(None::<(usize, usize)>, |acc, (s, e)| match acc {
+                        Some((as_, ae)) => Some((as_.min(s), ae.max(e))),
+                        None => Some((s, e)),
+                    });
+                if let Some((sel_start, sel_end)) = overlap {
+                    let content_cols =
+                        render_area.width.saturating_sub(gutter_width as u16) as usize;
+                    let gap = (sel_start - row_len).min(content_cols.saturating_sub(rendered_cols));
+                    if gap > 0 {
+                        push_span_with_map(
+                            &mut line_spans,
+                            &mut line_view_map,
+                            " ".repeat(gap),
+                            Style::default(),
+                            None,
+                        );
+                        rendered_cols += gap;
+                    }
+                    // Match the per-cell sweep: block columns are half-open,
+                    // so the rectangle is `sel_end - sel_start` wide — exactly
+                    // what `copy_block_selection_text` pads a short line to.
+                    let sel_len =
+                        (sel_end - sel_start).min(content_cols.saturating_sub(rendered_cols));
+                    if sel_len > 0 {
+                        push_span_with_map(
+                            &mut line_spans,
+                            &mut line_view_map,
+                            " ".repeat(sel_len),
+                            Style::default().bg(theme.selection_bg),
+                            None,
+                        );
+                        rendered_cols += sel_len;
+                    }
+                }
+            }
+
+            if !line_has_newline {
+                // The end-of-line cursor can only be placed on rows whose final
+                // screen y is already known: empty rows, unwrapped rows, or rows
+                // with empty content (wrapped non-empty rows may still grow).
+                let seg_y = (line_spans.is_empty() || !line_wrap || line_content.is_empty())
+                    .then_some(current_row);
+                place_line_end_cursor(
+                    &LineEndCursorInput {
+                        view_line: current_view_line,
+                        selection,
+                        buffer_len: state.buffer.len(),
+                        theme,
+                        is_active,
+                        software_cursor_only,
+                        gutter_width,
+                        left_col,
+                        col_offset: cells.col_offset,
+                        seg_y,
+                    },
+                    &mut cursor,
+                    &mut line_spans,
+                    &mut line_view_map,
+                );
+            }
+
+            // Where THIS row's text ends. Per row, and `None` until a source cell is
+            // found: a row that draws none, empty or carrying only decoration, has
+            // no text end of its own and must not inherit another row's.
+            let mut row_text_end_x: Option<u16> = None;
+            if !line_spans.is_empty() {
+                let row_end_exclusive = row_end_exclusive(current_view_line, &state.buffer);
+                if let Some(x) = locate_cursor_in_view_map(
+                    &line_view_map,
+                    primary_cursor_position,
+                    cursor_line_start_byte,
+                    cursor_line_end_byte,
+                    row_end_exclusive,
+                    is_on_cursor_line,
+                    current_row,
+                    &mut cursor,
+                ) {
+                    row_text_end_x = Some(x);
+                }
+            }
+
+            let content_width = render_area.width.saturating_sub(gutter_width as u16) as usize;
+            let cursor_line_active = is_on_cursor_line && highlight_current_line && is_active;
+
+            // Draw indentation guides *through* this row at guide columns the
+            // per-cell pass could not reach — i.e. columns past the row's own
+            // leading whitespace. Blank and empty rows have few or no leading-space
+            // cells to restyle, so without this their guides would gap out; here the
+            // missing guide cells (and the plain spaces between them) are synthesised
+            // so guides stay vertically continuous across blank lines. Code rows
+            // never trigger this (their guide columns all fall inside their indent).
+            let row_can_have_guides = current_view_line.source_start_byte.is_some()
+                && !matches!(
+                    line_start_type,
+                    LineStart::AfterBreak | LineStart::AfterInjectedNewline
+                );
+            if row_can_have_guides {
+                let synth_columns: &[usize] = match indentation_guide {
+                    IndentationGuideMode::All => &guide_columns_buf,
+                    IndentationGuideMode::Active => active_guide_col.as_slice(),
+                    IndentationGuideMode::None => &[],
+                };
+                let mut guide_style = Style::default().fg(theme.indentation_guide_fg);
+                if cursor_line_active {
+                    guide_style = guide_style.bg(theme.current_line_bg);
+                } else if cells.first_line_byte_pos.is_some() && cells.last_line_byte_pos.is_some()
+                {
+                    // Match the tail fill: a full-width overlay band must run
+                    // under the synthesised guide cells too, or blank rows in
+                    // the range show a bg hole where the guides sit.
+                    if let Some(bg) = overlay_sweep
+                        .fill_overlay()
+                        .and_then(|o| overlay_bg_style(o, theme))
+                        .and_then(|s| s.bg)
+                    {
+                        guide_style = guide_style.bg(bg);
+                    }
+                }
+                append_blank_line_guides(
+                    synth_columns,
+                    left_col + rendered_cols,
+                    left_col,
                     content_width,
-                    cursor_line_active,
-                    theme.current_line_bg,
+                    guide_glyph_char,
+                    guide_style,
+                    rainbow_indentation.then_some(theme),
+                    state.buffer_settings.tab_size,
                     &mut rendered_cols,
                     &mut line_spans,
                     &mut line_view_map,
                 );
             }
-        }
 
-        // Paint trailing columns with the overlay-extend bg, or fall
-        // back to the virtual-line bg. See `tail_fill` for the policy.
-        let remaining_cols = content_width.saturating_sub(rendered_cols);
-        if remaining_cols > 0 {
-            if let Some(fill) = resolve_tail_fill(TailFillInput {
-                current_view_line,
-                theme,
-                overlay_fill: overlay_sweep.fill_overlay(),
-                syntax_extend_bg: cells.syntax_extend_bg,
-                first_line_byte_pos: cells.first_line_byte_pos,
-                last_line_byte_pos: cells.last_line_byte_pos,
-            }) {
-                push_span_with_map(
-                    &mut line_spans,
-                    &mut line_view_map,
+            // Inline diagnostic text: render after line content (before extend_to_line_end fill).
+            // Only for non-continuation lines that have a diagnostic overlay.
+            if let Some(lsb) = line_start_byte {
+                if let Some((message, diag_style)) = decorations.diagnostic_inline_texts.get(&lsb) {
+                    append_inline_diagnostic(
+                        message,
+                        diag_style,
+                        content_width,
+                        cursor_line_active,
+                        theme.current_line_bg,
+                        &mut rendered_cols,
+                        &mut line_spans,
+                        &mut line_view_map,
+                    );
+                }
+            }
+
+            // Paint trailing columns with the overlay-extend bg, or fall
+            // back to the virtual-line bg. See `tail_fill` for the policy.
+            let remaining_cols = content_width.saturating_sub(rendered_cols);
+            if remaining_cols > 0 {
+                if let Some(fill) = resolve_tail_fill(TailFillInput {
+                    current_view_line,
+                    theme,
+                    overlay_fill: overlay_sweep.fill_overlay(),
+                    syntax_extend_bg: cells.syntax_extend_bg,
+                    first_line_byte_pos: cells.first_line_byte_pos,
+                    last_line_byte_pos: cells.last_line_byte_pos,
+                }) {
+                    push_span_with_map(
+                        &mut line_spans,
+                        &mut line_view_map,
+                        " ".repeat(remaining_cols),
+                        fill.style,
+                        fill.source_byte,
+                    );
+                }
+            }
+
+            // Fill remaining width with current_line_bg for cursor line highlighting.
+            // Add the span directly (not via push_span_with_map) to avoid extending
+            // line_view_map, which would break mouse click byte mapping.
+            if cursor_line_active && remaining_cols > 0 {
+                line_spans.push(Span::styled(
                     " ".repeat(remaining_cols),
-                    fill.style,
-                    fill.source_byte,
+                    Style::default().bg(theme.current_line_bg),
+                ));
+            }
+
+            if let (Some((key, _)), Some(cache), true) = (row, row_cache.as_deref_mut(), store_row)
+            {
+                cache.insert(
+                    key,
+                    CachedRow::new(
+                        line_spans[gutter_spans..].to_vec(),
+                        line_view_map[gutter_cells..].to_vec(),
+                        theme_cells.map_or(&[][..], |range| &cell_theme_map[range]),
+                        row_text_end_x,
+                        cells.newline_indicator_cols,
+                    ),
                 );
             }
-        }
-
-        // Fill remaining width with current_line_bg for cursor line highlighting.
-        // Add the span directly (not via push_span_with_map) to avoid extending
-        // line_view_map, which would break mouse click byte mapping.
-        if cursor_line_active && remaining_cols > 0 {
-            line_spans.push(Span::styled(
-                " ".repeat(remaining_cols),
-                Style::default().bg(theme.current_line_bg),
-            ));
-        }
+            (row_text_end_x, cells.newline_indicator_cols)
+        };
 
         // For virtual rows (no source bytes), inherit from previous row
         let prev_line_end_byte = view_line_mappings
@@ -1111,7 +1467,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
             // cursor lands on the indicator, not past it.
             Some(x) => x
                 .saturating_add(1)
-                .saturating_sub(cells.newline_indicator_cols as u16),
+                .saturating_sub(newline_indicator_cols as u16),
             // No source cell, so the row's text ends where text begins.
             None => gutter_width as u16,
         };
@@ -1210,6 +1566,10 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         show_tilde,
         effective_editor_bg,
     );
+
+    if let Some(cache) = row_cache {
+        cache.end();
+    }
 
     LineRenderOutput {
         lines,

@@ -150,6 +150,11 @@ impl<'a> OverlayActiveSet<'a> {
         self.last_bp = Some(bp);
     }
 
+    /// The byte `advance_to` was last called with.
+    pub(super) fn last_bp(&self) -> Option<usize> {
+        self.last_bp
+    }
+
     /// Active overlays at the byte `advance_to` was last called with,
     /// in priority-ascending order. Use for per-cell style composition.
     pub(super) fn at_cursor(&self) -> &[&'a Overlay] {

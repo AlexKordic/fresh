@@ -36,6 +36,7 @@ pub use crate::app::CellsProvenance;
 // The text pipeline's frame-cost counters (`view::ui::split_rendering::instrument`):
 // how many panes a frame placed, formatted and built rows for. The e2e harness
 // asserts the three agree around every frame.
+pub use crate::view::ui::split_rendering::instrument::{row_cache_counts, RowCacheCounts};
 pub use crate::view::ui::split_rendering::instrument::{snapshot as frame_counters, FrameCounters};
 
 /// A test-side projection of `crate::model::cursor::Cursor`.

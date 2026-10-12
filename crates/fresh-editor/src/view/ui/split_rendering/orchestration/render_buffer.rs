@@ -480,6 +480,8 @@ pub(crate) fn compute_buffer_layout(
         None => (&mut dummy_map, 0u16),
     };
 
+    // The buffer's cached rows, lent to the row pass and returned after it.
+    let mut row_cache = std::mem::take(&mut state.row_cache);
     let render_output = render_view_lines(LineRenderInput {
         state,
         margin: &margin,
@@ -509,7 +511,9 @@ pub(crate) fn compute_buffer_layout(
         rainbow_indentation,
         cell_theme_map: map_ref,
         screen_width: sw,
+        row_cache: Some(&mut row_cache),
     });
+    state.row_cache = row_cache;
 
     let view_line_mappings = render_output.view_line_mappings.clone();
 

@@ -8,7 +8,7 @@
 /// properties carry.
 use std::borrow::Cow;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CellThemeInfo {
     /// Foreground theme key (e.g. "syntax.keyword", "editor.fg")
     pub fg_key: Option<std::borrow::Cow<'static, str>>,
