@@ -2190,7 +2190,10 @@ pub(crate) struct GridHasher {
 }
 
 /// A row's cells as bytes, hashed in one pass: hashing each cell's fields one
-/// by one costs a millisecond for a large grid.
+/// by one costs a millisecond for a large grid. The hash is foldhash's
+/// quality variant with a fixed seed, several times faster than SipHash over
+/// a row's couple of kilobytes; a collision would keep a changed row from
+/// being sent, so it is a full-quality 64-bit hash, not the fastest one.
 #[derive(Default)]
 struct RowBytes(Vec<u8>);
 
@@ -2199,7 +2202,8 @@ impl std::hash::Hasher for RowBytes {
         self.0.extend_from_slice(bytes);
     }
     fn finish(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::BuildHasher;
+        let mut hasher = foldhash::quality::FixedState::with_seed(0).build_hasher();
         hasher.write(&self.0);
         hasher.finish()
     }
