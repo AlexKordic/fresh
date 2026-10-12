@@ -632,9 +632,9 @@ pub struct PopupSpanView {
     #[serde(rename = "t")]
     pub text: String,
     #[serde(rename = "fg", skip_serializing_if = "Option::is_none")]
-    pub fg: Option<String>,
+    pub fg: Option<Rgb>,
     #[serde(rename = "bg", skip_serializing_if = "Option::is_none")]
-    pub bg: Option<String>,
+    pub bg: Option<Rgb>,
     #[serde(rename = "b", skip_serializing_if = "std::ops::Not::not")]
     pub bold: bool,
     #[serde(rename = "i", skip_serializing_if = "std::ops::Not::not")]
@@ -663,8 +663,8 @@ impl PopupSpanView {
         let m = style.add_modifier;
         Self {
             text,
-            fg: style.fg.and_then(css_color),
-            bg: style.bg.and_then(css_color),
+            fg: style.fg.and_then(rgb),
+            bg: style.bg.and_then(rgb),
             bold: m.contains(ratatui::style::Modifier::BOLD),
             italic: m.contains(ratatui::style::Modifier::ITALIC),
             underline: m.contains(ratatui::style::Modifier::UNDERLINED),
@@ -1390,7 +1390,30 @@ pub struct TreeView {
     pub cursor: Option<[i32; 2]>,
 }
 
+/// A color resolved to RGB for a front end. The web scene writes it as CSS
+/// (`#rrggbb`); the native front end's encoder writes the number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+impl Rgb {
+    /// `0xRRGGBB`.
+    pub fn packed(self) -> u32 {
+        (self.0 as u32) << 16 | (self.1 as u32) << 8 | self.2 as u32
+    }
+}
+
+impl Serialize for Rgb {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("#{:02x}{:02x}{:02x}", self.0, self.1, self.2))
+    }
+}
+
 fn css_color(c: ratatui::style::Color) -> Option<String> {
+    rgb(c).map(|Rgb(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
+}
+
+/// A color as RGB, `None` for the terminal default.
+fn rgb(c: ratatui::style::Color) -> Option<Rgb> {
     use ratatui::style::Color;
     // The xterm 256-colour cube and ramp, so an indexed colour a theme names
     // reads the same in a browser as in a terminal.
@@ -1447,7 +1470,7 @@ fn css_color(c: ratatui::style::Color) -> Option<String> {
         Color::White => indexed(15),
         Color::Reset => return None,
     };
-    Some(format!("#{r:02x}{g:02x}{b:02x}"))
+    Some(Rgb(r, g, b))
 }
 
 impl Editor {
@@ -2514,8 +2537,12 @@ mod tests {
             .bg(Color::Rgb(40, 40, 40))
             .add_modifier(Modifier::BOLD | Modifier::ITALIC);
         let span = PopupSpanView::styled("greet".to_string(), style);
-        assert_eq!(span.fg.as_deref(), Some("#ffff00"));
-        assert_eq!(span.bg.as_deref(), Some("#282828"));
+        assert_eq!(span.fg, Some(super::Rgb(255, 255, 0)));
+        assert_eq!(span.bg, Some(super::Rgb(40, 40, 40)));
+        // The web scene writes them as CSS.
+        let json = serde_json::to_value(&span).expect("span");
+        assert_eq!(json["fg"], "#ffff00");
+        assert_eq!(json["bg"], "#282828");
         assert!(span.bold);
         assert!(span.italic);
         assert!(!span.underline);

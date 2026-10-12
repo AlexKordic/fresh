@@ -108,6 +108,7 @@ use ratatui::Terminal;
 use serde_json::{json, Value};
 
 use crate::app::Editor;
+use crate::view::scene::Rgb;
 use crate::config;
 use crate::config_io::DirectoryContext;
 use crate::model::filesystem::{FileSystem, StdFileSystem};
@@ -475,25 +476,25 @@ pub fn build_editor(cols: u16, rows: u16, files: &[PathBuf], fire_ready: bool) -
 pub fn apply_step(editor: &mut Editor, step: &Value) {
     if let Some(s) = step.get("type").and_then(|t| t.as_str()) {
         for ch in s.chars() {
-            apply_key(editor, &json!({ "key": ch.to_string() }));
+            let key = ch.to_string();
+            apply_key(
+                editor,
+                KeyInput {
+                    key: &key,
+                    ..KeyInput::default()
+                },
+            );
         }
     } else if step.get("key").is_some() {
-        apply_key(editor, step);
+        apply_key(editor, KeyInput::from_json(step));
     } else if step.get("kind").is_some() {
-        apply_mouse(editor, step);
+        if let Some(input) = MouseInput::from_json(step) {
+            apply_mouse(editor, input);
+        }
     } else if let Some(name) = step.get("action").and_then(|a| a.as_str()) {
         // Optional `args` object for parameterised actions
         // (e.g. {"action": "menu_open", "args": {"name": "File"}}).
-        let args: std::collections::HashMap<String, Value> = step
-            .get("args")
-            .and_then(|a| a.as_object())
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        if let Some(act) = crate::input::keybindings::Action::from_str(name, &args) {
-            if let Err(e) = editor.handle_action(act) {
-                eprintln!("[webui] action error: {e}");
-            }
-        }
+        apply_action(editor, name, &action_args(step));
     }
     // Drain async work / step animations. The `bool` (needs-render) is moot —
     // the bridge re-renders the scene on every request — but surface a real
@@ -1366,6 +1367,117 @@ fn handle_http(
 /// POST routes (kind = route name) and the WS `{"type": kind, ...}` messages.
 /// Returns false for unknown kinds. Does NOT render: callers decide when a
 /// scene is built (per HTTP request, or once per WS input batch).
+/// A key from a front end: the browser's name for it (`key`), the physical
+/// key (`code`, read for the digit row), and the modifiers held.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct KeyInput<'a> {
+    pub(crate) key: &'a str,
+    pub(crate) code: Option<&'a str>,
+    pub(crate) ctrl: bool,
+    pub(crate) alt: bool,
+    pub(crate) meta: bool,
+    pub(crate) shift: bool,
+}
+
+impl<'a> KeyInput<'a> {
+    fn from_json(v: &'a Value) -> Self {
+        let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+        Self {
+            key: v.get("key").and_then(|k| k.as_str()).unwrap_or(""),
+            code: v.get("code").and_then(|c| c.as_str()),
+            ctrl: flag("ctrl"),
+            alt: flag("alt"),
+            meta: flag("meta"),
+            shift: flag("shift"),
+        }
+    }
+}
+
+/// A mouse event from a front end, on a cell, repeated `n` times (wheel
+/// notches), with the click count the front end counted (`count`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MouseInput {
+    pub(crate) kind: MouseEventKind,
+    pub(crate) col: u16,
+    pub(crate) row: u16,
+    pub(crate) n: u16,
+    pub(crate) count: u64,
+    pub(crate) modifiers: KeyModifiers,
+}
+
+impl MouseInput {
+    /// The event a JSON `mouse` message names, or `None` for an unknown kind.
+    fn from_json(v: &Value) -> Option<Self> {
+        let button = match v.get("button").and_then(|b| b.as_str()) {
+            Some("right") => MouseButton::Right,
+            Some("middle") => MouseButton::Middle,
+            _ => MouseButton::Left,
+        };
+        let kind = match v.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
+            "down" => MouseEventKind::Down(button),
+            "up" => MouseEventKind::Up(button),
+            "drag" => MouseEventKind::Drag(button),
+            "moved" => MouseEventKind::Moved,
+            "scrollup" => MouseEventKind::ScrollUp,
+            "scrolldown" => MouseEventKind::ScrollDown,
+            "scrollleft" => MouseEventKind::ScrollLeft,
+            "scrollright" => MouseEventKind::ScrollRight,
+            _ => return None,
+        };
+        let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+        let mut modifiers = KeyModifiers::empty();
+        if flag("ctrl") {
+            modifiers |= KeyModifiers::CONTROL;
+        }
+        if flag("alt") {
+            modifiers |= KeyModifiers::ALT;
+        }
+        if flag("shift") {
+            modifiers |= KeyModifiers::SHIFT;
+        }
+        Some(Self {
+            kind,
+            col: v.get("col").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+            row: v.get("row").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+            n: v.get("n").and_then(|x| x.as_u64()).unwrap_or(1).clamp(1, 10) as u16,
+            count: v.get("count").and_then(|x| x.as_u64()).unwrap_or(1),
+            modifiers,
+        })
+    }
+}
+
+/// A click in the settings modal: what was hit (`kind`, the names of
+/// `SettingsHit`'s variants and a few more), its indices, whether it was a
+/// double click, and for an entry dialog's button, which one.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SettingsClick<'a> {
+    pub(crate) kind: &'a str,
+    pub(crate) a: usize,
+    pub(crate) b: usize,
+    pub(crate) double: bool,
+    pub(crate) button: &'a str,
+}
+
+impl<'a> SettingsClick<'a> {
+    fn from_json(v: &'a Value) -> Self {
+        Self {
+            kind: v.get("kind").and_then(|k| k.as_str()).unwrap_or(""),
+            a: v.get("a").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            b: v.get("b").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            double: v.get("double").and_then(|x| x.as_bool()).unwrap_or(false),
+            button: v.get("button").and_then(|x| x.as_str()).unwrap_or("cancel"),
+        }
+    }
+}
+
+/// Action arguments from a JSON message's `args` object.
+fn action_args(v: &Value) -> HashMap<String, Value> {
+    v.get("args")
+        .and_then(|a| a.as_object())
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
 fn apply_message(
     editor: &mut Editor,
     kind: &str,
@@ -1374,31 +1486,46 @@ fn apply_message(
     rows: &mut u16,
 ) -> bool {
     match kind {
-        "key" => apply_key(editor, v),
-        "mouse" => apply_mouse(editor, v),
-        "action" => apply_action(editor, v),
-        "paste" => apply_paste(editor, v),
-        "widget" => apply_widget(editor, v),
-        "settings" => apply_settings(editor, v),
-        "kbedit" => apply_kbedit(editor, v),
-        "resize" => apply_resize(editor, v, cols, rows),
+        "key" => apply_key(editor, KeyInput::from_json(v)),
+        "mouse" => {
+            if let Some(input) = MouseInput::from_json(v) {
+                apply_mouse(editor, input);
+            }
+        }
+        "action" => {
+            if let Some(name) = v.get("action").and_then(|a| a.as_str()) {
+                apply_action(editor, name, &action_args(v));
+            }
+        }
+        "paste" => {
+            if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                apply_paste(editor, text);
+            }
+        }
+        "widget" => apply_widget(
+            editor,
+            v.get("surface").and_then(|s| s.as_str()).unwrap_or(""),
+            v.get("key").and_then(|k| k.as_str()),
+        ),
+        "settings" => apply_settings(editor, SettingsClick::from_json(v)),
+        "kbedit" => apply_kbedit(editor, v.get("a").and_then(|x| x.as_u64())),
+        "resize" => apply_resize(
+            editor,
+            v.get("cols").and_then(|x| x.as_u64()),
+            v.get("rows").and_then(|x| x.as_u64()),
+            cols,
+            rows,
+        ),
         _ => return false,
     }
     true
 }
 
 /// Run a named editor action (with optional args) through the real dispatch.
-fn apply_action(editor: &mut Editor, v: &Value) {
-    if let Some(name) = v.get("action").and_then(|a| a.as_str()) {
-        let args: HashMap<String, Value> = v
-            .get("args")
-            .and_then(|a| a.as_object())
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        if let Some(act) = crate::input::keybindings::Action::from_str(name, &args) {
-            if let Err(e) = editor.handle_action(act) {
-                eprintln!("[webui] action error: {e}");
-            }
+fn apply_action(editor: &mut Editor, name: &str, args: &HashMap<String, Value>) {
+    if let Some(act) = crate::input::keybindings::Action::from_str(name, args) {
+        if let Err(e) = editor.handle_action(act) {
+            eprintln!("[webui] action error: {e}");
         }
     }
 }
@@ -1409,11 +1536,9 @@ fn apply_action(editor: &mut Editor, v: &Value) {
 /// path a terminal bracketed paste takes (`Ev::Paste` in app/lifecycle.rs): a
 /// focused floating panel / dock text field first, then the buffer / prompt /
 /// terminal paste in `paste_text`.
-fn apply_paste(editor: &mut Editor, v: &Value) {
-    if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-        if !editor.paste_bracketed_into_focused_panel(text) {
-            editor.paste_text(text.to_string());
-        }
+fn apply_paste(editor: &mut Editor, text: &str) {
+    if !editor.paste_bracketed_into_focused_panel(text) {
+        editor.paste_text(text.to_string());
     }
 }
 
@@ -1430,9 +1555,9 @@ fn apply_paste(editor: &mut Editor, v: &Value) {
 /// wildcard and does nothing, which is what it should do while there is no
 /// panel on the page to have clicked. See
 /// `docs/internal/retained-mode-ui.md` "The web".
-fn apply_widget(editor: &mut Editor, v: &Value) {
-    if let Some("toolbar") = v.get("surface").and_then(|s| s.as_str()) {
-        if let Some(key) = v.get("key").and_then(|k| k.as_str()) {
+fn apply_widget(editor: &mut Editor, surface: &str, key: Option<&str>) {
+    if surface == "toolbar" {
+        if let Some(key) = key {
             editor.toggle_overlay_toolbar_widget(key);
         }
     }
@@ -1443,19 +1568,15 @@ fn apply_widget(editor: &mut Editor, v: &Value) {
 /// (`dispatch_settings_hit`). Entry (add/edit) sub-dialog interactions take a
 /// separate semantic path — the dialog is its own stacked state, not a
 /// main-panel item.
-fn apply_settings(editor: &mut Editor, v: &Value) {
-    let a = v.get("a").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-    let bb = v.get("b").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-    let dbl = v.get("double").and_then(|x| x.as_bool()).unwrap_or(false);
+fn apply_settings(editor: &mut Editor, click: SettingsClick<'_>) {
+    let (a, bb, dbl, kind) = (click.a, click.b, click.double, click.kind);
     use crate::view::settings::SettingsHit as H;
-    let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
     if kind == "entryItem" {
         editor.entry_dialog_select_item(a);
         return;
     }
     if kind == "entryButton" {
-        let btn = v.get("button").and_then(|x| x.as_str()).unwrap_or("cancel");
-        editor.entry_dialog_activate_button(btn);
+        editor.entry_dialog_activate_button(click.button);
         return;
     }
     // The category tree's chevron and section rows: their `SettingsHit`s were
@@ -1506,18 +1627,24 @@ fn apply_settings(editor: &mut Editor, v: &Value) {
 
 /// Native keybinding-editor click: select the display row the frontend
 /// rendered (same as a TUI row click). Other interactions are keyboard.
-fn apply_kbedit(editor: &mut Editor, v: &Value) {
-    if let Some(a) = v.get("a").and_then(|x| x.as_u64()) {
-        editor.kbedit_select_display_row(a as usize);
+fn apply_kbedit(editor: &mut Editor, row: Option<u64>) {
+    if let Some(row) = row {
+        editor.kbedit_select_display_row(row as usize);
     }
 }
 
 /// `{cols, rows}` → the real `Editor::resize`, updating the bridge's size.
-fn apply_resize(editor: &mut Editor, v: &Value, cols: &mut u16, rows: &mut u16) {
-    if let Some(c) = v.get("cols").and_then(|x| x.as_u64()) {
+fn apply_resize(
+    editor: &mut Editor,
+    new_cols: Option<u64>,
+    new_rows: Option<u64>,
+    cols: &mut u16,
+    rows: &mut u16,
+) {
+    if let Some(c) = new_cols {
         *cols = (c as u16).clamp(20, 400);
     }
-    if let Some(r) = v.get("rows").and_then(|x| x.as_u64()) {
+    if let Some(r) = new_rows {
         *rows = (r as u16).clamp(8, 200);
     }
     editor.resize(*cols, *rows);
@@ -2364,14 +2491,13 @@ fn rect_json(r: Rect) -> Value {
 /// bar's leaf bucketed onto the track layout gave it — so the web scrollbar
 /// shows exactly the cells the terminal painted. Theme names are resolved
 /// to hex here: the frontend has no theme-key resolver.
-fn scrollbar_markers_json(editor: &Editor, leaf: crate::model::event::LeafId) -> Value {
+fn scrollbar_markers(editor: &Editor, leaf: crate::model::event::LeafId) -> Vec<ScrollbarMarker> {
     let key = crate::view::shell::splits::vscroll_key(leaf);
     let Some(ui) = editor.shell_ui.as_ref() else {
-        return json!([]);
+        return Vec::new();
     };
     let theme = editor.theme.read().unwrap();
-    let out: Vec<Value> = ui
-        .spec()
+    ui.spec()
         .items
         .iter()
         .filter(|i| i.key.as_ref() == Some(&key))
@@ -2389,15 +2515,14 @@ fn scrollbar_markers_json(editor: &Editor, leaf: crate::model::event::LeafId) ->
                     let ratatui::style::Color::Rgb(r, g, b) = style.fg? else {
                         return None;
                     };
-                    Some(json!({
-                        "row": m.at,
-                        "color": format!("#{r:02x}{g:02x}{b:02x}"),
-                    }))
+                    Some(ScrollbarMarker {
+                        row: m.at,
+                        color: Rgb(r, g, b),
+                    })
                 })
                 .collect()
         })
-        .unwrap_or_default();
-    json!(out)
+        .unwrap_or_default()
 }
 
 fn cells_json(buf: &Buffer, r: Rect) -> Value {
@@ -2622,46 +2747,266 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
     scene_parts(editor, &mut renderer, cols, rows, SceneOptions::default(), &mut SceneTimes::default()).0
 }
 
-/// The scene, and for a grid client its cells (`SceneOptions::grid`), which
-/// the scene's `regions.grid` leaves out: frames send only the rows a client
-/// lacks, and a whole scene puts them all in (`GridFrame::embed`).
-fn scene_parts<'r>(
-    editor: &mut Editor,
-    renderer: &'r mut SceneRenderer,
-    cols: u16,
-    rows: u16,
-    options: SceneOptions,
-    times: &mut SceneTimes,
-) -> (Value, Option<GridFrame<'r>>) {
-    // A front end with its own menu bar has no use for Fresh's menu row, so
-    // the frame starts at row 0. Only while no menu is open: a menu opened from
-    // the keyboard (`menu_activate`) still shows itself, the way a hidden bar
-    // auto-shows in the terminal.
-    if options.native_menus && editor.menu_state().active_menu.is_none() {
-        let window = editor.active_window_mut();
-        window.menu_bar_visible = false;
-        window.menu_bar_auto_shown = false;
+/// The colors a front end draws Fresh's chrome with, from the active theme
+/// (named and indexed colors through the web palette, `color_rgb`).
+pub(crate) struct SceneTheme {
+    pub(crate) name: String,
+    pub(crate) bg: Option<Rgb>,
+    pub(crate) fg: Option<Rgb>,
+    pub(crate) accent: Option<Rgb>,
+    pub(crate) muted: Option<Rgb>,
+    pub(crate) selection_bg: Option<Rgb>,
+    pub(crate) menu_bg: Option<Rgb>,
+    pub(crate) menu_fg: Option<Rgb>,
+    pub(crate) menu_hi: Option<Rgb>,
+    pub(crate) menu_highlight_fg: Option<Rgb>,
+    pub(crate) popup_bg: Option<Rgb>,
+    pub(crate) popup_fg: Option<Rgb>,
+    pub(crate) border: Option<Rgb>,
+    pub(crate) status_bg: Option<Rgb>,
+    pub(crate) status_fg: Option<Rgb>,
+    pub(crate) tab_active_bg: Option<Rgb>,
+}
+
+impl SceneTheme {
+    fn of(editor: &Editor) -> Self {
+        let t = editor.theme.read().unwrap();
+        Self {
+            name: t.name.clone(),
+            bg: color_rgb(t.editor_bg),
+            fg: color_rgb(t.editor_fg),
+            accent: color_rgb(t.cursor),
+            muted: color_rgb(t.line_number_fg),
+            selection_bg: color_rgb(t.selection_bg),
+            menu_bg: color_rgb(t.menu_bg),
+            menu_fg: color_rgb(t.menu_fg),
+            menu_hi: color_rgb(t.menu_highlight_bg),
+            // The ink the theme itself chose for its highlight fill. The
+            // frontend can only guess black or white from the fill; a theme
+            // that names this beats the guess, so send it and let the guess be
+            // the fallback for a theme that leaves it at terminal reset.
+            menu_highlight_fg: color_rgb(t.menu_highlight_fg),
+            popup_bg: color_rgb(t.popup_bg),
+            popup_fg: color_rgb(t.popup_text_fg),
+            border: color_rgb(t.popup_border_fg),
+            status_bg: color_rgb(t.status_bar_bg),
+            status_fg: color_rgb(t.status_bar_fg),
+            tab_active_bg: color_rgb(t.tab_active_bg),
+        }
     }
-    // A grid client draws Fresh's chrome from cells, so its render keeps the
-    // chrome; everyone else gets pane interiors only and draws chrome natively.
-    let started = Instant::now();
-    let (buf, cursor) = if options.grid {
-        renderer.render(editor, cols, rows)
-    } else {
-        with_chrome_suppressed(editor, |e| renderer.render(e, cols, rows))
-    };
-    times.render_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let w = buf.area.width;
-    let h = buf.area.height;
+}
 
-    // Semantic popups (completion / hover / action / list / text) — derived once
-    // in the core (`Editor::popups_view`) and rendered as native UI, not cells.
-    let popups = serde_json::to_value(editor.popups_view()).unwrap_or_else(|_| json!([]));
+/// One pane: where its content and scrollbar are, its tab bar, and the
+/// scrollbar's thumb and plugin marks.
+pub(crate) struct PaneModel {
+    pub(crate) leaf: usize,
+    pub(crate) buffer: Option<usize>,
+    pub(crate) content: Rect,
+    /// The line-number gutter's width, at the content's left; 0 without one.
+    pub(crate) gutter_width: u16,
+    pub(crate) tab_bar: crate::view::scene::TabBarView,
+    pub(crate) vscroll: Rect,
+    pub(crate) thumb_start: usize,
+    pub(crate) thumb_end: usize,
+    pub(crate) markers: Vec<ScrollbarMarker>,
+}
 
-    // Semantic menu model — derived once in the core (`Editor::menu_view`) and
-    // shared with the TUI renderer; the bridge only serializes it. See
-    // crates/fresh-editor/src/view/scene.rs.
-    let menu_view = serde_json::to_value(editor.menu_view()).unwrap_or_else(|_| json!({}));
+/// A plugin's mark on a pane's scrollbar: its row on the track and color.
+pub(crate) struct ScrollbarMarker {
+    pub(crate) row: u16,
+    pub(crate) color: Rgb,
+}
+
+/// A line between panes.
+pub(crate) struct SeparatorModel {
+    pub(crate) vertical: bool,
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) len: u16,
+}
+
+/// Everything one scene carries, gathered once per build for the encoders to
+/// read: the JSON one for browsers (`scene_json_value`) and the protobuf one
+/// for File Commander's socket. The views are the core's (`view::scene`), the
+/// cells the renderer's buffer, borrowed.
+pub(crate) struct SceneModel<'r> {
+    pub(crate) buf: &'r Buffer,
+    pub(crate) cursor: Option<(u16, u16)>,
+    pub(crate) window_id: u64,
+    pub(crate) popups: Vec<crate::view::scene::ScenePopup>,
+    pub(crate) menu: crate::view::scene::MenuView,
+    pub(crate) menubar: Option<Rect>,
+    pub(crate) panes: Vec<PaneModel>,
+    pub(crate) separators: Vec<SeparatorModel>,
+    pub(crate) file_explorer: Option<crate::view::scene::FileExplorerView>,
+    pub(crate) status: Option<crate::view::scene::StatusView>,
+    pub(crate) palette: Option<crate::view::scene::PaletteView>,
+    pub(crate) file_browser: Option<crate::view::scene::FileBrowserView>,
+    pub(crate) trust_dialog: Option<crate::view::scene::TrustDialogView>,
+    pub(crate) context_menu: Option<crate::view::scene::ContextMenuView>,
+    pub(crate) aux_modal: Option<crate::view::scene::AuxModalView>,
+    pub(crate) keybinding_editor: Option<crate::view::scene::KeybindingEditorView>,
+    pub(crate) settings: Option<crate::view::scene::SettingsView>,
+    pub(crate) theme: SceneTheme,
+    pub(crate) tree: crate::view::scene::TreeView,
+    pub(crate) poll_active: bool,
+}
+
+impl<'r> SceneModel<'r> {
+    /// Render the editor and gather the scene, in the order the scene was
+    /// always built in.
+    fn gather(
+        editor: &mut Editor,
+        renderer: &'r mut SceneRenderer,
+        cols: u16,
+        rows: u16,
+        options: SceneOptions,
+        times: &mut SceneTimes,
+    ) -> Self {
+        // A front end with its own menu bar has no use for Fresh's menu row, so
+        // the frame starts at row 0. Only while no menu is open: a menu opened from
+        // the keyboard (`menu_activate`) still shows itself, the way a hidden bar
+        // auto-shows in the terminal.
+        if options.native_menus && editor.menu_state().active_menu.is_none() {
+            let window = editor.active_window_mut();
+            window.menu_bar_visible = false;
+            window.menu_bar_auto_shown = false;
+        }
+        // A grid client draws Fresh's chrome from cells, so its render keeps the
+        // chrome; everyone else gets pane interiors only and draws chrome natively.
+        let started = Instant::now();
+        let (buf, cursor) = if options.grid {
+            renderer.render(editor, cols, rows)
+        } else {
+            with_chrome_suppressed(editor, |e| renderer.render(e, cols, rows))
+        };
+        times.render_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let (w, h) = (buf.area.width, buf.area.height);
+
+        // Semantic popups (completion / hover / action / list / text) — derived once
+        // in the core (`Editor::popups_view`) and rendered as native UI, not cells.
+        let popups = editor.popups_view();
+        // Semantic menu model — derived once in the core (`Editor::menu_view`) and
+        // shared with the TUI renderer. See crates/fresh-editor/src/view/scene.rs.
+        let menu = editor.menu_view();
+
+        // --- per-window geometry, read off the frame's tree ---
+        let content = editor.body_area().unwrap_or(Rect::new(0, 0, w, h));
+        // The menu bar spans the FULL width at row 0 — exactly as the TUI draws it,
+        // *above* any left dock (the dock/file-explorer carve the rows below). Using
+        // `content.x` here would shift the whole menu right when a left dock opens.
+        // Per-menu title x still comes from the tree's label rectangles (so
+        // titles + their dropdowns align); only the container is full-width.
+        let menubar = (content.y > 0).then(|| Rect::new(0, 0, w, content.y));
+
+        // **The rectangles are the tree's here too, and so is the thumb.** The
+        // web is a consumer of the same layout the TUI folds (D.3), so a pane's
+        // content and its scrollbar come from the nodes under `content_key` /
+        // `vscroll_key`, and the thumb from the bar's own facts. A pane the tree
+        // has no rectangle for is dropped, which is what a zero-size entry meant.
+        let panes = editor
+            .window_panes()
+            .iter()
+            .filter_map(|(leaf, target)| {
+                let content = editor.pane_content_rect(*leaf)?;
+                let vscroll = editor
+                    .pane_vscroll_rect(*leaf)
+                    .unwrap_or(Rect::new(0, 0, 0, 0));
+                // The thumb is the bar's own: its facts on the track the tree
+                // gave it, the arithmetic the bar's leaf paints with.
+                let (thumb_start, thumb_end) = editor
+                    .bar_thumb(*leaf, fresh_ui::Axis::Vertical)
+                    .map(|(s, e, _)| (s, e))
+                    .unwrap_or((0, 0));
+                // Tabs are derived once in the core (`Editor::tab_bar_view`).
+                let tab_bar = editor.tab_bar_view(*leaf);
+                // A pane showing a group tab has no buffer and no gutter:
+                // its content is the group's grid, whose panels are panes
+                // of their own in this list.
+                let buffer = target.as_buffer();
+                let gutter_width = buffer
+                    .map_or(0, |b| editor.leaf_gutter_width(*leaf, b))
+                    .min(content.width);
+                Some(PaneModel {
+                    leaf: leaf.0 .0,
+                    buffer: buffer.map(|b| b.0),
+                    content,
+                    gutter_width,
+                    tab_bar,
+                    vscroll,
+                    thumb_start,
+                    thumb_end,
+                    // Plugin scrollbar markers. A front end draws its own
+                    // scrollbar from `vscroll`/`thumb*` rather than reading the
+                    // painted cells, so markers must travel as data too.
+                    markers: scrollbar_markers(editor, *leaf),
+                })
+            })
+            .collect();
+
+        let separators = editor
+            .separator_rects()
+            .iter()
+            .map(|(_id, dir, x, y, len)| SeparatorModel {
+                vertical: matches!(dir, crate::model::event::SplitDirection::Vertical),
+                x: *x,
+                y: *y,
+                len: *len,
+            })
+            .collect();
+
+        // Semantic file explorer, status bar, palette, file browser, dialogs
+        // and modals — each derived once in the core and rendered natively.
+        let file_explorer = editor.file_explorer_view();
+        let status = editor.status_view();
+        let palette = editor.palette_view();
+        let file_browser = editor.file_browser_view();
+        let trust_dialog = editor.trust_dialog_view();
+        let context_menu = editor.context_menu_view();
+        let aux_modal = editor.aux_modals_view();
+        let keybinding_editor = editor.keybinding_editor_view();
+        let settings = editor.settings_view();
+        let theme = SceneTheme::of(editor);
+        // The plugin panels, as the display list the tree produced for them
+        // (`Editor::tree_view`).
+        let tree = editor.tree_view();
+        let poll_active = poll_active(editor);
+        // The active window id lets the frontend tell a WORKSPACE SWITCH (dock
+        // live-switch: everything changes at once) from an in-place layout change
+        // (explorer toggle) — the former gets a hard cut, not layout motion.
+        let window_id = editor.active_window.0;
+        Self {
+            buf,
+            cursor,
+            window_id,
+            popups,
+            menu,
+            menubar,
+            panes,
+            separators,
+            file_explorer,
+            status,
+            palette,
+            file_browser,
+            trust_dialog,
+            context_menu,
+            aux_modal,
+            keybinding_editor,
+            settings,
+            theme,
+            tree,
+            poll_active,
+        }
+    }
+}
+
+/// The scene a browser gets, from the model: the JSON every web front end
+/// reads (see the module docs).
+fn scene_json_value(model: &SceneModel<'_>, options: SceneOptions) -> Value {
+    let buf = model.buf;
+    let (w, h) = (buf.area.width, buf.area.height);
+    let popups = serde_json::to_value(&model.popups).unwrap_or_else(|_| json!([]));
+    let menu_view = serde_json::to_value(&model.menu).unwrap_or_else(|_| json!({}));
     let get = |k: &str| menu_view.get(k).cloned().unwrap_or(Value::Null);
     let menus = get("menus");
     let menu_open = get("menuOpen");
@@ -2669,108 +3014,53 @@ fn scene_parts<'r>(
     let submenu_path = get("submenuPath");
     let dropdown = get("dropdown");
 
-    // --- per-window geometry, read off the frame's tree ---
-    let content = editor.body_area().unwrap_or(Rect::new(0, 0, w, h));
-    // The menu bar spans the FULL width at row 0 — exactly as the TUI draws it,
-    // *above* any left dock (the dock/file-explorer carve the rows below). Using
-    // `content.x` here would shift the whole menu right when a left dock opens.
-    // Per-menu title x still comes from the tree's label rectangles (so
-    // titles + their dropdowns align); only the container is full-width.
-    let menubar_rect = (content.y > 0).then(|| Rect::new(0, 0, w, content.y));
-
-    // **The rectangles are the tree's here too, and so is the thumb.** The
-    // web is a consumer of the same layout the TUI folds (D.3), so a pane's
-    // content and its scrollbar come from the nodes under `content_key` /
-    // `vscroll_key`, and the thumb from the bar's own facts. A pane the tree
-    // has no rectangle for is dropped, which is what a zero-size entry meant.
-    let pane_list = editor.window_panes();
-    let panes: Vec<Value> = pane_list
+    let panes: Vec<Value> = model
+        .panes
         .iter()
-        .filter_map(|(leaf, bufid)| {
-            // Owned, because these are read *out* of the tree rather than
-            // borrowed from the vector being iterated.
-            let content_rect = editor.pane_content_rect(*leaf)?;
-            let scrollbar_rect = editor
-                .pane_vscroll_rect(*leaf)
-                .unwrap_or(Rect::new(0, 0, 0, 0));
-            // The thumb is the bar's own: its facts on the track the tree
-            // gave it, the arithmetic the bar's leaf paints with.
-            let (thumb_s, thumb_e) = editor
-                .bar_thumb(*leaf, fresh_ui::Axis::Vertical)
-                .map(|(s, e, _)| (s, e))
-                .unwrap_or((0, 0));
-            Some((leaf, bufid, content_rect, scrollbar_rect, thumb_s, thumb_e))
-        })
-        .map(
-            |(leaf, bufid, content_rect, scrollbar_rect, thumb_s, thumb_e)| {
-                let (content_rect, scrollbar_rect) = (&content_rect, &scrollbar_rect);
-                // Tabs are derived once in the core (`Editor::tab_bar_view`).
-                let tb = editor.tab_bar_view(*leaf);
-                // Emit the line-number gutter as its own cell block, separate
-                // from the buffer text, sliced at the renderer's real gutter
-                // width — so the frontend keeps the gutter out of the text flow
-                // (future native selection covers only code). `cells` is the
-                // buffer text after the gutter; `gutter` is the line-number
-                // column. When line numbers are off, gutterWidth is 0 and
-                // `cells` is the whole pane.
-                // A pane showing a group tab has no buffer and no gutter:
-                // its content is the group's grid, whose panels are panes
-                // of their own in this list.
-                let bufid = bufid.as_buffer();
-                let gw = bufid
-                    .map_or(0, |b| editor.leaf_gutter_width(*leaf, b))
-                    .min(content_rect.width);
-                let gutter_rect =
-                    Rect::new(content_rect.x, content_rect.y, gw, content_rect.height);
-                let text_rect = Rect::new(
-                    content_rect.x + gw,
-                    content_rect.y,
-                    content_rect.width - gw,
-                    content_rect.height,
-                );
-                json!({
-                    "leaf": leaf.0 .0,
-                    "buffer": bufid.map(|b| b.0),
-                    "content": rect_json(*content_rect),
-                    "gutterWidth": gw,
-                    "gutter": if gw > 0 && !options.grid { cells_json(buf, gutter_rect) } else { Value::Null },
-                    "cells": if options.grid { Value::Null } else { cells_json(buf, text_rect) },
-                    "tabBar": serde_json::to_value(tb.bar).unwrap_or(Value::Null),
-                    "tabs": serde_json::to_value(tb.tabs).unwrap_or_else(|_| json!([])),
-                    "vscroll": rect_json(*scrollbar_rect),
-                    "thumbStart": thumb_s,
-                    "thumbEnd": thumb_e,
-                    // Plugin scrollbar markers. The web frontend draws its own
-                    // scrollbar from `vscroll`/`thumb*` rather than reading the
-                    // painted cells, so markers must travel as data too.
-                    // Colours are resolved here — the frontend has no theme-key
-                    // resolver.
-                    "vscrollMarkers": scrollbar_markers_json(editor, *leaf),
-                })
-            },
-        )
-        .collect();
-
-    let separators: Vec<Value> = editor
-        .separator_rects()
-        .iter()
-        .map(|(_id, dir, x, y, len)| {
+        .map(|pane| {
+            // Emit the line-number gutter as its own cell block, separate
+            // from the buffer text, sliced at the renderer's real gutter
+            // width — so the frontend keeps the gutter out of the text flow
+            // (future native selection covers only code). `cells` is the
+            // buffer text after the gutter; `gutter` is the line-number
+            // column. When line numbers are off, gutterWidth is 0 and
+            // `cells` is the whole pane.
+            let (content, gw) = (pane.content, pane.gutter_width);
+            let gutter_rect = Rect::new(content.x, content.y, gw, content.height);
+            let text_rect = Rect::new(content.x + gw, content.y, content.width - gw, content.height);
+            let markers: Vec<Value> = pane
+                .markers
+                .iter()
+                .map(|m| json!({ "row": m.row, "color": m.color }))
+                .collect();
             json!({
-                "vertical": matches!(dir, crate::model::event::SplitDirection::Vertical),
-                "x": x, "y": y, "len": len,
+                "leaf": pane.leaf,
+                "buffer": pane.buffer,
+                "content": rect_json(content),
+                "gutterWidth": gw,
+                "gutter": if gw > 0 && !options.grid { cells_json(buf, gutter_rect) } else { Value::Null },
+                "cells": if options.grid { Value::Null } else { cells_json(buf, text_rect) },
+                "tabBar": serde_json::to_value(pane.tab_bar.bar).unwrap_or(Value::Null),
+                "tabs": serde_json::to_value(&pane.tab_bar.tabs).unwrap_or_else(|_| json!([])),
+                "vscroll": rect_json(pane.vscroll),
+                "thumbStart": pane.thumb_start,
+                "thumbEnd": pane.thumb_end,
+                // Colours are resolved here — the frontend has no theme-key
+                // resolver.
+                "vscrollMarkers": markers,
             })
         })
         .collect();
 
-    // Semantic file explorer (sidebar tree) — derived once in the core
-    // (`Editor::file_explorer_view`) and rendered as native UI, not cells.
-    let file_explorer = serde_json::to_value(editor.file_explorer_view()).unwrap_or(Value::Null);
+    let separators: Vec<Value> = model
+        .separators
+        .iter()
+        .map(|s| json!({ "vertical": s.vertical, "x": s.x, "y": s.y, "len": s.len }))
+        .collect();
 
-    // Semantic status bar and command palette are derived once in the core
-    // (`Editor::status_view` / `Editor::palette_view`); the bridge only
-    // serializes them. See crates/fresh-editor/src/view/scene.rs.
-    let statusbar = serde_json::to_value(editor.status_view()).unwrap_or(Value::Null);
-    let mut palette = serde_json::to_value(editor.palette_view()).unwrap_or(Value::Null);
+    let file_explorer = serde_json::to_value(&model.file_explorer).unwrap_or(Value::Null);
+    let statusbar = serde_json::to_value(&model.status).unwrap_or(Value::Null);
+    let mut palette = serde_json::to_value(&model.palette).unwrap_or(Value::Null);
     // The overlay preview pane is real rendered buffer cells (a phantom-leaf
     // pipeline render into its content rect), not chrome — so slice them from
     // the buffer just like a pane interior and attach them to the palette. The
@@ -2787,59 +3077,44 @@ fn scene_parts<'r>(
     }
     // Semantic file browser for the OpenFile / SaveFileAs / SwitchProject
     // prompts (`Editor::file_browser_view`), attached to the palette because
-    // it belongs to the active prompt. It used to ship as a slab of cells —
-    // the one chrome surface that did — which is why it looked like a
-    // terminal screenshot pasted into the page.
-    let file_browser = serde_json::to_value(editor.file_browser_view()).unwrap_or(Value::Null);
+    // it belongs to the active prompt.
+    let file_browser = serde_json::to_value(&model.file_browser).unwrap_or(Value::Null);
     if !file_browser.is_null() {
         if let Some(obj) = palette.as_object_mut() {
             obj.insert("browser".to_string(), file_browser);
         }
     }
-    let trust_dialog = serde_json::to_value(editor.trust_dialog_view()).unwrap_or(Value::Null);
-    // Active right-click / new-tab context menu, rendered natively.
-    let context_menu = serde_json::to_value(editor.context_menu_view()).unwrap_or(Value::Null);
-    // Auxiliary modals (keybinding editor / event-debug / theme-info popup).
-    let aux_modal = serde_json::to_value(editor.aux_modals_view()).unwrap_or(Value::Null);
-    // Full keybinding editor modal (header/search/filters, table, edit dialog…).
-    let keybinding_editor =
-        serde_json::to_value(editor.keybinding_editor_view()).unwrap_or(Value::Null);
-    // Full Settings modal (category tree, items, search, entry dialog).
-    let settings = serde_json::to_value(editor.settings_view()).unwrap_or(Value::Null);
+    let trust_dialog = serde_json::to_value(&model.trust_dialog).unwrap_or(Value::Null);
+    let context_menu = serde_json::to_value(&model.context_menu).unwrap_or(Value::Null);
+    let aux_modal = serde_json::to_value(&model.aux_modal).unwrap_or(Value::Null);
+    let keybinding_editor = serde_json::to_value(&model.keybinding_editor).unwrap_or(Value::Null);
+    let settings = serde_json::to_value(&model.settings).unwrap_or(Value::Null);
 
-    // Theme-accurate chrome palette: the active editor `Theme` resolves every
-    // UI color the TUI draws with. The frontend's CSS variables (--bg, --fg,
+    // Theme-accurate chrome palette: the frontend's CSS variables (--bg, --fg,
     // --accent, …) are seeded from these so the native HTML chrome matches the
-    // terminal instead of a fixed dark palette. Color→CSS is the web renderer's
-    // job (the TUI uses `Color` directly), so it lives here in the bridge.
-    let theme = {
-        let t = editor.theme.read().unwrap();
-        json!({
-            "name": t.name,
-            "bg": color_css(t.editor_bg),
-            "fg": color_css(t.editor_fg),
-            "accent": color_css(t.cursor),
-            "muted": color_css(t.line_number_fg),
-            "selectionBg": color_css(t.selection_bg),
-            "menuBg": color_css(t.menu_bg),
-            "menuFg": color_css(t.menu_fg),
-            "menuHi": color_css(t.menu_highlight_bg),
-            // The ink the theme itself chose for its highlight fill. The
-            // frontend can only guess black or white from the fill; a theme
-            // that names this beats the guess, so send it and let the guess be
-            // the fallback for a theme that leaves it at terminal reset.
-            "menuHighlightFg": color_css(t.menu_highlight_fg),
-            "popupBg": color_css(t.popup_bg),
-            "popupFg": color_css(t.popup_text_fg),
-            "border": color_css(t.popup_border_fg),
-            "statusBg": color_css(t.status_bar_bg),
-            "statusFg": color_css(t.status_bar_fg),
-            "tabActiveBg": color_css(t.tab_active_bg),
-        })
-    };
+    // terminal instead of a fixed dark palette.
+    let t = &model.theme;
+    let theme = json!({
+        "name": t.name,
+        "bg": t.bg,
+        "fg": t.fg,
+        "accent": t.accent,
+        "muted": t.muted,
+        "selectionBg": t.selection_bg,
+        "menuBg": t.menu_bg,
+        "menuFg": t.menu_fg,
+        "menuHi": t.menu_hi,
+        "menuHighlightFg": t.menu_highlight_fg,
+        "popupBg": t.popup_bg,
+        "popupFg": t.popup_fg,
+        "border": t.border,
+        "statusBg": t.status_bg,
+        "statusFg": t.status_fg,
+        "tabActiveBg": t.tab_active_bg,
+    });
 
     let regions = json!({
-        "menubar": menubar_rect.map(rect_json),
+        "menubar": model.menubar.map(rect_json),
         "menus": menus,
         "menuOpen": menu_open,
         "menuHighlight": menu_highlight,
@@ -2852,14 +3127,14 @@ fn scene_parts<'r>(
         "popups": popups,
         // The plugin panels, as the display list the tree produced for them
         // (`Editor::tree_view`); the web folds it into DOM.
-        "tree": serde_json::to_value(editor.tree_view()).unwrap_or_else(|_| json!({})),
+        "tree": serde_json::to_value(&model.tree).unwrap_or_else(|_| json!({})),
         "palette": palette,
         "trustDialog": trust_dialog,
         "contextMenu": context_menu,
         "auxModal": aux_modal,
         "keybindingEditor": keybinding_editor,
         "settings": settings,
-        "cursor": cursor.map(|(x, y)| json!({ "x": x, "y": y })),
+        "cursor": model.cursor.map(|(x, y)| json!({ "x": x, "y": y })),
         // The whole frame as cells, for a grid client (`SceneOptions::grid`):
         // filled in from the `GridFrame` when the scene goes out whole.
         "grid": Value::Null,
@@ -2867,16 +3142,26 @@ fn scene_parts<'r>(
         // a timer is pending, the server ticks fast (TICK_ACTIVE), otherwise
         // idles (TICK_IDLE, just to pick up async LSP/file events). Kept in
         // the scene so tests (and any polling client) can observe it.
-        "poll": json!({ "active": poll_active(editor) }),
+        "poll": json!({ "active": model.poll_active }),
     });
+    json!({ "w": w, "h": h, "windowId": model.window_id, "regions": regions, "theme": theme })
+}
 
-    // The active window id lets the frontend tell a WORKSPACE SWITCH (dock
-    // live-switch: everything changes at once) from an in-place layout change
-    // (explorer toggle) — the former gets a hard cut, not layout motion.
-    let window_id = editor.active_window.0;
-    let scene = json!({ "w": w, "h": h, "windowId": window_id, "regions": regions, "theme": theme });
+/// The scene a client gets as JSON, and for a grid client its cells (`SceneOptions::grid`),
+/// which the scene's `regions.grid` leaves out: frames send only the rows a client
+/// lacks, and a whole scene puts them all in (`GridFrame::embed`).
+fn scene_parts<'r>(
+    editor: &mut Editor,
+    renderer: &'r mut SceneRenderer,
+    cols: u16,
+    rows: u16,
+    options: SceneOptions,
+    times: &mut SceneTimes,
+) -> (Value, Option<GridFrame<'r>>) {
+    let model = SceneModel::gather(editor, renderer, cols, rows, options, times);
+    let scene = scene_json_value(&model, options);
     let started = Instant::now();
-    let grid = options.grid.then(|| GridFrame::new(buf));
+    let grid = options.grid.then(|| GridFrame::new(model.buf));
     times.grid_ms = started.elapsed().as_secs_f64() * 1000.0;
     (scene, grid)
 }
@@ -2892,12 +3177,15 @@ fn digit_row_char(code: &str) -> Option<char> {
 }
 
 /// Map a browser key to a crossterm key and run the real input path.
-fn apply_key(editor: &mut Editor, v: &Value) {
-    let key = v.get("key").and_then(|k| k.as_str()).unwrap_or("");
-    let ctrl = v.get("ctrl").and_then(|b| b.as_bool()).unwrap_or(false);
-    let alt = v.get("alt").and_then(|b| b.as_bool()).unwrap_or(false);
-    let meta = v.get("meta").and_then(|b| b.as_bool()).unwrap_or(false);
-    let shift = v.get("shift").and_then(|b| b.as_bool()).unwrap_or(false);
+fn apply_key(editor: &mut Editor, input: KeyInput<'_>) {
+    let KeyInput {
+        key,
+        ctrl,
+        alt,
+        meta,
+        shift,
+        ..
+    } = input;
 
     let mut code = match key {
         "Enter" => KeyCode::Enter,
@@ -2930,10 +3218,7 @@ fn apply_key(editor: &mut Editor, v: &Value) {
     // typing is untouched (no CONTROL), and ALT is excluded so AltGr layouts
     // keep producing their own characters.
     let digit_row = match ctrl && !alt {
-        true => v
-            .get("code")
-            .and_then(|c| c.as_str())
-            .and_then(digit_row_char),
+        true => input.code.and_then(digit_row_char),
         false => None,
     };
     if let Some(d) = digit_row {
@@ -3042,40 +3327,15 @@ fn super_chord_action(
 /// Forward a browser mouse/wheel event to the real `Editor::handle_mouse` at
 /// cell coordinates; the editor does all hit-testing (panes, tabs, scrollbars,
 /// separators), exactly as the terminal/GUI frontends do.
-fn apply_mouse(editor: &mut Editor, v: &Value) {
-    let col = v.get("col").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
-    let row = v.get("row").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
-    let n = v
-        .get("n")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(1)
-        .clamp(1, 10);
-    let button = match v.get("button").and_then(|b| b.as_str()) {
-        Some("right") => MouseButton::Right,
-        Some("middle") => MouseButton::Middle,
-        _ => MouseButton::Left,
-    };
-    let kind = match v.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
-        "down" => MouseEventKind::Down(button),
-        "up" => MouseEventKind::Up(button),
-        "drag" => MouseEventKind::Drag(button),
-        "moved" => MouseEventKind::Moved,
-        "scrollup" => MouseEventKind::ScrollUp,
-        "scrolldown" => MouseEventKind::ScrollDown,
-        "scrollleft" => MouseEventKind::ScrollLeft,
-        "scrollright" => MouseEventKind::ScrollRight,
-        _ => return,
-    };
-    let mut mods = KeyModifiers::empty();
-    if v.get("ctrl").and_then(|b| b.as_bool()).unwrap_or(false) {
-        mods |= KeyModifiers::CONTROL;
-    }
-    if v.get("alt").and_then(|b| b.as_bool()).unwrap_or(false) {
-        mods |= KeyModifiers::ALT;
-    }
-    if v.get("shift").and_then(|b| b.as_bool()).unwrap_or(false) {
-        mods |= KeyModifiers::SHIFT;
-    }
+fn apply_mouse(editor: &mut Editor, input: MouseInput) {
+    let MouseInput {
+        kind,
+        col,
+        row,
+        n,
+        count,
+        modifiers: mods,
+    } = input;
     // Wave-animation dismissal parity with the TUI event loops: ANY mouse
     // activity (move, click, wheel) dismisses the interactive wave and is
     // CONSUMED. One representative event is enough — the whole batch below
@@ -3099,7 +3359,6 @@ fn apply_mouse(editor: &mut Editor, v: &Value) {
     // just-now previous click at this cell and bumps `click_count` to the
     // browser's count (2 = double, ≥3 = triple; the editor's word/line
     // selection then runs through its normal, unmodified path).
-    let count = v.get("count").and_then(|x| x.as_u64()).unwrap_or(1);
     if count >= 2 && matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
         let w = editor.active_window_mut();
         w.previous_click_time = Some(std::time::Instant::now());
@@ -3121,7 +3380,7 @@ fn apply_mouse(editor: &mut Editor, v: &Value) {
 }
 
 /// The 16 ANSI colors (indices 0-15), shared by `color_css` (named-color arm)
-/// and `indexed_css` so the same logical color resolves to one hex no matter
+/// and `indexed_rgb` so the same logical color resolves to one hex no matter
 /// whether it arrives as a named `Color` or a `Color::Indexed`.
 const ANSI16: [(u8, u8, u8); 16] = [
     (0, 0, 0),          // 0 black
@@ -3149,13 +3408,19 @@ fn hex(r: u8, g: u8, b: u8) -> String {
 /// ratatui Color → CSS hex (or None for the terminal default). Named colors map
 /// to their ANSI index in `ANSI16` so they agree with `Color::Indexed`.
 fn color_css(c: Color) -> Option<String> {
+    color_rgb(c).map(|Rgb(r, g, b)| hex(r, g, b))
+}
+
+/// A color as RGB through the web palette (`ANSI16`, the xterm cube and
+/// ramp), `None` for the terminal default.
+fn color_rgb(c: Color) -> Option<Rgb> {
     let ansi = |i: usize| {
         let (r, g, b) = ANSI16[i];
-        hex(r, g, b)
+        Rgb(r, g, b)
     };
     Some(match c {
         Color::Reset => return None,
-        Color::Rgb(r, g, b) => hex(r, g, b),
+        Color::Rgb(r, g, b) => Rgb(r, g, b),
         Color::Black => ansi(0),
         Color::Red => ansi(1),
         Color::Green => ansi(2),
@@ -3172,12 +3437,12 @@ fn color_css(c: Color) -> Option<String> {
         Color::LightMagenta => ansi(13),
         Color::LightCyan => ansi(14),
         Color::White => ansi(15),
-        Color::Indexed(i) => return Some(indexed_css(i)),
+        Color::Indexed(i) => indexed_rgb(i),
     })
 }
 
 /// xterm-256 palette → hex.
-fn indexed_css(i: u8) -> String {
+fn indexed_rgb(i: u8) -> Rgb {
     let (r, g, b) = if i < 16 {
         ANSI16[i as usize]
     } else if i < 232 {
@@ -3192,7 +3457,7 @@ fn indexed_css(i: u8) -> String {
         let v = 8 + (i - 232) * 10;
         (v, v, v)
     };
-    hex(r, g, b)
+    Rgb(r, g, b)
 }
 
 #[cfg(test)]
