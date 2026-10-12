@@ -101,7 +101,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 // The browser sends a chord, never a keyboard layout's shifted codepoint, so
 // the web path builds plain key presses (`Event::key`) with no layout char.
 use fresh_input_parser::Event;
-use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier};
@@ -518,7 +517,8 @@ pub fn scene_value_grid(editor: &mut Editor, cols: u16, rows: u16) -> Value {
         native_menus: true,
         ..SceneOptions::default()
     };
-    let (mut scene, grid) = scene_parts(editor, cols, rows, options, &mut SceneTimes::default());
+    let mut renderer = SceneRenderer::new();
+    let (mut scene, grid) = scene_parts(editor, &mut renderer, cols, rows, options, &mut SceneTimes::default());
     GridFrame::embed(grid.as_ref(), &mut scene);
     scene
 }
@@ -531,7 +531,8 @@ pub fn scene_value_grid(editor: &mut Editor, cols: u16, rows: u16) -> Value {
 pub fn render_tui_cells(editor: &mut Editor, cols: u16, rows: u16) -> String {
     let prev = editor.suppress_chrome_cells;
     editor.suppress_chrome_cells = false;
-    let (buf, _) = render_to_buffer(editor, cols, rows);
+    let mut renderer = SceneRenderer::new();
+    let (buf, _) = renderer.render(editor, cols, rows);
     editor.suppress_chrome_cells = prev;
     let mut out = String::new();
     for y in 0..buf.area.height {
@@ -624,7 +625,8 @@ pub struct WebBridge {
     /// is fit to the smallest viewport so it fits every window (bigger windows
     /// letterbox). Each client keeps its own diff cache.
     ws: Vec<WsSession>,
-    clip: ClipboardSync,
+    /// The clipboard mirror and the renderer, kept between scenes.
+    source: SceneSource,
     /// Files the `/reset` parity route re-opens in the rebuilt editor.
     files: Vec<PathBuf>,
     /// Whether `POST /reset` may replace the editor wholesale. True only for
@@ -656,7 +658,7 @@ impl WebBridge {
             bind_host,
             pending: Vec::new(),
             ws: Vec::new(),
-            clip: ClipboardSync::new(editor),
+            source: SceneSource::new(editor),
             files: files.to_vec(),
             allow_reset,
             last_push_allocs: None,
@@ -691,7 +693,7 @@ impl WebBridge {
             bind_host: "localhost".to_string(),
             pending: Vec::new(),
             ws: Vec::new(),
-            clip: ClipboardSync::new(editor),
+            source: SceneSource::new(editor),
             files: Vec::new(),
             allow_reset: false,
             last_push_allocs: None,
@@ -859,7 +861,7 @@ impl WebBridge {
                         cols,
                         rows,
                         &self.files,
-                        &mut self.clip,
+                        &mut self.source,
                         &self.bind_host,
                         self.allow_reset,
                         self.options,
@@ -923,7 +925,7 @@ impl WebBridge {
         let allocs_before = crate::alloc_stats::counts();
         let started = Instant::now();
         let mut times = SceneTimes::default();
-        let (scene, grid) = build_scene(editor, cols, rows, &mut self.clip, self.options, &mut times);
+        let (scene, grid) = build_scene(editor, &mut self.source, cols, rows, self.options, &mut times);
         let timing = self.options.telemetry.then(|| FrameTiming {
             build_ms: started.elapsed().as_secs_f64() * 1000.0,
             times,
@@ -1203,7 +1205,7 @@ fn serve_request(
     cols: &mut u16,
     rows: &mut u16,
     files: &[PathBuf],
-    clip: &mut ClipboardSync,
+    source: &mut SceneSource,
     bind_host: &str,
     allow_reset: bool,
     options: SceneOptions,
@@ -1223,7 +1225,7 @@ fn serve_request(
             .header("upgrade")
             .is_some_and(|u| u.to_ascii_lowercase().contains("websocket"));
     if wants_ws {
-        return match upgrade_ws(stream, req, editor, *cols, *rows, clip, bind_host, options)? {
+        return match upgrade_ws(stream, req, editor, *cols, *rows, source, bind_host, options)? {
             Some(session) => Ok(Served::WsClient(Box::new(session))),
             None => Ok(Served::Http { mutated: false }),
         };
@@ -1256,7 +1258,7 @@ fn serve_request(
         cols,
         rows,
         files,
-        clip,
+        source,
         allow_reset,
         options,
     )?;
@@ -1276,7 +1278,7 @@ fn handle_http(
     cols: &mut u16,
     rows: &mut u16,
     files: &[PathBuf],
-    clip: &mut ClipboardSync,
+    source: &mut SceneSource,
     allow_reset: bool,
     options: SceneOptions,
 ) -> Result<bool> {
@@ -1296,7 +1298,7 @@ fn handle_http(
             Ok(false)
         }
         ("GET", "/state") => {
-            let s = tick_scene(editor, *cols, *rows, clip, options).to_string();
+            let s = tick_scene(editor, source, *cols, *rows, options).to_string();
             respond(stream, "200 OK", "application/json", s.as_bytes())?;
             Ok(false)
         }
@@ -1311,7 +1313,7 @@ fn handle_http(
             | "/resize"),
         ) => {
             apply_message(editor, &p[1..], &body_json(), cols, rows);
-            let s = tick_scene(editor, *cols, *rows, clip, options).to_string();
+            let s = tick_scene(editor, source, *cols, *rows, options).to_string();
             respond(stream, "200 OK", "application/json", s.as_bytes())?;
             Ok(true)
         }
@@ -1597,7 +1599,7 @@ fn upgrade_ws(
     editor: &mut Editor,
     cols: u16,
     rows: u16,
-    clip: &mut ClipboardSync,
+    source: &mut SceneSource,
     bind_host: &str,
     options: SceneOptions,
 ) -> Result<Option<WsSession>> {
@@ -1630,7 +1632,7 @@ fn upgrade_ws(
     stream.set_nonblocking(true)?;
     let mut session = WsSession::new(stream);
     tick_only(editor);
-    let (scene, grid) = build_scene(editor, cols, rows, clip, options, &mut SceneTimes::default());
+    let (scene, grid) = build_scene(editor, source, cols, rows, options, &mut SceneTimes::default());
     session.send_hello(&scene, grid.as_ref())?;
     Ok(Some(session))
 }
@@ -1943,7 +1945,7 @@ impl WsSession {
     /// per connection; seeds the diff cache and restarts `seq`. `acks` tells
     /// the client it may report each message it applied (`applied`), and then
     /// gets the newest scene rather than every frame when it falls behind.
-    fn send_hello(&mut self, scene: &Value, grid: Option<&GridFrame>) -> std::io::Result<()> {
+    fn send_hello(&mut self, scene: &Value, grid: Option<&GridFrame<'_>>) -> std::io::Result<()> {
         self.seq = 0;
         self.diff(scene, grid, false); // seed the cache; the hello carries the full scene
         let mut msg = json!({ "type": "hello", "seq": 0, "scene": scene, "acks": true });
@@ -1962,7 +1964,7 @@ impl WsSession {
     fn push_diff(
         &mut self,
         scene: &Value,
-        grid: Option<&GridFrame>,
+        grid: Option<&GridFrame<'_>>,
         timing: Option<FrameTiming>,
         row_copies: bool,
     ) -> std::io::Result<()> {
@@ -2015,7 +2017,7 @@ impl WsSession {
     fn diff(
         &mut self,
         scene: &Value,
-        grid: Option<&GridFrame>,
+        grid: Option<&GridFrame<'_>>,
         row_copies: bool,
     ) -> serde_json::Map<String, Value> {
         let mut changed = serde_json::Map::new();
@@ -2210,20 +2212,145 @@ fn respond(stream: &mut Conn, status: &str, ctype: &str, body: &[u8]) -> Result<
     Ok(())
 }
 
-/// Run the real render pipeline into an in-memory cell buffer, returning the
-/// rendered cells and the real hardware-cursor cell the pipeline set (if any).
-fn render_to_buffer(editor: &mut Editor, cols: u16, rows: u16) -> (Buffer, Option<(u16, u16)>) {
-    use ratatui::backend::Backend;
-    let backend = TestBackend::new(cols, rows);
-    let mut terminal = Terminal::new(backend).expect("terminal");
-    terminal.draw(|frame| editor.render(frame)).expect("draw");
-    let buf = terminal.backend().buffer().clone();
-    let cursor = terminal
-        .backend_mut()
-        .get_cursor_position()
-        .ok()
-        .map(|p| (p.x, p.y));
-    (buf, cursor)
+/// Renders the editor for scenes into one terminal kept between frames.
+///
+/// Building a `Terminal` and a `TestBackend` per frame allocated and cleared
+/// three grids of cells and copied a fourth. Here the terminal's buffer is
+/// reset and rendered into, and read in place: nothing is drawn to a backend.
+pub(crate) struct SceneRenderer {
+    terminal: Terminal<SceneBackend>,
+}
+
+impl SceneRenderer {
+    pub(crate) fn new() -> Self {
+        let backend = SceneBackend {
+            size: ratatui::layout::Size::new(1, 1),
+        };
+        match Terminal::new(backend) {
+            Ok(terminal) => Self { terminal },
+            Err(never) => match never {},
+        }
+    }
+
+    /// Run the real render pipeline at `cols` × `rows`: the rendered cells and
+    /// the hardware-cursor cell. The cells are what a terminal shown this frame
+    /// from scratch would hold (`as_drawn_from_scratch`), and a hidden cursor
+    /// reads as the origin, as the per-frame `TestBackend` reported both.
+    fn render(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> (&Buffer, Option<(u16, u16)>) {
+        self.terminal.backend_mut().size = ratatui::layout::Size::new(cols, rows);
+        if let Err(never) = self.terminal.autoresize() {
+            match never {}
+        }
+        self.terminal.current_buffer_mut().reset();
+        editor.render(&mut self.terminal.get_frame());
+        let cursor = editor.rendered_cursor().unwrap_or((0, 0));
+        let buf = self.terminal.current_buffer_mut();
+        as_drawn_from_scratch(buf);
+        (buf, Some(cursor))
+    }
+}
+
+/// Make a rendered buffer what a terminal shown it from scratch would hold,
+/// which is what the scene carried while each frame got a new terminal: the
+/// frame's diff against a blank screen never writes a cell marked `skip`, nor
+/// the cells a wide character covers (except those of an emoji with VS16,
+/// which it clears explicitly), so those stayed blank.
+fn as_drawn_from_scratch(buf: &mut Buffer) {
+    use unicode_width::UnicodeWidthStr;
+    let mut to_skip = 0usize;
+    // Cells before this index were written as the trailing cells of a VS16 emoji.
+    let mut written_until = 0usize;
+    for i in 0..buf.content.len() {
+        let cell = &buf.content[i];
+        let width = cell.symbol().width();
+        let skip = cell.skip;
+        if !skip && to_skip == 0 && width > 1 && cell.symbol().contains('\u{FE0F}') {
+            written_until = i + width;
+        }
+        let written = !skip && (to_skip == 0 || i < written_until);
+        to_skip = width.saturating_sub(1);
+        if !written {
+            buf.content[i] = ratatui::buffer::Cell::EMPTY;
+        }
+    }
+}
+
+/// A backend with a size and nothing else: `SceneRenderer` reads the cells
+/// from the terminal's buffer, so nothing is ever drawn.
+struct SceneBackend {
+    size: ratatui::layout::Size,
+}
+
+impl ratatui::backend::Backend for SceneBackend {
+    type Error = std::convert::Infallible;
+
+    fn draw<'a, I>(&mut self, _content: I) -> std::result::Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn get_cursor_position(&mut self) -> std::result::Result<Position, Self::Error> {
+        Ok(Position::ORIGIN)
+    }
+
+    fn set_cursor_position<P: Into<Position>>(
+        &mut self,
+        _position: P,
+    ) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn clear(&mut self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn clear_region(
+        &mut self,
+        _clear_type: ratatui::backend::ClearType,
+    ) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn size(&self) -> std::result::Result<ratatui::layout::Size, Self::Error> {
+        Ok(self.size)
+    }
+
+    fn window_size(&mut self) -> std::result::Result<ratatui::backend::WindowSize, Self::Error> {
+        Ok(ratatui::backend::WindowSize {
+            columns_rows: self.size,
+            pixels: ratatui::layout::Size::default(),
+        })
+    }
+
+    fn flush(&mut self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// What building a scene keeps between frames: the clipboard mirror's state
+/// and the renderer.
+pub(crate) struct SceneSource {
+    clip: ClipboardSync,
+    renderer: SceneRenderer,
+}
+
+impl SceneSource {
+    fn new(editor: &Editor) -> Self {
+        Self {
+            clip: ClipboardSync::new(editor),
+            renderer: SceneRenderer::new(),
+        }
+    }
 }
 
 fn rect_json(r: Rect) -> Value {
@@ -2284,13 +2411,13 @@ fn cells_json(buf: &Buffer, r: Rect) -> Value {
 /// `cells_json` makes them, except that a run leaves out what is off — `b`,
 /// `i`, `u`, `r` when false, `fg` and `bg` when the terminal default — which
 /// halves a typical row.
-struct GridFrame {
-    buf: Buffer,
+struct GridFrame<'a> {
+    buf: &'a Buffer,
     hashes: Vec<u64>,
 }
 
-impl GridFrame {
-    fn new(buf: Buffer) -> Self {
+impl<'a> GridFrame<'a> {
+    fn new(buf: &'a Buffer) -> Self {
         use std::hash::{Hash, Hasher};
         /// A row's cells as bytes, hashed in one pass: hashing each cell's
         /// fields one by one costs a millisecond for a large grid.
@@ -2328,7 +2455,7 @@ impl GridFrame {
     fn row(&self, i: usize) -> Value {
         let area = self.buf.area;
         let rect = Rect::new(area.x, area.y + i as u16, area.width, 1);
-        match runs_json(&self.buf, rect, true) {
+        match runs_json(self.buf, rect, true) {
             Value::Array(mut rows) if !rows.is_empty() => rows.swap_remove(0),
             _ => json!([]),
         }
@@ -2336,11 +2463,11 @@ impl GridFrame {
 
     /// Every row's runs, for a scene sent whole.
     fn rows(&self) -> Value {
-        runs_json(&self.buf, self.buf.area, true)
+        runs_json(self.buf, self.buf.area, true)
     }
 
     /// Put every row into `scene` as `regions.grid`.
-    fn embed(grid: Option<&GridFrame>, scene: &mut Value) {
+    fn embed(grid: Option<&GridFrame<'_>>, scene: &mut Value) {
         if let (Some(grid), Some(regions)) = (grid, scene.get_mut("regions")) {
             regions["grid"] = grid.rows();
         }
@@ -2445,16 +2572,16 @@ fn poll_active(editor: &Editor) -> bool {
 /// clipboard `seq` bumps on actual text changes (hash compare), so it cannot
 /// double-increment no matter which path — `GET /state` or WS push — builds
 /// the scene.
-fn build_scene(
+fn build_scene<'s>(
     editor: &mut Editor,
+    source: &'s mut SceneSource,
     cols: u16,
     rows: u16,
-    clip: &mut ClipboardSync,
     options: SceneOptions,
     times: &mut SceneTimes,
-) -> (Value, Option<GridFrame>) {
-    let (mut scene, grid) = scene_parts(editor, cols, rows, options, times);
-    clip.attach(editor, &mut scene);
+) -> (Value, Option<GridFrame<'s>>) {
+    let (mut scene, grid) = scene_parts(editor, &mut source.renderer, cols, rows, options, times);
+    source.clip.attach(editor, &mut scene);
     (scene, grid)
 }
 
@@ -2463,13 +2590,13 @@ fn build_scene(
 /// doesn't pay for a render and a grid goes out row by row.
 fn tick_scene(
     editor: &mut Editor,
+    source: &mut SceneSource,
     cols: u16,
     rows: u16,
-    clip: &mut ClipboardSync,
     options: SceneOptions,
 ) -> Value {
     tick_only(editor);
-    let (mut scene, grid) = build_scene(editor, cols, rows, clip, options, &mut SceneTimes::default());
+    let (mut scene, grid) = build_scene(editor, source, cols, rows, options, &mut SceneTimes::default());
     GridFrame::embed(grid.as_ref(), &mut scene);
     scene
 }
@@ -2491,19 +2618,21 @@ fn with_chrome_suppressed<T>(editor: &mut Editor, f: impl FnOnce(&mut Editor) ->
 }
 
 fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
-    scene_parts(editor, cols, rows, SceneOptions::default(), &mut SceneTimes::default()).0
+    let mut renderer = SceneRenderer::new();
+    scene_parts(editor, &mut renderer, cols, rows, SceneOptions::default(), &mut SceneTimes::default()).0
 }
 
 /// The scene, and for a grid client its cells (`SceneOptions::grid`), which
 /// the scene's `regions.grid` leaves out: frames send only the rows a client
 /// lacks, and a whole scene puts them all in (`GridFrame::embed`).
-fn scene_parts(
+fn scene_parts<'r>(
     editor: &mut Editor,
+    renderer: &'r mut SceneRenderer,
     cols: u16,
     rows: u16,
     options: SceneOptions,
     times: &mut SceneTimes,
-) -> (Value, Option<GridFrame>) {
+) -> (Value, Option<GridFrame<'r>>) {
     // A front end with its own menu bar has no use for Fresh's menu row, so
     // the frame starts at row 0. Only while no menu is open: a menu opened from
     // the keyboard (`menu_activate`) still shows itself, the way a hidden bar
@@ -2517,9 +2646,9 @@ fn scene_parts(
     // chrome; everyone else gets pane interiors only and draws chrome natively.
     let started = Instant::now();
     let (buf, cursor) = if options.grid {
-        render_to_buffer(editor, cols, rows)
+        renderer.render(editor, cols, rows)
     } else {
-        with_chrome_suppressed(editor, |e| render_to_buffer(e, cols, rows))
+        with_chrome_suppressed(editor, |e| renderer.render(e, cols, rows))
     };
     times.render_ms = started.elapsed().as_secs_f64() * 1000.0;
     let w = buf.area.width;
@@ -2604,8 +2733,8 @@ fn scene_parts(
                     "buffer": bufid.map(|b| b.0),
                     "content": rect_json(*content_rect),
                     "gutterWidth": gw,
-                    "gutter": if gw > 0 && !options.grid { cells_json(&buf, gutter_rect) } else { Value::Null },
-                    "cells": if options.grid { Value::Null } else { cells_json(&buf, text_rect) },
+                    "gutter": if gw > 0 && !options.grid { cells_json(buf, gutter_rect) } else { Value::Null },
+                    "cells": if options.grid { Value::Null } else { cells_json(buf, text_rect) },
                     "tabBar": serde_json::to_value(tb.bar).unwrap_or(Value::Null),
                     "tabs": serde_json::to_value(tb.tabs).unwrap_or_else(|_| json!([])),
                     "vscroll": rect_json(*scrollbar_rect),
@@ -2650,7 +2779,7 @@ fn scene_parts(
         let u = |k: &str| pv.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as u16;
         let pr = Rect::new(u("x"), u("y"), u("w"), u("h"));
         if pr.width > 0 && pr.height > 0 {
-            let cells = cells_json(&buf, pr);
+            let cells = cells_json(buf, pr);
             if let Some(obj) = palette.as_object_mut() {
                 obj.insert("previewCells".to_string(), cells);
             }
@@ -3149,6 +3278,32 @@ mod tests {
     }
 
     #[test]
+    fn rendered_cells_read_as_a_terminal_drawn_from_scratch_holds_them() {
+        use ratatui::backend::{Backend, TestBackend};
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::style::{Color, Style};
+        let area = Rect::new(0, 0, 12, 3);
+        let mut buf = Buffer::empty(area);
+        // Wide characters under a line highlight, which also styles the
+        // cells they cover; an emoji with VS16; a cell marked skip.
+        buf.set_string(0, 0, "a日本b", Style::default());
+        buf.set_style(Rect::new(0, 0, 12, 1), Style::default().bg(Color::Blue));
+        buf.set_string(0, 1, "x\u{1F44D}\u{FE0F}y", Style::default());
+        buf.set_style(Rect::new(0, 1, 12, 1), Style::default().bg(Color::Red));
+        buf[(5, 2)].set_symbol("Z").set_skip(true);
+        let mut terminal = TestBackend::new(12, 3);
+        let updates = Buffer::empty(area).diff(&buf);
+        match terminal.draw(updates.into_iter()) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+        let mut ours = buf.clone();
+        super::as_drawn_from_scratch(&mut ours);
+        assert_eq!(&ours, terminal.buffer());
+    }
+
+    #[test]
     fn rows_that_moved_are_named_by_where_they_were() {
         use super::grid_copies;
         // Lines 1..6 scrolled by two: four rows moved up, two came into view.
@@ -3167,16 +3322,20 @@ mod tests {
     fn a_scrolled_grid_sends_only_the_rows_that_came_into_view() {
         use super::GridFrame;
         use ratatui::buffer::Buffer;
-        let grid = |rows: [&str; 4]| GridFrame::new(Buffer::with_lines(rows));
+        let (first, scrolled, again) = (
+            Buffer::with_lines(["a", "b", "c", "d"]),
+            Buffer::with_lines(["c", "d", "e", "f"]),
+            Buffer::with_lines(["e", "f", "g", "h"]),
+        );
         let (mut session, _client) = session();
-        session.send_hello(&scene(0), Some(&grid(["a", "b", "c", "d"]))).unwrap();
-        let changed = session.diff(&scene(0), Some(&grid(["c", "d", "e", "f"])), true);
+        session.send_hello(&scene(0), Some(&GridFrame::new(&first))).unwrap();
+        let changed = session.diff(&scene(0), Some(&GridFrame::new(&scrolled)), true);
         assert_eq!(changed["regions.grid.copy"], json!([[0, 2, 2]]));
         assert_eq!(changed["regions.grid.2"], json!([{ "t": "e" }]));
         assert_eq!(changed["regions.grid.3"], json!([{ "t": "f" }]));
         assert!(!changed.contains_key("regions.grid.0"));
         // A client that didn't ask for copies gets every changed row.
-        let changed = session.diff(&scene(0), Some(&grid(["e", "f", "g", "h"])), false);
+        let changed = session.diff(&scene(0), Some(&GridFrame::new(&again)), false);
         assert!(changed.contains_key("regions.grid.0"));
         assert!(!changed.contains_key("regions.grid.copy"));
     }

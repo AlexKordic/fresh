@@ -235,6 +235,17 @@ impl Editor {
     }
 
     /// Render the editor to the terminal
+    /// The caret of the last render: the cell `render` gave the frame as its
+    /// cursor, or `None` when it hid it. For a renderer that reads the frame's
+    /// cells straight from its buffer (the web bridge) rather than drawing them.
+    pub fn rendered_cursor(&self) -> Option<(u16, u16)> {
+        self.shell_ui
+            .as_ref()
+            .and_then(|ui| ui.spec().cursor)
+            .filter(|c| c.visible)
+            .map(|c| (c.pos.x.max(0) as u16, c.pos.y.max(0) as u16))
+    }
+
     pub fn render(&mut self, frame: &mut Frame) {
         let _span = tracing::info_span!("render").entered();
         let size = frame.area();
@@ -1190,13 +1201,8 @@ impl Editor {
         // wins, and a layer painted over a cursor ends it. Nothing here asks
         // whether something covered the cell; that was answered when the
         // list was painted.
-        if let Some(c) = self
-            .shell_ui
-            .as_ref()
-            .and_then(|ui| ui.spec().cursor)
-            .filter(|c| c.visible)
-        {
-            frame.set_cursor_position((c.pos.x.max(0) as u16, c.pos.y.max(0) as u16));
+        if let Some(position) = self.rendered_cursor() {
+            frame.set_cursor_position(position);
         }
 
         // Frame-buffer animations run after the main draw so they mutate the
