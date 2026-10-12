@@ -3691,7 +3691,11 @@ mod tests {
         let config = crate::config::Config::default();
         let mut resolver = KeybindingResolver::new(&config);
         let built = resolver.generation();
-        assert_ne!(KeybindingResolver::new(&config).generation(), built, "each resolver has its own");
+        assert_ne!(
+            KeybindingResolver::new(&config).generation(),
+            built,
+            "each resolver has its own"
+        );
         resolver.set_mode_inherits_normal_bindings("some-mode", true);
         assert_ne!(resolver.generation(), built);
     }
