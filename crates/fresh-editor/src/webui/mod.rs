@@ -281,6 +281,32 @@ struct FrameTiming {
     times: SceneTimes,
     owed: u32,
     top: usize,
+    /// The process's CPU time so far (user and system).
+    cpu_ms: f64,
+    /// Allocations and bytes of the previous push, from building its scene to
+    /// queueing its frames (`alloc-stats` builds only). The previous push,
+    /// because this frame's own encoding allocates after its timing is set.
+    prev_allocs: Option<(u64, u64)>,
+}
+
+/// The process's CPU time so far, user and system, in milliseconds.
+fn process_cpu_ms() -> f64 {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage fills the struct it is given.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return 0.0;
+        }
+        // SAFETY: zeroed, then filled by a successful getrusage.
+        let usage = unsafe { usage.assume_init() };
+        let ms = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+        ms(usage.ru_utime) + ms(usage.ru_stime)
+    }
+    #[cfg(not(unix))]
+    {
+        0.0
+    }
 }
 
 /// Where part of building a scene went, for telemetry: rendering the editor
@@ -594,6 +620,8 @@ pub struct WebBridge {
     /// workspace, attached terminals — that a silent replacement would drop on
     /// the floor, so the route is refused there instead.
     allow_reset: bool,
+    /// Allocations of the last push, for the next frame's telemetry.
+    last_push_allocs: Option<(u64, u64)>,
 }
 
 impl WebBridge {
@@ -618,6 +646,7 @@ impl WebBridge {
             clip: ClipboardSync::new(editor),
             files: files.to_vec(),
             allow_reset,
+            last_push_allocs: None,
         })
     }
 
@@ -652,6 +681,7 @@ impl WebBridge {
             clip: ClipboardSync::new(editor),
             files: Vec::new(),
             allow_reset: false,
+            last_push_allocs: None,
         })
     }
 
@@ -877,6 +907,7 @@ impl WebBridge {
             }
             return true;
         }
+        let allocs_before = crate::alloc_stats::counts();
         let started = Instant::now();
         let mut times = SceneTimes::default();
         let (scene, grid) = build_scene(editor, cols, rows, &mut self.clip, self.options, &mut times);
@@ -885,6 +916,8 @@ impl WebBridge {
             times,
             owed: editor.pending_wheel_lines(),
             top: editor.active_top_line(),
+            cpu_ms: process_cpu_ms(),
+            prev_allocs: self.last_push_allocs,
         });
         let mut i = 0;
         while i < self.ws.len() {
@@ -895,6 +928,7 @@ impl WebBridge {
                 i += 1;
             }
         }
+        self.last_push_allocs = crate::alloc_stats::since(allocs_before);
         self.ws.iter().any(|session| session.held)
     }
 
@@ -1948,7 +1982,12 @@ impl WsSession {
                 "diff_ms": started.elapsed().as_secs_f64() * 1000.0,
                 "owed": timing.owed,
                 "top": timing.top,
+                "cpu_ms": timing.cpu_ms,
             });
+            if let Some((allocs, bytes)) = timing.prev_allocs {
+                msg["t"]["prev_allocs"] = json!(allocs);
+                msg["t"]["prev_alloc_bytes"] = json!(bytes);
+            }
         }
         let msg = msg.to_string();
         self.enqueue(0x1, msg.as_bytes());

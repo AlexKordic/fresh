@@ -50,6 +50,9 @@ pub mod server;
 #[cfg(feature = "web")]
 pub mod webui;
 
+// Heap allocation counts for the scene telemetry (`alloc-stats` feature).
+pub mod alloc_stats;
+
 // View module - available for runtime, WASM, and dev-bins (schema generation)
 // Most submodules are runtime-only, but theme types are always available
 #[cfg(any(feature = "runtime", feature = "wasm", feature = "dev-bins"))]
