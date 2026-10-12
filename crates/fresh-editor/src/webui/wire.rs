@@ -213,25 +213,6 @@ impl<T: Uint + ?Sized> Uint for &T {
     }
 }
 
-/// A signed integer field's value (`sint32`, zigzag-encoded).
-pub(crate) trait Sint {
-    fn sint(&self) -> i64;
-}
-
-impl Sint for i32 {
-    #[inline]
-    fn sint(&self) -> i64 {
-        i64::from(*self)
-    }
-}
-
-impl<T: Sint + ?Sized> Sint for &T {
-    #[inline]
-    fn sint(&self) -> i64 {
-        (**self).sint()
-    }
-}
-
 /// A `double` field's value.
 pub(crate) trait Double {
     fn double(&self) -> f64;
@@ -321,21 +302,6 @@ pub(crate) mod field {
             put_key(buf, tag, VARINT);
             put_varint(buf, v);
         }
-    }
-
-    #[inline]
-    fn zigzag(v: i64) -> u64 {
-        ((v << 1) ^ (v >> 63)) as u64
-    }
-
-    #[inline]
-    pub(crate) fn sint_len(tag: u32, v: i64) -> usize {
-        uint_len(tag, zigzag(v))
-    }
-
-    #[inline]
-    pub(crate) fn sint(buf: &mut Vec<u8>, tag: u32, v: i64) {
-        uint(buf, tag, zigzag(v))
     }
 
     #[inline]
@@ -547,7 +513,7 @@ pub(crate) mod field {
 /// type, in `.proto` terms. Generates the struct's [`Message`] encoder and the
 /// message's `.proto` text, collected in the `SCHEMA` constant this defines.
 ///
-/// Field types: `uint32`, `uint64`, `bool`, `sint32`, `double`, `string`; the
+/// Field types: `uint32`, `uint64`, `bool`, `double`, `string`; the
 /// same after `optional` for a Rust `Option`; `repeated` before a number type
 /// (packed), `string` or a message for a `Vec`; a message name for a
 /// struct field, or after `maybe` for an `Option` of one (written as the
@@ -558,7 +524,6 @@ macro_rules! proto {
     (@len $t:literal, $v:expr, uint32) => { field::uint_len($t, Uint::uint(&$v)) };
     (@len $t:literal, $v:expr, uint64) => { field::uint_len($t, Uint::uint(&$v)) };
     (@len $t:literal, $v:expr, bool) => { field::uint_len($t, Uint::uint(&$v)) };
-    (@len $t:literal, $v:expr, sint32) => { field::sint_len($t, Sint::sint(&$v)) };
     (@len $t:literal, $v:expr, double) => { field::double_len($t, Double::double(&$v)) };
     (@len $t:literal, $v:expr, string) => { field::text_len($t, Text::text(&$v)) };
     (@len $t:literal, $v:expr, json) => { field::json_len($t, &$v) };
@@ -575,7 +540,6 @@ macro_rules! proto {
     (@put $b:ident, $t:literal, $v:expr, uint32) => { field::uint($b, $t, Uint::uint(&$v)) };
     (@put $b:ident, $t:literal, $v:expr, uint64) => { field::uint($b, $t, Uint::uint(&$v)) };
     (@put $b:ident, $t:literal, $v:expr, bool) => { field::uint($b, $t, Uint::uint(&$v)) };
-    (@put $b:ident, $t:literal, $v:expr, sint32) => { field::sint($b, $t, Sint::sint(&$v)) };
     (@put $b:ident, $t:literal, $v:expr, double) => { field::double($b, $t, Double::double(&$v)) };
     (@put $b:ident, $t:literal, $v:expr, string) => { field::text($b, $t, Text::text(&$v)) };
     (@put $b:ident, $t:literal, $v:expr, json) => { field::json($b, $t, &$v) };

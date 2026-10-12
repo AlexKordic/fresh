@@ -134,12 +134,14 @@ pub struct EditorServer {
     /// Keepalive paired with the startup authority, held for the server's lifetime.
     #[allow(dead_code)]
     session_keepalive: Option<Box<dyn std::any::Any + Send>>,
-    /// The hosted web bridge (`config.web_addr`), bound in `run` once the
-    /// editor exists. Browsers reach the SAME editor the IPC clients do: the
-    /// bridge is polled in the loop below, its viewport joins the shared-grid
-    /// fit, and it gets the scene pushed alongside the terminal broadcast.
+    /// The hosted bridge, bound once the editor exists: the web bridge for
+    /// browsers (`config.web_addr`), or an FC session's scene socket for the
+    /// native editor (`config.scene_socket`). Either reaches the SAME editor
+    /// the IPC clients do: it is polled in the loop below, its viewport joins
+    /// the shared-grid fit, and it gets the scene pushed alongside the
+    /// terminal broadcast.
     #[cfg(feature = "web")]
-    web: Option<crate::webui::WebBridge>,
+    web: Option<crate::webui::HostedBridge>,
 }
 
 /// Buffered writer for sending data to a client without blocking the server loop.
@@ -814,7 +816,7 @@ impl EditorServer {
         let bridge = crate::webui::WebBridge::bind(&addr, editor, &[], false)
             .map_err(|e| io::Error::other(format!("failed to serve the web UI on {addr}: {e}")))?;
         tracing::info!("Web UI bridge listening on {}", addr);
-        self.web = Some(bridge);
+        self.web = Some(crate::webui::HostedBridge::Web(bridge));
         Ok(())
     }
 
@@ -831,10 +833,10 @@ impl EditorServer {
             return;
         };
         #[cfg(unix)]
-        match crate::webui::WebBridge::bind_unix(&path, editor) {
+        match crate::webui::SceneBridge::bind(&path, editor) {
             Ok(bridge) => {
                 tracing::info!("Scene bridge listening on {}", path.display());
-                self.web = Some(bridge);
+                self.web = Some(crate::webui::HostedBridge::Scene(bridge));
             }
             Err(e) => tracing::warn!("failed to serve the scene on {}: {e}", path.display()),
         }

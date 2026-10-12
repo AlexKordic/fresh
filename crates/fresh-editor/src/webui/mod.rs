@@ -111,6 +111,10 @@ use crate::app::Editor;
 use crate::view::scene::Rgb;
 
 mod wire;
+#[cfg(unix)]
+mod scene_bridge;
+#[cfg(unix)]
+pub use scene_bridge::SceneBridge;
 use crate::config;
 use crate::config_io::DirectoryContext;
 use crate::model::filesystem::{FileSystem, StdFileSystem};
@@ -130,128 +134,10 @@ pub const DEFAULT_SIZE: (u16, u16) = (140, 44);
 /// therefore requires a rebuild.
 const INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/webui-index.html"));
 
-/// One connection the bridge serves: a TCP socket (browsers, `fresh --web`) or
-/// a Unix socket (File Commander's native front end, which never opens a TCP
-/// port). Everything above the socket — HTTP assembly, the WebSocket upgrade,
-/// framing, the diff protocol — is shared, so the two transports can't drift.
-enum Conn {
-    Tcp(TcpStream),
-    #[cfg(unix)]
-    Unix(std::os::unix::net::UnixStream),
-}
-
-impl Conn {
-    fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
-        match self {
-            Conn::Tcp(s) => s.set_nonblocking(on),
-            #[cfg(unix)]
-            Conn::Unix(s) => s.set_nonblocking(on),
-        }
-    }
-
-    /// Ready the socket for frames: Nagle off for TCP. A Unix socket gets big
-    /// buffers instead — macOS gives one 8 KiB each way, a fraction of a single
-    /// grid frame, so every frame would trickle out over many loop passes and
-    /// the frames behind it would queue up in `outbuf`. The kernel caps the size
-    /// at its own limit (`net.core.wmem_max` on Linux) or refuses a size past
-    /// it (`kern.ipc.maxsockbuf` on macOS); either way the socket still works,
-    /// only slower, so buffers are best effort.
-    fn tune(&self) -> std::io::Result<()> {
-        match self {
-            Conn::Tcp(s) => s.set_nodelay(true),
-            #[cfg(unix)]
-            Conn::Unix(s) => {
-                use std::os::unix::io::AsRawFd;
-                const SOCKET_BUFFER: libc::c_int = 4 << 20; // 4 MiB
-                for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-                    // SAFETY: a live descriptor, and an option value of the size passed.
-                    let result = unsafe {
-                        libc::setsockopt(
-                            s.as_raw_fd(),
-                            libc::SOL_SOCKET,
-                            option,
-                            (&SOCKET_BUFFER as *const libc::c_int).cast(),
-                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                        )
-                    };
-                    if result != 0 {
-                        eprintln!(
-                            "[webui] scene socket buffer not raised: {}",
-                            std::io::Error::last_os_error()
-                        );
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        match self {
-            Conn::Tcp(s) => s.set_write_timeout(timeout),
-            #[cfg(unix)]
-            Conn::Unix(s) => s.set_write_timeout(timeout),
-        }
-    }
-}
-
-impl Read for Conn {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Conn::Tcp(s) => s.read(buf),
-            #[cfg(unix)]
-            Conn::Unix(s) => s.read(buf),
-        }
-    }
-}
-
-impl Write for Conn {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Conn::Tcp(s) => s.write(buf),
-            #[cfg(unix)]
-            Conn::Unix(s) => s.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Conn::Tcp(s) => s.flush(),
-            #[cfg(unix)]
-            Conn::Unix(s) => s.flush(),
-        }
-    }
-}
-
-/// Where the bridge accepts connections. A Unix listener owns its socket file
-/// and removes it when the bridge goes away.
-enum BridgeListener {
-    Tcp(TcpListener),
-    #[cfg(unix)]
-    Unix {
-        listener: std::os::unix::net::UnixListener,
-        path: PathBuf,
-    },
-}
-
-impl BridgeListener {
-    fn accept(&self) -> std::io::Result<Conn> {
-        match self {
-            BridgeListener::Tcp(l) => l.accept().map(|(s, _)| Conn::Tcp(s)),
-            #[cfg(unix)]
-            BridgeListener::Unix { listener, .. } => listener.accept().map(|(s, _)| Conn::Unix(s)),
-        }
-    }
-}
-
-impl Drop for BridgeListener {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let BridgeListener::Unix { path, .. } = self {
-            drop(std::fs::remove_file(path));
-        }
-    }
-}
+/// One connection the bridge serves: a browser's TCP socket (`fresh --web`,
+/// the parity harnesses). File Commander's native editor has a socket and a
+/// protocol of its own (`SceneBridge`).
+type Conn = TcpStream;
 
 /// What the connected front end asked the scene to carry — set by a
 /// `configure` message, or by the `/ws` upgrade's query (`?grid=1&menus=native`)
@@ -680,7 +566,7 @@ pub struct BridgePoll {
 /// reports the size its browsers want ([`wanted_size`](Self::wanted_size)),
 /// which the daemon mins against its attached terminals.
 pub struct WebBridge {
-    listener: BridgeListener,
+    listener: TcpListener,
     /// What the connected front end asked the scene to carry.
     options: SceneOptions,
     /// Host part of the bind address — only the fallback for the WS-upgrade
@@ -724,7 +610,7 @@ impl WebBridge {
             .unwrap_or(addr)
             .to_string();
         Ok(Self {
-            listener: BridgeListener::Tcp(listener),
+            listener,
             options: SceneOptions::default(),
             bind_host,
             pending: Vec::new(),
@@ -732,41 +618,6 @@ impl WebBridge {
             source: SceneSource::new(editor),
             files: files.to_vec(),
             allow_reset,
-            last_push_allocs: None,
-        })
-    }
-
-    /// Bind the bridge on a Unix socket at `path` instead of a TCP port. This
-    /// is how a File Commander session serves its native front end: the socket
-    /// lives in the session's owner-only socket directory and is itself mode
-    /// 0600, so only the user's own processes can reach the editor — there is
-    /// no port for anything else on the machine to find.
-    ///
-    /// Only the daemon binds this path, while holding the session's startup
-    /// lock, so a file already there is a socket left behind by a previous run.
-    #[cfg(unix)]
-    pub fn bind_unix(path: &Path, editor: &Editor) -> Result<Self> {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        let listener = std::os::unix::net::UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        Ok(Self {
-            listener: BridgeListener::Unix {
-                listener,
-                path: path.to_path_buf(),
-            },
-            options: SceneOptions::default(),
-            bind_host: "localhost".to_string(),
-            pending: Vec::new(),
-            ws: Vec::new(),
-            source: SceneSource::new(editor),
-            files: Vec::new(),
-            allow_reset: false,
             last_push_allocs: None,
         })
     }
@@ -779,15 +630,6 @@ impl WebBridge {
             editor.active_window_mut().menu_bar_visible = show;
         }
         self.options = options;
-    }
-
-    /// The Unix socket this bridge listens on, when it listens on one.
-    pub fn socket_path(&self) -> Option<&Path> {
-        match &self.listener {
-            BridgeListener::Tcp(_) => None,
-            #[cfg(unix)]
-            BridgeListener::Unix { path, .. } => Some(path),
-        }
     }
 
     /// True while a browser is connected or a request is mid-assembly. The
@@ -882,13 +724,13 @@ impl WebBridge {
 
         // 2) Accept new connections into the pending pool (nonblocking).
         loop {
-            match self.listener.accept() {
+            match self.listener.accept().map(|(stream, _)| stream) {
                 Ok(stream) => {
                     // The pump relies on nonblocking reads; a socket we can't
                     // configure is dropped rather than risked stalling the
                     // editor loop. `tune` is folded in — it never fails on a
                     // live socket, and a dead one belongs on the floor anyway.
-                    if stream.set_nonblocking(true).is_err() || stream.tune().is_err() {
+                    if stream.set_nonblocking(true).is_err() || stream.set_nodelay(true).is_err() {
                         continue;
                     }
                     self.pending.push(PendingConn {
@@ -1039,6 +881,65 @@ impl WebBridge {
             }
         }
         self.ws.len() != before
+    }
+}
+
+/// The bridge a session hosts: browsers over TCP (`fresh --web`), or File
+/// Commander's native editor over the session's Unix socket.
+pub enum HostedBridge {
+    Web(WebBridge),
+    #[cfg(unix)]
+    Scene(SceneBridge),
+}
+
+impl HostedBridge {
+    /// The Unix socket File Commander's app connects to, for a scene bridge.
+    pub fn socket_path(&self) -> Option<&Path> {
+        match self {
+            HostedBridge::Web(_) => None,
+            #[cfg(unix)]
+            HostedBridge::Scene(b) => b.socket_path(),
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        match self {
+            HostedBridge::Web(b) => b.is_busy(),
+            #[cfg(unix)]
+            HostedBridge::Scene(b) => b.is_busy(),
+        }
+    }
+
+    pub fn wanted_size(&self) -> Option<(u16, u16)> {
+        match self {
+            HostedBridge::Web(b) => b.wanted_size(),
+            #[cfg(unix)]
+            HostedBridge::Scene(b) => b.wanted_size(),
+        }
+    }
+
+    pub fn poll(&mut self, editor: &mut Editor, cols: &mut u16, rows: &mut u16) -> BridgePoll {
+        match self {
+            HostedBridge::Web(b) => b.poll(editor, cols, rows),
+            #[cfg(unix)]
+            HostedBridge::Scene(b) => b.poll(editor, cols, rows),
+        }
+    }
+
+    pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> bool {
+        match self {
+            HostedBridge::Web(b) => b.push_scene(editor, cols, rows),
+            #[cfg(unix)]
+            HostedBridge::Scene(b) => b.push_scene(editor, cols, rows),
+        }
+    }
+
+    pub fn maintain(&mut self) -> bool {
+        match self {
+            HostedBridge::Web(b) => b.maintain(),
+            #[cfg(unix)]
+            HostedBridge::Scene(b) => b.maintain(),
+        }
     }
 }
 
@@ -1704,6 +1605,18 @@ fn apply_kbedit(editor: &mut Editor, row: Option<u64>) {
 }
 
 /// `{cols, rows}` → the real `Editor::resize`, updating the bridge's size.
+/// A client's wanted grid size after a resize to `cols` × `rows`, clamped as
+/// the HTTP `/resize` route clamps; `None` when it didn't change. A resize
+/// always sends both, but a partial one keeps the other from `current`.
+fn apply_resize_want(current: Option<(u16, u16)>, cols: Option<u64>, rows: Option<u64>) -> Option<(u16, u16)> {
+    let cur = current.unwrap_or(DEFAULT_SIZE);
+    let next = (
+        cols.map_or(cur.0, |c| (c as u16).clamp(20, 400)),
+        rows.map_or(cur.1, |r| (r as u16).clamp(8, 200)),
+    );
+    (current != Some(next)).then_some(next)
+}
+
 fn apply_resize(
     editor: &mut Editor,
     new_cols: Option<u64>,
@@ -2079,23 +1992,14 @@ impl WsSession {
     /// true if the wanted size changed — the caller then recomputes the
     /// effective (min-across-clients) size and resizes the shared editor.
     fn note_resize(&mut self, v: &Value) -> bool {
-        let c = v
-            .get("cols")
-            .and_then(|x| x.as_u64())
-            .map(|c| (c as u16).clamp(20, 400));
-        let r = v
-            .get("rows")
-            .and_then(|x| x.as_u64())
-            .map(|r| (r as u16).clamp(8, 200));
-        // Keep whichever dimension the message carried; a resize always sends
-        // both, but tolerate a partial one by falling back to the last value.
-        let cur = self.want.unwrap_or(DEFAULT_SIZE);
-        let next = (c.unwrap_or(cur.0), r.unwrap_or(cur.1));
-        if self.want != Some(next) {
-            self.want = Some(next);
-            true
-        } else {
-            false
+        let cols = v.get("cols").and_then(|x| x.as_u64());
+        let rows = v.get("rows").and_then(|x| x.as_u64());
+        match apply_resize_want(self.want, cols, rows) {
+            Some(next) => {
+                self.want = Some(next);
+                true
+            }
+            None => false,
         }
     }
 
@@ -3537,25 +3441,22 @@ mod tests {
         digit_row_char, host_only, origin_host_matches, try_parse_request, SceneOptions,
         HTTP_REQUEST_CAP,
     };
-    #[cfg(unix)]
-    use super::{Conn, WsSession, FRAMES_AHEAD};
-    #[cfg(unix)]
+    use super::{WsSession, FRAMES_AHEAD};
     use serde_json::{json, Value};
 
-    /// A session on one end of a socket pair; keep the other end alive.
-    #[cfg(unix)]
-    fn session() -> (WsSession, std::os::unix::net::UnixStream) {
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+    /// A session on one end of a loopback connection; keep the other end alive.
+    fn session() -> (WsSession, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
         server.set_nonblocking(true).unwrap();
-        (WsSession::new(Conn::Unix(server)), client)
+        (WsSession::new(server), client)
     }
 
-    #[cfg(unix)]
     fn scene(status: u64) -> Value {
         json!({ "w": 10, "h": 2, "regions": { "statusbar": status } })
     }
 
-    #[cfg(unix)]
     #[test]
     fn frames_wait_for_a_client_that_reports_what_it_applied() {
         let (mut session, _client) = session();
@@ -3653,7 +3554,6 @@ mod tests {
         assert!(grid_copies(&[1, 2], &[1, 2]).is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_scrolled_grid_sends_only_the_rows_that_came_into_view() {
         use super::GridHasher;

@@ -1,5 +1,12 @@
 //! Integration tests for client-server communication
 
+/// Types generated from the scene channel's `scene.proto`, to read what the
+/// scene socket sends (`tests/scene_proto/`).
+#[cfg(all(feature = "web", unix))]
+#[path = "../../tests/scene_proto/fresh.scene.v1.rs"]
+#[allow(clippy::all)]
+mod scene_proto;
+
 #[cfg(test)]
 mod integration_tests {
     use std::sync::atomic::Ordering;
@@ -1672,34 +1679,55 @@ mod integration_tests {
     ///      owner-only, and every handshake advertises it;
     ///   2. FC's short-lived command clients (`fc_control`) never size the
     ///      shared grid, while a real terminal still does;
-    ///   3. a `/ws?grid=1` client gets the whole frame as cells in its hello.
+    ///   3. a client's hello carries the whole frame, every row of the grid.
     #[cfg(all(feature = "web", unix))]
     #[test]
     fn test_scene_socket_serves_fc_sessions() {
+        use crate::server::tests::scene_proto;
         use crate::config::Config;
         use crate::config_io::DirectoryContext;
         use crate::server::editor_server::{EditorServer, EditorServerConfig};
+        use prost::Message;
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixStream;
         use std::sync::mpsc;
 
-        fn try_state(path: &std::path::Path) -> Option<serde_json::Value> {
-            let mut stream = UnixStream::connect(path).ok()?;
-            stream
-                .write_all(b"GET /state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .ok()?;
-            let mut raw = String::new();
-            drop(stream.read_to_string(&mut raw));
-            serde_json::from_str(raw.split_once("\r\n\r\n")?.1).ok()
+        fn varint(stream: &mut UnixStream) -> Option<u64> {
+            let mut v = 0u64;
+            for i in 0..10 {
+                let mut b = [0u8];
+                stream.read_exact(&mut b).ok()?;
+                v |= u64::from(b[0] & 0x7f) << (7 * i);
+                if b[0] & 0x80 == 0 {
+                    return Some(v);
+                }
+            }
+            None
         }
 
-        fn state_until(
+        /// The whole scene a new client gets, from its `ServerHello`.
+        fn try_scene(path: &std::path::Path) -> Option<scene_proto::Frame> {
+            let mut stream = UnixStream::connect(path).ok()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            let hello = scene_proto::ClientHello { version: 1, telemetry: false }.encode_to_vec();
+            let mut message = vec![16, hello.len() as u8];
+            message.extend_from_slice(&hello);
+            stream.write_all(&message).ok()?;
+            let kind = varint(&mut stream)?;
+            let len = varint(&mut stream)? as usize;
+            let mut payload = vec![0; len];
+            stream.read_exact(&mut payload).ok()?;
+            (kind == 1).then_some(())?;
+            scene_proto::ServerHello::decode(&payload[..]).ok()?.scene
+        }
+
+        fn scene_until(
             path: &std::path::Path,
-            f: impl Fn(&serde_json::Value) -> bool,
-        ) -> serde_json::Value {
+            f: impl Fn(&scene_proto::Frame) -> bool,
+        ) -> scene_proto::Frame {
             loop {
-                if let Some(v) = try_state(path) {
+                if let Some(v) = try_scene(path) {
                     if f(&v) {
                         return v;
                     }
@@ -1770,59 +1798,27 @@ mod integration_tests {
             Some(scene_path.to_str().unwrap()),
             "the handshake advertises the scene socket"
         );
-        let booted = state_until(&scene_path, |v| v["w"].as_u64().is_some());
+        let booted = scene_until(&scene_path, |v| v.width.is_some());
         let mode = std::fs::metadata(&scene_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the scene socket must be owner-only");
 
         // (2) A command client leaves the grid alone; a terminal sizes it.
         thread::sleep(Duration::from_millis(300));
-        let still = state_until(&scene_path, |v| v["w"].as_u64().is_some());
+        let still = scene_until(&scene_path, |v| v.width.is_some());
         assert_eq!(
-            (still["w"].clone(), still["h"].clone()),
-            (booted["w"].clone(), booted["h"].clone()),
+            (still.width, still.height),
+            (booted.width, booted.height),
             "an fc_control client must not size the shared grid"
         );
         let (terminal, _) = hello_as(&socket_paths, TermSize::new(80, 24), false);
-        state_until(&scene_path, |v| v["w"] == 80 && v["h"] == 24);
+        let sized = scene_until(&scene_path, |v| v.width == Some(80) && v.height == Some(24));
         drop(control);
 
-        // (3) A grid client's hello carries every row of the frame as cells,
-        //     and its panes carry geometry without cells of their own.
-        let mut ws = UnixStream::connect(&scene_path).unwrap();
-        ws.write_all(
-            b"GET /ws?grid=1 HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-        )
-        .unwrap();
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 65536];
-        let frame = loop {
-            let n = ws.read(&mut chunk).unwrap();
-            assert!(n > 0, "the bridge closed the upgrade");
-            buf.extend_from_slice(&chunk[..n]);
-            let Some(head) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-                continue;
-            };
-            let body = &buf[head + 4..];
-            if body.len() < 2 {
-                continue;
-            }
-            let (len, off) = match body[1] & 0x7F {
-                126 if body.len() >= 4 => (u16::from_be_bytes([body[2], body[3]]) as usize, 4),
-                127 if body.len() >= 10 => (u64::from_be_bytes(body[2..10].try_into().unwrap()) as usize, 10),
-                n @ 0..=125 => (n as usize, 2),
-                _ => continue,
-            };
-            if body.len() >= off + len {
-                break body[off..off + len].to_vec();
-            }
-        };
-        let hello: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-        assert_eq!(hello["type"], "hello");
-        let grid = hello["scene"]["regions"]["grid"].as_array().expect("grid rows");
-        assert_eq!(grid.len(), 24, "one row of cells per terminal row");
-        assert!(hello["scene"]["regions"]["panes"][0]["cells"].is_null());
+        // (3) A client's hello carries every row of the frame, and its panes.
+        assert_eq!(sized.rows.len(), 24, "one row per terminal row");
+        assert_eq!(sized.grid_len, Some(24));
+        assert!(!sized.panes.is_empty(), "the panes");
 
-        drop(ws);
         drop(terminal);
         shutdown_handle.store(true, Ordering::SeqCst);
         drop(server_handle.join());

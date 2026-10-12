@@ -67,6 +67,11 @@ name = "scene_golden"
 path = "tests/scene_golden.rs"
 required-features = ["web"]
 
+[[test]]
+name = "scene_socket"
+path = "tests/scene_socket.rs"
+required-features = ["web"]
+
 [features]
 default = ["plugins", "runtime", "embed-plugins", "tree-sitter", "http", "self-update"]
 plugins = [
