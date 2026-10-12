@@ -510,6 +510,19 @@ pub fn scene_value(editor: &mut Editor, cols: u16, rows: u16) -> Value {
     scene_json(editor, cols, rows)
 }
 
+/// The whole scene a grid client with native menus gets (File Commander's
+/// options), grid rows included, without a tick. For tests.
+pub fn scene_value_grid(editor: &mut Editor, cols: u16, rows: u16) -> Value {
+    let options = SceneOptions {
+        grid: true,
+        native_menus: true,
+        ..SceneOptions::default()
+    };
+    let (mut scene, grid) = scene_parts(editor, cols, rows, options, &mut SceneTimes::default());
+    GridFrame::embed(grid.as_ref(), &mut scene);
+    scene
+}
+
 /// Render the SAME editor the way the TUI would — chrome drawn into cells — and
 /// return the joined cell text. Used by the parity test to assert the web's
 /// semantic scene and the terminal's cell rendering agree for one editor state

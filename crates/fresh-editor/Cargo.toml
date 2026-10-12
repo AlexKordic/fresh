@@ -62,6 +62,11 @@ name = "scene_parity"
 path = "tests/scene_parity.rs"
 required-features = ["web"]
 
+[[test]]
+name = "scene_golden"
+path = "tests/scene_golden.rs"
+required-features = ["web"]
+
 [features]
 default = ["plugins", "runtime", "embed-plugins", "tree-sitter", "http", "self-update"]
 plugins = [
