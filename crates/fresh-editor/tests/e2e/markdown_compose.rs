@@ -2320,12 +2320,14 @@ fn test_compose_mode_table_cell_wrapping() {
 
 | Category | Features |
 |---|---|
+| Emoji | EMOJI |
 | Editing | undo/redo, multi-cursor, block selection, smart indent |
 | Language Server (LSP) | go to definition, references, hover, code actions, rename, diagnostics, autocompletion |
 | Productivity | command palette, menu bar, keyboard macros, git log, diagnostics panel |
 
 End.
-";
+"
+    .replace("EMOJI", &"🚀".repeat(50));
 
     let temp_dir = tempfile::TempDir::new().unwrap();
     let project_root = temp_dir.path().join("project");
@@ -2337,7 +2339,7 @@ End.
     copy_plugin_lib(&plugins_dir);
 
     let md_path = project_root.join("table_wrap_test.md");
-    std::fs::write(&md_path, md_content).unwrap();
+    std::fs::write(&md_path, &md_content).unwrap();
 
     // Use a narrow width (60 cols) to force column compression and wrapping.
     let mut harness =
@@ -2379,6 +2381,10 @@ End.
         })
         .unwrap();
     let screen = harness.screen_to_string();
+    assert!(
+        screen.contains('🚀'),
+        "Wrapped supplementary characters must not abort table formatting: {screen}"
+    );
 
     // Dump rendered output for debugging
     eprintln!("=== Rendered table wrapping output ===");

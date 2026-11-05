@@ -1611,6 +1611,11 @@ function wrapText(text: string, width: number): string[] {
     let breakAt = text.lastIndexOf(' ', pos + width);
     if (breakAt <= pos) {
       breakAt = pos + width;
+      // Source positions are UTF-16 offsets. Keep a supplementary character
+      // whole when a hard break lands between its surrogate pair; the next
+      // displayWidth call crosses a UTF-8 boundary and cannot accept half.
+      const next = text.charCodeAt(breakAt);
+      if (next >= 0xdc00 && next <= 0xdfff) breakAt++;
       lines.push(text.slice(pos, breakAt));
       pos = breakAt;
     } else {
