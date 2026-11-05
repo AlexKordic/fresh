@@ -135,13 +135,14 @@ impl RemoteFileSystem {
         match e {
             ChannelError::Io(e) => e,
             ChannelError::Remote(msg) => {
-                let kind = if msg.contains("not found") || msg.contains("No such file") {
+                let normalized = msg.to_ascii_lowercase();
+                let kind = if normalized.contains("not found") || normalized.contains("no such file") {
                     io::ErrorKind::NotFound
-                } else if msg.contains("permission denied") {
+                } else if normalized.contains("permission denied") {
                     io::ErrorKind::PermissionDenied
-                } else if msg.contains("is a directory") {
+                } else if normalized.contains("is a directory") {
                     io::ErrorKind::IsADirectory
-                } else if msg.contains("not a directory") {
+                } else if normalized.contains("not a directory") {
                     io::ErrorKind::NotADirectory
                 } else {
                     io::ErrorKind::Other
@@ -1018,6 +1019,20 @@ mod tests {
         assert!(RemoteFileSystem::convert_metadata(&rm, "private.txt").is_readonly);
         rm.mode = 0o100666;
         assert!(RemoteFileSystem::convert_metadata(&rm, "acl-denied.txt").is_readonly);
+    }
+
+    #[test]
+    fn agent_os_errors_keep_their_classification_regardless_of_capitalization() {
+        for (message, kind) in [
+            ("[Errno 2] No such file or directory", io::ErrorKind::NotFound),
+            ("[Errno 13] Permission denied", io::ErrorKind::PermissionDenied),
+            ("[Errno 21] Is a directory", io::ErrorKind::IsADirectory),
+            ("[Errno 20] Not a directory", io::ErrorKind::NotADirectory),
+        ] {
+            let error = RemoteFileSystem::to_io_error(ChannelError::Remote(message.into()));
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), message);
+        }
     }
 
     #[test]
