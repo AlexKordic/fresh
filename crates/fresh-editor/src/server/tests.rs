@@ -1710,7 +1710,7 @@ mod integration_tests {
         fn try_scene(path: &std::path::Path) -> Option<scene_proto::Frame> {
             let mut stream = UnixStream::connect(path).ok()?;
             stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-            let hello = scene_proto::ClientHello { version: 1, telemetry: false }.encode_to_vec();
+            let hello = scene_proto::ClientHello { version: 1, telemetry: false, ..Default::default() }.encode_to_vec();
             let mut message = vec![16, hello.len() as u8];
             message.extend_from_slice(&hello);
             stream.write_all(&message).ok()?;

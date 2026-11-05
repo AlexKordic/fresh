@@ -111,6 +111,7 @@ use crate::app::Editor;
 use crate::view::scene::Rgb;
 
 mod wire;
+mod compose;
 #[cfg(unix)]
 mod scene_bridge;
 #[cfg(unix)]
@@ -2411,6 +2412,7 @@ pub(crate) struct PaneModel {
     pub(crate) thumb_start: usize,
     pub(crate) thumb_end: usize,
     pub(crate) markers: Vec<ScrollbarMarker>,
+    pub(crate) compose: Option<compose::ComposePane>,
 }
 
 /// A plugin's mark on a pane's scrollbar: its row on the track and color.
@@ -2541,6 +2543,7 @@ impl<'r> SceneModel<'r> {
                     // scrollbar from `vscroll`/`thumb*` rather than reading the
                     // painted cells, so markers must travel as data too.
                     markers: scrollbar_markers(editor, *leaf),
+                    compose: None,
                 })
             })
             .collect();

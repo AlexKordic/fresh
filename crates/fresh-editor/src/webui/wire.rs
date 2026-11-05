@@ -39,6 +39,7 @@ pub(crate) mod kind {
     pub const KB_EDIT_CLICK: u64 = 24;
     pub const CONFIGURE: u64 = 25;
     pub const APPLIED: u64 = 26;
+    pub const COMPOSE_INPUT: u64 = 27;
 }
 
 /// The protocol version a client's hello must name.
@@ -753,6 +754,8 @@ impl<'a> Iterator for Reader<'a> {
 // grid's cells carry what the app shows of them.
 
 use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
+use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection};
+use super::compose::InputReply;
 use crate::view::scene::{
     ContextMenuView, EntryDialogView, FileExplorerView, FileRow, KbConfirm, KbEditDialog, KbRow,
     KbSearchView, KeybindingEditorView, MapEntryView, MenuEntry, MenuItemView, PaletteView,
@@ -893,8 +896,33 @@ proto! {
     PaneModel as Pane {
         1 leaf: uint64, 2 buffer: optional uint64, 3 content: Rect, 4 gutter_width: uint32,
         5 tab_bar: TabBarView, 6 vscroll: Rect, 7 thumb_start: uint64, 8 thumb_end: uint64,
-        9 markers: repeated ScrollbarMarker,
+        9 markers: repeated ScrollbarMarker, 10 compose: maybe ComposePane,
     }
+    /// A source-preserving rich Compose window. All offsets are UTF-8 bytes;
+    /// display offsets are relative to text, source offsets are buffer-wide.
+    ComposePane {
+        1 buffer_revision: uint64, 2 projection_revision: uint64,
+        3 source_start: uint64, 4 source_end: uint64, 5 text: string,
+        6 segments: repeated ComposeSegment, 7 spans: repeated ComposeSpan,
+        8 images: repeated ComposeImage, 9 cursors: repeated ComposeSelection,
+        10 focused: bool, 11 top_byte: uint64, 12 document_len: uint64,
+        13 selection_revision: uint64, 14 keyboard: bool,
+    }
+    /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
+    ComposeSegment {
+        1 source_start: uint64, 2 source_end: uint64,
+        3 display_start: uint64, 4 display_end: uint64, 5 kind: uint32,
+    }
+    /// role: body 0, headings 1-6, code 7, table 8, quote 9.
+    /// flags: bold 1, italic 2, underline 4, strikethrough 8.
+    ComposeSpan { 1 start: uint64, 2 end: uint64, 3 role: uint32, 4 flags: uint32 }
+    ComposeImage {
+        1 start: uint64, 2 end: uint64, 3 target: string,
+        4 alt: string, 5 title: string, 6 block: bool,
+    }
+    ComposeSelection { 1 position: uint64, 2 anchor: optional uint64, 3 id: uint64, 4 primary: bool }
+    /// A revisioned input was applied exactly once, or requires a fresh layout.
+    InputReply { 1 id: uint64, 2 accepted: bool }
     /// A line between panes.
     SeparatorModel as Separator { 1 vertical: bool, 2 x: uint32, 3 y: uint32, 4 len: uint32 }
     /// The colors chrome is drawn with, 0xRRGGBB, each left out for the default.
@@ -1120,6 +1148,7 @@ message Frame {
   KeybindingEditorUpdate keybinding_editor = 21;
   SettingsUpdate settings = 22;
   Timing timing = 23;
+  InputReply input_reply = 24;
 }
 // Type 1: the answer to a ClientHello, with the whole scene.
 message ServerHello {
@@ -1134,6 +1163,29 @@ message Error {
 message ClientHello {
   uint32 version = 1;
   bool telemetry = 2;
+  // Opt in to source-mapped Compose panes. Grid cells remain available.
+  bool rich_compose = 3;
+}
+// A pane identity and the exact source/projection the client interacted with.
+message ComposeScope {
+  uint64 window_id = 1;
+  uint64 leaf = 2;
+  uint64 buffer = 3;
+  uint64 buffer_revision = 4;
+  uint64 projection_revision = 5;
+  uint64 selection_revision = 6;
+}
+// Type 27: serialized input for a rich client. kind/payload carry an existing
+// input message unchanged. A pointer instead supplies a source position.
+// Fresh acknowledges even a no-op. Rejected input is retried after the frame.
+message ComposeInput {
+  uint64 id = 1;
+  ComposeScope scope = 2;
+  uint32 kind = 3;
+  bytes payload = 4;
+  optional uint64 position = 5;
+  bool extend = 6;
+  uint32 click_count = 7;
 }
 // Type 17: a key, as a browser names it (key), the physical key (code), and
 // the modifiers held.

@@ -65,6 +65,8 @@ pub struct SceneBridge {
     grid: GridHasher,
     /// The last push's scene, encoded once for every client.
     encoded: EncodedScene,
+    rich_encoded: EncodedScene,
+    compose: super::compose::ComposeCache,
     /// Allocations of the last push, for the next frame's telemetry.
     last_push_allocs: Option<(u64, u64)>,
 }
@@ -82,6 +84,9 @@ struct SceneClient {
     hello_sent: bool,
     /// Frames carry timing.
     telemetry: bool,
+    rich_compose: bool,
+    last_input: u64,
+    input_reply: Option<super::compose::InputReply>,
     /// What it has of the scene.
     scene: ClientScene,
     /// The last frame sent, and the last it applied.
@@ -118,6 +123,8 @@ impl SceneBridge {
             source: SceneSource::new(editor),
             grid: GridHasher::default(),
             encoded: EncodedScene::default(),
+            rich_encoded: EncodedScene::default(),
+            compose: Default::default(),
             last_push_allocs: None,
         })
     }
@@ -149,7 +156,7 @@ impl SceneBridge {
         let had_clients = !self.clients.is_empty();
         let mut i = 0;
         while i < self.clients.len() {
-            match self.clients[i].read(editor, &mut out) {
+            match self.clients[i].read(editor, &mut out, &mut self.compose) {
                 Ok(()) => i += 1,
                 Err(reason) => {
                     eprintln!("[scene] client dropped: {reason}");
@@ -201,13 +208,27 @@ impl SceneBridge {
         let started = Instant::now();
         let mut times = SceneTimes::default();
         let source = &mut self.source;
-        let model = SceneModel::gather(editor, &mut source.renderer, cols, rows, SceneFor::App, &mut times);
-        let (clip_seq, clip_text) = source.clip.current(editor);
+        let mut model = SceneModel::gather(editor, &mut source.renderer, cols, rows, SceneFor::App, &mut times);
         let grid_started = Instant::now();
         let grid = self.grid.frame(model.buf);
         times.grid_ms = grid_started.elapsed().as_secs_f64() * 1000.0;
+        let rich = self.clients.iter().any(|c| c.greeted && c.rich_compose);
+        if rich && model.aux_modal.is_none() && editor.menu_state().active_menu.is_none() {
+            for pane in &mut model.panes {
+                if let Some(buffer) = pane.buffer {
+                    pane.compose = self.compose.gather(editor,
+                        fresh_core::LeafId(fresh_core::SplitId(pane.leaf)),
+                        crate::model::event::BufferId(buffer));
+                }
+            }
+        }
         let build_ms = started.elapsed().as_secs_f64() * 1000.0;
         let encode_started = Instant::now();
+        let (clip_seq, clip_text) = source.clip.current(editor);
+        if rich {
+            self.rich_encoded.encode(&model, wire::Clipboard { seq: clip_seq, text: clip_text });
+            for pane in &mut model.panes { pane.compose = None; }
+        }
         self.encoded.encode(&model, wire::Clipboard { seq: clip_seq, text: clip_text });
         let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let base = Timing {
@@ -226,11 +247,12 @@ impl SceneBridge {
             if !client.greeted {
                 continue;
             }
+            let encoded = if client.rich_compose { &self.rich_encoded } else { &self.encoded };
             if !client.hello_sent {
-                client.send_hello(&self.encoded, &grid);
+                client.send_hello(encoded, &grid);
             } else if client.ready() {
                 client.held = false;
-                client.send_frame(&self.encoded, &grid, base);
+                client.send_frame(encoded, &grid, base);
             } else {
                 client.held = true;
             }
@@ -291,6 +313,9 @@ impl SceneClient {
             greeted: false,
             hello_sent: false,
             telemetry: false,
+            rich_compose: false,
+            last_input: 0,
+            input_reply: None,
             scene: ClientScene::default(),
             seq: 0,
             applied: 0,
@@ -309,7 +334,7 @@ impl SceneClient {
     }
 
     /// Read what arrived and apply each whole message.
-    fn read(&mut self, editor: &mut Editor, out: &mut BridgePoll) -> Result<(), String> {
+    fn read(&mut self, editor: &mut Editor, out: &mut BridgePoll, compose: &mut super::compose::ComposeCache) -> Result<(), String> {
         let mut tmp = [0u8; 16384];
         loop {
             match self.stream.read(&mut tmp) {
@@ -328,7 +353,7 @@ impl SceneClient {
                     let payload = &inbuf[used..][payload];
                     used += n;
                     self.received += 1;
-                    if let Err(e) = self.handle(k, payload, editor, out) {
+                    if let Err(e) = self.handle(k, payload, editor, out, compose) {
                         break Err(e);
                     }
                 }
@@ -347,17 +372,19 @@ impl SceneClient {
         payload: &[u8],
         editor: &mut Editor,
         out: &mut BridgePoll,
+        compose: &mut super::compose::ComposeCache,
     ) -> Result<(), String> {
         let w = |e: WireError| e.to_string();
         if !self.greeted {
             if k != kind::CLIENT_HELLO {
                 return Err(format!("expected a hello, got message type {k}"));
             }
-            let (mut version, mut telemetry) = (0, false);
+            let (mut version, mut telemetry, mut rich_compose) = (0, false, false);
             for f in Reader::new(payload) {
                 match f.map_err(w)? {
                     (1, v) => version = v.uint(),
                     (2, v) => telemetry = v.flag(),
+                    (3, v) => rich_compose = v.flag(),
                     _ => {}
                 }
             }
@@ -366,10 +393,34 @@ impl SceneClient {
             }
             self.greeted = true;
             self.telemetry = telemetry;
+            self.rich_compose = rich_compose;
             out.frame_owed = true;
             return Ok(());
         }
         match k {
+            kind::COMPOSE_INPUT => {
+                if !self.rich_compose { return Err("rich input requires rich_compose in hello".into()); }
+                let input = super::compose::Input::parse(payload).map_err(w)?;
+                if input.id == 0 { return Err("rich input has no request id".into()); }
+                if input.id > self.last_input.saturating_add(1) { return Err("rich input request ids must be sequential".into()); }
+                if self.input_reply.is_some() { return Err("rich inputs must wait for their reply".into()); }
+                let mut accepted = input.id <= self.last_input;
+                if !accepted && input.scope.as_ref().is_none_or(|scope| scope.matches(editor, compose)) {
+                    if input.position.is_some() {
+                        accepted = input.pointer(editor);
+                        out.mutated |= accepted;
+                    } else if (kind::KEY..=kind::KB_EDIT_CLICK).contains(&input.kind) {
+                        if let Some(scope) = &input.scope { editor.focus_split(scope.leaf, scope.buffer); }
+                        self.handle(input.kind, input.payload, editor, out, compose)?;
+                        accepted = true;
+                    } else {
+                        return Err("unsupported input inside ComposeInput".into());
+                    }
+                }
+                if accepted { self.last_input = self.last_input.max(input.id); }
+                self.input_reply = Some(super::compose::InputReply { id: input.id, accepted });
+                out.frame_owed = true;
+            }
             kind::KEY => {
                 let mut input = KeyInput::default();
                 for f in Reader::new(payload) {
@@ -511,8 +562,11 @@ impl SceneClient {
         let started = Instant::now();
         self.body.clear();
         let changed = self.scene.write_frame(&mut self.body, self.seq + 1, scene, Some(grid), None);
-        if !changed {
+        if !changed && self.input_reply.is_none() {
             return;
+        }
+        if let Some(reply) = self.input_reply.take() {
+            wire::field::msg(&mut self.body, 24, &reply);
         }
         if self.telemetry {
             // Timing goes last, so it can say how long writing this frame took.

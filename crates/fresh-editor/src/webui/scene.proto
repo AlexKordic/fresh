@@ -296,6 +296,66 @@ message Pane {
   uint64 thumb_start = 7;
   uint64 thumb_end = 8;
   repeated ScrollbarMarker markers = 9;
+  ComposePane compose = 10;
+}
+
+// A source-preserving rich Compose window. All offsets are UTF-8 bytes;
+// display offsets are relative to text, source offsets are buffer-wide.
+message ComposePane {
+  uint64 buffer_revision = 1;
+  uint64 projection_revision = 2;
+  uint64 source_start = 3;
+  uint64 source_end = 4;
+  string text = 5;
+  repeated ComposeSegment segments = 6;
+  repeated ComposeSpan spans = 7;
+  repeated ComposeImage images = 8;
+  repeated ComposeSelection cursors = 9;
+  bool focused = 10;
+  uint64 top_byte = 11;
+  uint64 document_len = 12;
+  uint64 selection_revision = 13;
+  bool keyboard = 14;
+}
+
+// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
+message ComposeSegment {
+  uint64 source_start = 1;
+  uint64 source_end = 2;
+  uint64 display_start = 3;
+  uint64 display_end = 4;
+  uint32 kind = 5;
+}
+
+// role: body 0, headings 1-6, code 7, table 8, quote 9.
+// flags: bold 1, italic 2, underline 4, strikethrough 8.
+message ComposeSpan {
+  uint64 start = 1;
+  uint64 end = 2;
+  uint32 role = 3;
+  uint32 flags = 4;
+}
+
+message ComposeImage {
+  uint64 start = 1;
+  uint64 end = 2;
+  string target = 3;
+  string alt = 4;
+  string title = 5;
+  bool block = 6;
+}
+
+message ComposeSelection {
+  uint64 position = 1;
+  optional uint64 anchor = 2;
+  uint64 id = 3;
+  bool primary = 4;
+}
+
+// A revisioned input was applied exactly once, or requires a fresh layout.
+message InputReply {
+  uint64 id = 1;
+  bool accepted = 2;
 }
 
 // A line between panes.
@@ -562,6 +622,7 @@ message Frame {
   KeybindingEditorUpdate keybinding_editor = 21;
   SettingsUpdate settings = 22;
   Timing timing = 23;
+  InputReply input_reply = 24;
 }
 // Type 1: the answer to a ClientHello, with the whole scene.
 message ServerHello {
@@ -576,6 +637,29 @@ message Error {
 message ClientHello {
   uint32 version = 1;
   bool telemetry = 2;
+  // Opt in to source-mapped Compose panes. Grid cells remain available.
+  bool rich_compose = 3;
+}
+// A pane identity and the exact source/projection the client interacted with.
+message ComposeScope {
+  uint64 window_id = 1;
+  uint64 leaf = 2;
+  uint64 buffer = 3;
+  uint64 buffer_revision = 4;
+  uint64 projection_revision = 5;
+  uint64 selection_revision = 6;
+}
+// Type 27: serialized input for a rich client. kind/payload carry an existing
+// input message unchanged. A pointer instead supplies a source position.
+// Fresh acknowledges even a no-op. Rejected input is retried after the frame.
+message ComposeInput {
+  uint64 id = 1;
+  ComposeScope scope = 2;
+  uint32 kind = 3;
+  bytes payload = 4;
+  optional uint64 position = 5;
+  bool extend = 6;
+  uint32 click_count = 7;
 }
 // Type 17: a key, as a browser names it (key), the physical key (code), and
 // the modifiers held.

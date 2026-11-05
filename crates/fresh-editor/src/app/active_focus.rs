@@ -64,7 +64,7 @@ impl Editor {
 
     /// Focus a split and its buffer, handling all side effects including
     /// terminal mode. Window-side body in [`Window::focus_split`].
-    pub(super) fn focus_split(&mut self, split_id: LeafId, buffer_id: BufferId) {
+    pub(crate) fn focus_split(&mut self, split_id: LeafId, buffer_id: BufferId) {
         match self.active_window_mut().focus_split(split_id, buffer_id) {
             FocusSplitOutcome::Handled => {
                 // Window body synced the flag; finish any restored-terminal

@@ -483,6 +483,102 @@ pub struct Pane {
     pub thumb_end: u64,
     #[prost(message, repeated, tag = "9")]
     pub markers: ::prost::alloc::vec::Vec<ScrollbarMarker>,
+    #[prost(message, optional, tag = "10")]
+    pub compose: ::core::option::Option<ComposePane>,
+}
+/// A source-preserving rich Compose window. All offsets are UTF-8 bytes;
+/// display offsets are relative to text, source offsets are buffer-wide.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposePane {
+    #[prost(uint64, tag = "1")]
+    pub buffer_revision: u64,
+    #[prost(uint64, tag = "2")]
+    pub projection_revision: u64,
+    #[prost(uint64, tag = "3")]
+    pub source_start: u64,
+    #[prost(uint64, tag = "4")]
+    pub source_end: u64,
+    #[prost(string, tag = "5")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "6")]
+    pub segments: ::prost::alloc::vec::Vec<ComposeSegment>,
+    #[prost(message, repeated, tag = "7")]
+    pub spans: ::prost::alloc::vec::Vec<ComposeSpan>,
+    #[prost(message, repeated, tag = "8")]
+    pub images: ::prost::alloc::vec::Vec<ComposeImage>,
+    #[prost(message, repeated, tag = "9")]
+    pub cursors: ::prost::alloc::vec::Vec<ComposeSelection>,
+    #[prost(bool, tag = "10")]
+    pub focused: bool,
+    #[prost(uint64, tag = "11")]
+    pub top_byte: u64,
+    #[prost(uint64, tag = "12")]
+    pub document_len: u64,
+    #[prost(uint64, tag = "13")]
+    pub selection_revision: u64,
+    #[prost(bool, tag = "14")]
+    pub keyboard: bool,
+}
+/// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeSegment {
+    #[prost(uint64, tag = "1")]
+    pub source_start: u64,
+    #[prost(uint64, tag = "2")]
+    pub source_end: u64,
+    #[prost(uint64, tag = "3")]
+    pub display_start: u64,
+    #[prost(uint64, tag = "4")]
+    pub display_end: u64,
+    #[prost(uint32, tag = "5")]
+    pub kind: u32,
+}
+/// role: body 0, headings 1-6, code 7, table 8, quote 9.
+/// flags: bold 1, italic 2, underline 4, strikethrough 8.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeSpan {
+    #[prost(uint64, tag = "1")]
+    pub start: u64,
+    #[prost(uint64, tag = "2")]
+    pub end: u64,
+    #[prost(uint32, tag = "3")]
+    pub role: u32,
+    #[prost(uint32, tag = "4")]
+    pub flags: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeImage {
+    #[prost(uint64, tag = "1")]
+    pub start: u64,
+    #[prost(uint64, tag = "2")]
+    pub end: u64,
+    #[prost(string, tag = "3")]
+    pub target: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub alt: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub title: ::prost::alloc::string::String,
+    #[prost(bool, tag = "6")]
+    pub block: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeSelection {
+    #[prost(uint64, tag = "1")]
+    pub position: u64,
+    #[prost(uint64, optional, tag = "2")]
+    pub anchor: ::core::option::Option<u64>,
+    #[prost(uint64, tag = "3")]
+    pub id: u64,
+    #[prost(bool, tag = "4")]
+    pub primary: bool,
+}
+/// A revisioned input was applied exactly once, or requires a fresh layout.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InputReply {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(bool, tag = "2")]
+    pub accepted: bool,
 }
 /// A line between panes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -951,6 +1047,8 @@ pub struct Frame {
     pub settings: ::core::option::Option<SettingsUpdate>,
     #[prost(message, optional, tag = "23")]
     pub timing: ::core::option::Option<Timing>,
+    #[prost(message, optional, tag = "24")]
+    pub input_reply: ::core::option::Option<InputReply>,
 }
 /// Type 1: the answer to a ClientHello, with the whole scene.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -973,6 +1071,45 @@ pub struct ClientHello {
     pub version: u32,
     #[prost(bool, tag = "2")]
     pub telemetry: bool,
+    /// Opt in to source-mapped Compose panes. Grid cells remain available.
+    #[prost(bool, tag = "3")]
+    pub rich_compose: bool,
+}
+/// A pane identity and the exact source/projection the client interacted with.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeScope {
+    #[prost(uint64, tag = "1")]
+    pub window_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub leaf: u64,
+    #[prost(uint64, tag = "3")]
+    pub buffer: u64,
+    #[prost(uint64, tag = "4")]
+    pub buffer_revision: u64,
+    #[prost(uint64, tag = "5")]
+    pub projection_revision: u64,
+    #[prost(uint64, tag = "6")]
+    pub selection_revision: u64,
+}
+/// Type 27: serialized input for a rich client. kind/payload carry an existing
+/// input message unchanged. A pointer instead supplies a source position.
+/// Fresh acknowledges even a no-op. Rejected input is retried after the frame.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeInput {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub scope: ::core::option::Option<ComposeScope>,
+    #[prost(uint32, tag = "3")]
+    pub kind: u32,
+    #[prost(bytes = "vec", tag = "4")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, optional, tag = "5")]
+    pub position: ::core::option::Option<u64>,
+    #[prost(bool, tag = "6")]
+    pub extend: bool,
+    #[prost(uint32, tag = "7")]
+    pub click_count: u32,
 }
 /// Type 17: a key, as a browser names it (key), the physical key (code), and
 /// the modifiers held.

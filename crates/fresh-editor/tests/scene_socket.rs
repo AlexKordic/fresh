@@ -134,7 +134,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
 
     // A client naming another protocol version is told why, and dropped.
     let mut stranger = App::connect(&path);
-    stranger.send(16, pb::ClientHello { version: 99, telemetry: false });
+    stranger.send(16, pb::ClientHello { version: 99, telemetry: false, ..Default::default() });
     settle_bridge(&mut bridge, &mut ed);
     let (kind, payload) = stranger.receive().expect("an Error");
     assert_eq!(kind, 3);
@@ -144,7 +144,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
 
     // Hello: the whole scene.
     let mut app = App::connect(&path);
-    app.send(16, pb::ClientHello { version: 1, telemetry: true });
+    app.send(16, pb::ClientHello { version: 1, telemetry: true, ..Default::default() });
     settle_bridge(&mut bridge, &mut ed);
     let (kind, payload) = app.receive().expect("a ServerHello");
     assert_eq!(kind, 1);
@@ -209,5 +209,92 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     assert!(!bridge.is_busy(), "the app left");
     drop(bridge);
     assert!(!path.exists(), "the bridge removes its socket");
+    rich_compose_edits_keep_source_and_retry_obsolete_input(&root, &work);
     drop(std::fs::remove_dir_all(&root));
+}
+
+fn rich_compose_edits_keep_source_and_retry_obsolete_input(root: &std::path::Path, work: &std::path::Path) {
+    let original = "# Heading\r\n\r\nSome **strong** café text.\r\n\r\n![alt](images/a.png)\r\n";
+    let file = work.join("compose.md");
+    std::fs::write(&file, original).unwrap();
+    let mut ed = build_editor(COLS, ROWS, &[file.clone()], true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed, &json!({})); }
+    apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));
+    for _ in 0..50 {
+        apply_step(&mut ed, &json!({}));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(ed.active_window().focused_view().view_mode, fresh::state::ViewMode::PageView,
+        "the real Compose plugin enabled its presentation");
+    let path = root.join("compose.sock");
+    let mut bridge = SceneBridge::bind(&path, &ed).unwrap();
+    let mut grid = App::connect(&path);
+    let mut rich = App::connect(&path);
+    grid.send(16, pb::ClientHello { version: 1, ..Default::default() });
+    rich.send(16, pb::ClientHello { version: 1, rich_compose: true, ..Default::default() });
+    settle_bridge(&mut bridge, &mut ed);
+    let grid_scene = pb::ServerHello::decode(&grid.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    assert!(grid_scene.panes.iter().all(|p| p.pane.as_ref().unwrap().compose.is_none()));
+    let scene = pb::ServerHello::decode(&rich.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let pane = scene.panes.iter().find_map(|p| p.pane.as_ref().filter(|p| p.compose.is_some())).unwrap();
+    let compose = pane.compose.as_ref().unwrap();
+    assert!(compose.spans.iter().any(|s| s.role == 1), "a semantic heading");
+    assert_eq!(compose.images.len(), 1);
+    assert_eq!(compose.images[0].target, "images/a.png");
+    let scope = |pane: &pb::Pane| {
+        let c = pane.compose.as_ref().unwrap();
+        pb::ComposeScope { window_id: scene.window_id.unwrap(), leaf: pane.leaf, buffer: pane.buffer.unwrap(),
+            buffer_revision: c.buffer_revision, projection_revision: c.projection_revision,
+            selection_revision: c.selection_revision }
+    };
+    let initial = scope(pane);
+    let at = original.find("café").unwrap();
+    rich.send(27, pb::ComposeInput { id: 1, scope: Some(initial.clone()), position: Some(at as u64), ..Default::default() });
+    settle_bridge(&mut bridge, &mut ed);
+    let placed = rich.frame().unwrap();
+    assert!(placed.input_reply.unwrap().accepted);
+    assert_eq!(ed.active_window().active_cursors().primary().position, at);
+    rich.send(26, pb::Applied { seq: placed.seq });
+    let before_edit = scope(placed.panes.iter().find_map(|p| p.pane.as_ref().filter(|p| p.compose.is_some())).unwrap());
+    let key = pb::ComposeInput { id: 2, scope: Some(before_edit.clone()), kind: 17,
+        payload: pb::Key { key: "X".into(), ..Default::default() }.encode_to_vec(), ..Default::default() };
+    let mut obsolete_cursor = key.clone();
+    obsolete_cursor.scope = Some(initial);
+    rich.send(27, obsolete_cursor);
+    settle_bridge(&mut bridge, &mut ed);
+    let stale_cursor = rich.frame().unwrap();
+    assert!(!stale_cursor.input_reply.unwrap().accepted, "cursor-only changes invalidate pending input too");
+    rich.send(26, pb::Applied { seq: stale_cursor.seq });
+    rich.send(27, key.clone());
+    settle_bridge(&mut bridge, &mut ed);
+    let typed = rich.frame().unwrap();
+    assert!(typed.input_reply.unwrap().accepted);
+    rich.send(26, pb::Applied { seq: typed.seq });
+    let current = scope(typed.panes.iter().find_map(|p| p.pane.as_ref().filter(|p| p.compose.is_some())).unwrap());
+    let source = |ed: &fresh::app::Editor| {
+        let state = ed.active_window().active_state();
+        String::from_utf8(state.buffer.slice_bytes(0..state.buffer.len())).unwrap()
+    };
+    assert_eq!(source(&ed), original.replacen("café", "Xcafé", 1));
+    // Replaying an accepted request cannot type the character twice.
+    rich.send(27, key);
+    settle_bridge(&mut bridge, &mut ed);
+    let duplicate = rich.frame().unwrap();
+    assert!(duplicate.input_reply.unwrap().accepted);
+    assert_eq!(source(&ed), original.replacen("café", "Xcafé", 1));
+    rich.send(26, pb::Applied { seq: duplicate.seq });
+    let mut undo = pb::ComposeInput { id: 3, scope: Some(before_edit), kind: 21,
+        payload: pb::Action { name: "undo".into(), args_json: String::new() }.encode_to_vec(), ..Default::default() };
+    rich.send(27, undo.clone());
+    settle_bridge(&mut bridge, &mut ed);
+    let stale = rich.frame().unwrap();
+    assert!(!stale.input_reply.unwrap().accepted, "obsolete source geometry is refused");
+    assert_eq!(source(&ed), original.replacen("café", "Xcafé", 1));
+    rich.send(26, pb::Applied { seq: stale.seq });
+    undo.scope = Some(current);
+    rich.send(27, undo);
+    settle_bridge(&mut bridge, &mut ed);
+    assert!(rich.frame().unwrap().input_reply.unwrap().accepted);
+    assert_eq!(source(&ed), original, "Fresh's normal undo restores the exact CRLF source");
+    assert_eq!(std::fs::read(&file).unwrap(), original.as_bytes(), "presentation never saved or rewrote the source");
 }
