@@ -580,8 +580,9 @@ pub struct ComposeSegment {
     #[prost(uint32, tag = "5")]
     pub kind: u32,
 }
-/// role: body 0, headings 1-6, code 7, table 8, quote 9.
-/// flags: bold 1, italic 2, underline 4, strikethrough 8.
+/// role: body 0, headings 1-6, inline code 7, table 8, quote 9,
+/// list 10, paragraph 11, code block 12, list item 13.
+/// flags: bold 1, italic 2, underline 4, strikethrough 8, link 16.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeSpan {
     #[prost(uint64, tag = "1")]

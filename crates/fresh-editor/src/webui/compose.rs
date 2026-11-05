@@ -336,9 +336,10 @@ pub(crate) struct ComposeSegment {
 pub(crate) struct ComposeSpan {
     pub start: usize,
     pub end: usize,
-    /// 0 body; 1..6 heading; 7 code; 8 table; 9 quote.
+    /// 0 body; 1..6 heading; 7 inline code; 8 table; 9 quote;
+    /// 10 list; 11 paragraph; 12 code block; 13 list item.
     pub role: u32,
-    /// Bold 1, italic 2, underline 4, strikethrough 8.
+    /// Bold 1, italic 2, underline 4, strikethrough 8, link 16.
     pub flags: u32,
 }
 
@@ -405,7 +406,7 @@ impl Document {
             let mut flags = 0;
             match event {
                 Event::Start(Tag::Heading { level, .. }) => role = level as u32,
-                Event::Start(Tag::CodeBlock(_)) => role = 7,
+                Event::Start(Tag::CodeBlock(_)) => role = 12,
                 Event::Code(text) => {
                     role = 7;
                     if let Some(image) = image_stack.last_mut() {
@@ -414,10 +415,16 @@ impl Document {
                 }
                 Event::Start(Tag::Table(_)) => role = 8,
                 Event::Start(Tag::BlockQuote(_)) => role = 9,
+                Event::Start(Tag::List(_)) => role = 10,
+                Event::Start(Tag::Item) => role = 13,
+                Event::Start(Tag::Link { .. }) => flags = 4 | 16,
                 Event::Start(Tag::Strong) => flags = 1,
                 Event::Start(Tag::Emphasis) => flags = 2,
                 Event::Start(Tag::Strikethrough) => flags = 8,
-                Event::Start(Tag::Paragraph) => paragraphs.push(range.clone()),
+                Event::Start(Tag::Paragraph) => {
+                    role = 11;
+                    paragraphs.push(range.clone());
+                }
                 Event::Start(Tag::Image {
                     dest_url, title, ..
                 }) => {
@@ -832,6 +839,38 @@ mod tests {
         assert_eq!(doc.images.len(), 1);
         assert_eq!(doc.images[0].target, "outer.png");
         assert_eq!(doc.images[0].alt, "outer inner");
+    }
+
+    #[test]
+    fn typography_ranges_preserve_nested_blocks_links_code_and_source_bytes() {
+        let text = "# Héading\r\n\r\n> Quoted [a **link**](https://example.test) and `code`.\r\n\r\n- parent\r\n  - child with ~~strike~~\r\n\r\n```md\r\n[not a link](no)\r\n```\r\n";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        let ranges = |role| doc.spans.iter().filter(move |span| span.role == role);
+        assert_eq!(ranges(1).count(), 1);
+        assert_eq!(ranges(9).count(), 1);
+        let lists: Vec<_> = ranges(10).collect();
+        assert_eq!(lists.len(), 2);
+        assert!(lists[0].start < lists[1].start && lists[0].end >= lists[1].end);
+        assert_eq!(ranges(13).count(), 2);
+        assert!(ranges(11).any(|span| text[span.start..span.end].starts_with("Quoted")));
+        assert!(ranges(7).any(|span| &text[span.start..span.end] == "`code`"));
+        assert!(ranges(12).any(|span| text[span.start..span.end].starts_with("```md")));
+        let links: Vec<_> = doc
+            .spans
+            .iter()
+            .filter(|span| span.flags & 16 != 0)
+            .collect();
+        assert_eq!(links.len(), 1, "fenced link-looking code is inert");
+        assert_eq!(
+            &text[links[0].start..links[0].end],
+            "[a **link**](https://example.test)"
+        );
+        assert_eq!(links[0].flags & 4, 4);
+        assert!(doc
+            .spans
+            .iter()
+            .any(|span| span.flags & 8 != 0 && &text[span.start..span.end] == "~~strike~~"));
+        assert_eq!(doc.text.as_bytes(), text.as_bytes());
     }
 
     #[test]
