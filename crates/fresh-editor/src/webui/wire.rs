@@ -763,6 +763,7 @@ impl<'a> Iterator for Reader<'a> {
 use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
 use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection};
 use super::compose_text::Context as ComposeTextContext;
+use super::compose_text::Chunk as ComposeTextChunk;
 use super::compose_assets::Chunk;
 use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewportReply};
 use super::compose::InputReply;
@@ -929,6 +930,7 @@ proto! {
         13 selection_revision: uint64, 14 keyboard: bool, 15 asset_authority: uint64, 16 asset_document: uint64,
         17 viewport: maybe ComposeViewport, 18 ready: optional bool, 19 error: string,
         20 text_context: maybe ComposeTextContext,
+        21 text_chunks: repeated ComposeTextChunk,
     }
     /// Raw source near the primary caret, independent of display conceals and
     /// viewport. source_start is UTF-8 bytes; all other offsets are UTF-16.
@@ -936,6 +938,9 @@ proto! {
         1 text: string, 2 source_start: uint64, 3 utf16_start: uint64,
         4 selection_start: uint64, 5 selection_end: uint64,
     }
+    /// Coalesced raw source windows around additional carets. Each byte occurs
+    /// at most once in this list, independently of the number of carets.
+    ComposeTextChunk { 1 text: string, 2 source_start: uint64, 3 utf16_start: uint64 }
     /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
     ComposeSegment {
         1 source_start: uint64, 2 source_end: uint64,
@@ -949,7 +954,10 @@ proto! {
         1 start: uint64, 2 end: uint64, 3 target: string,
         4 alt: string, 5 title: string, 6 block: bool, 7 rendered: bool, 8 source_preview: bool,
     }
-    ComposeSelection { 1 position: uint64, 2 anchor: optional uint64, 3 id: uint64, 4 primary: bool }
+    ComposeSelection {
+        1 position: uint64, 2 anchor: optional uint64, 3 id: uint64, 4 primary: bool,
+        5 utf16_position: optional uint64, 6 utf16_anchor: optional uint64,
+    }
     /// A revisioned input was applied exactly once, requires a fresh layout,
     /// or was cancelled with a terminal explanation. Cancelled ids are consumed.
     InputReply {
@@ -1239,6 +1247,15 @@ message ComposeInput {
   optional uint64 replacement_end = 17;
   bool text_input = 18;
   optional uint64 replacement_cursor = 19;
+  repeated ComposeReplacementTarget replacements = 20;
+}
+// Additional captured carets in the same atomic source transaction. An omitted
+// text uses the primary Paste payload; an explicitly empty text deletes.
+message ComposeReplacementTarget {
+  optional uint64 start = 1;
+  optional uint64 end = 2;
+  optional uint64 cursor = 3;
+  optional string text = 4;
 }
 // Type 28: read the image annotation identified by this source range through
 // its document authority. No client-supplied path. Cancellation needs only id.

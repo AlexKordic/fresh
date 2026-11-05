@@ -1456,55 +1456,68 @@ impl Editor {
         }
     }
 
-    /// An explicit native input-method range addresses its captured cursor.
-    /// Other cursors retain their identities and follow the edit;
-    /// ordinary text input/paste keeps the existing multi-cursor behavior.
+    /// Validate every captured range/cursor before mutating any cursor or byte.
+    /// Disjoint replacements share one undo transaction, including deletion.
     #[cfg(feature = "web")]
-    pub(crate) fn replace_native_text(
+    pub(crate) fn replace_native_texts(
         &mut self,
-        range: std::ops::Range<usize>,
-        text: String,
-        id: CursorId,
+        mut targets: Vec<(std::ops::Range<usize>, String, CursorId)>,
     ) -> Result<(), String> {
         if self.active_window().is_editing_disabled() {
             return Err("The document is read-only; text was not inserted.".into());
         }
-        if self.active_cursors().get(id).is_none() {
-            return Err("The text replacement cursor is no longer available.".into());
+        let mut ids = std::collections::HashSet::new();
+        for (_, _, id) in &targets {
+            if !ids.insert(*id) {
+                return Err("A text replacement cursor occurs more than once.".into());
+            }
+            if self.active_cursors().get(*id).is_none() {
+                return Err("A text replacement cursor is no longer available.".into());
+            }
         }
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let text = match self.active_state().buffer.line_ending() {
-            crate::model::buffer::LineEnding::LF => text,
-            crate::model::buffer::LineEnding::CRLF => text.replace('\n', "\r\n"),
-            crate::model::buffer::LineEnding::CR => text.replace('\n', "\r"),
-        };
+        targets.sort_by_key(|(range, _, _)| (range.start, range.end));
+        if targets
+            .windows(2)
+            .any(|pair| pair[0].0.end > pair[1].0.start || pair[0].0.start == pair[1].0.start)
+        {
+            return Err("Text replacement ranges overlap; no text was inserted.".into());
+        }
         let mut events = Vec::new();
-        if !range.is_empty() {
-            let deleted_text = self
-                .active_state_mut()
-                .get_text_range(range.start, range.end);
-            events.push(Event::Delete {
-                range: range.clone(),
-                deleted_text,
-                cursor_id: id,
-            });
-        }
-        if !text.is_empty() {
-            events.push(Event::Insert {
-                position: range.start,
-                text,
-                cursor_id: id,
-            });
+        for (range, text, id) in targets.iter().rev() {
+            if !range.is_empty() {
+                let deleted_text = self
+                    .active_state_mut()
+                    .get_text_range(range.start, range.end);
+                events.push(Event::Delete {
+                    range: range.clone(),
+                    deleted_text,
+                    cursor_id: *id,
+                });
+            }
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            let text = match self.active_state().buffer.line_ending() {
+                crate::model::buffer::LineEnding::LF => text,
+                crate::model::buffer::LineEnding::CRLF => text.replace('\n', "\r\n"),
+                crate::model::buffer::LineEnding::CR => text.replace('\n', "\r"),
+            };
+            if !text.is_empty() {
+                events.push(Event::Insert {
+                    position: range.start,
+                    text,
+                    cursor_id: *id,
+                });
+            }
         }
         if events.is_empty() {
             return Ok(());
         }
-        let cursor = self.active_cursors_mut().get_mut(id).unwrap();
-        *cursor = if range.is_empty() {
-            Cursor::new(range.start)
-        } else {
-            Cursor::with_selection(range.start, range.end)
-        };
+        for (range, _, id) in targets {
+            *self.active_cursors_mut().get_mut(id).unwrap() = if range.is_empty() {
+                Cursor::new(range.start)
+            } else {
+                Cursor::with_selection(range.start, range.end)
+            };
+        }
         self.mark_plugin_snapshot_dirty();
         if events.len() > 1 {
             let applied = self

@@ -575,6 +575,8 @@ pub struct ComposePane {
     pub error: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "20")]
     pub text_context: ::core::option::Option<ComposeTextContext>,
+    #[prost(message, repeated, tag = "21")]
+    pub text_chunks: ::prost::alloc::vec::Vec<ComposeTextChunk>,
 }
 /// Raw source near the primary caret, independent of display conceals and
 /// viewport. source_start is UTF-8 bytes; all other offsets are UTF-16.
@@ -590,6 +592,17 @@ pub struct ComposeTextContext {
     pub selection_start: u64,
     #[prost(uint64, tag = "5")]
     pub selection_end: u64,
+}
+/// Coalesced raw source windows around additional carets. Each byte occurs
+/// at most once in this list, independently of the number of carets.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeTextChunk {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub source_start: u64,
+    #[prost(uint64, tag = "3")]
+    pub utf16_start: u64,
 }
 /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -650,6 +663,10 @@ pub struct ComposeSelection {
     pub id: u64,
     #[prost(bool, tag = "4")]
     pub primary: bool,
+    #[prost(uint64, optional, tag = "5")]
+    pub utf16_position: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    pub utf16_anchor: ::core::option::Option<u64>,
 }
 /// A revisioned input was applied exactly once, requires a fresh layout,
 /// or was cancelled with a terminal explanation. Cancelled ids are consumed.
@@ -1244,6 +1261,21 @@ pub struct ComposeInput {
     pub text_input: bool,
     #[prost(uint64, optional, tag = "19")]
     pub replacement_cursor: ::core::option::Option<u64>,
+    #[prost(message, repeated, tag = "20")]
+    pub replacements: ::prost::alloc::vec::Vec<ComposeReplacementTarget>,
+}
+/// Additional captured carets in the same atomic source transaction. An omitted
+/// text uses the primary Paste payload; an explicitly empty text deletes.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeReplacementTarget {
+    #[prost(uint64, optional, tag = "1")]
+    pub start: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub end: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub cursor: ::core::option::Option<u64>,
+    #[prost(string, optional, tag = "4")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Type 28: read the image annotation identified by this source range through
 /// its document authority. No client-supplied path. Cancellation needs only id.

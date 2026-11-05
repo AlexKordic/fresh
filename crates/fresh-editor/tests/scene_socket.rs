@@ -492,6 +492,44 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(25,"undo")); assert_eq!(text(&ed),original);
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(26,"save"));
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    ed.active_cursors_mut().insert_with_id(fresh::model::event::CursorId(0),fresh::model::cursor::Cursor::with_selection(start as usize,end as usize));
+    ed.active_cursors_mut().remove_secondary();
+    let tail=original.find("Tail").unwrap();
+    let other=ed.active_cursors_mut().add(fresh::model::cursor::Cursor::with_selection(tail,tail+4));
+    let untouched=ed.active_cursors_mut().add(fresh::model::cursor::Cursor::new(original.len()));
+    let captured=ed.active_window().active_state().buffer.version();
+    ed.log_and_apply_event(&fresh::model::event::Event::Insert {position:0,text:"前置 ".into(),cursor_id:untouched});
+    let extra=|range:std::ops::Range<usize>,cursor:fresh::model::event::CursorId,text:Option<&str>|pb::ComposeReplacementTarget {
+        start:Some(range.start as u64),end:Some(range.end as u64),cursor:Some(cursor.0 as u64),text:text.map(str::to_string)};
+    let mut batch=replacement(27,captured,"東京\n_"); batch.replacements=vec![extra(tail..tail+4,other,Some("文"))];
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,batch);
+    let expected=format!("前置 {}",original.replacen("café","東京\r\n_",1).replacen("Tail","文",1));
+    assert_eq!(text(&ed),expected,"both captured ranges rebase, normalize line endings and edit atomically");
+    assert_eq!(ed.active_cursors().count(),3);
+    assert!(ed.active_cursors().get(fresh::model::event::CursorId(0)).unwrap().anchor.is_none());
+    assert!(ed.active_cursors().get(other).unwrap().anchor.is_none());
+    assert_eq!(ed.active_cursors().primary_id(),untouched,"replacements do not change the primary cursor identity");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(28,"undo")); assert_eq!(text(&ed),format!("前置 {original}"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(29,"redo")); assert_eq!(text(&ed),expected);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(30,"undo"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(31,"undo")); assert_eq!(text(&ed),original);
+    let snapshot=|ed:&fresh::app::Editor|ed.active_cursors().iter().map(|(id,c)|(id,c.position,c.anchor)).collect::<Vec<_>>();
+    let before=snapshot(&ed); let revision=ed.active_window().active_state().buffer.version();
+    for (id,target) in [(32,extra(tail..tail+4,fresh::model::event::CursorId(999_999),None)),
+        (33,extra(end as usize-1..end as usize,other,None)),
+        (34,extra(start as usize..end as usize,other,None)),
+        (35,extra(tail..tail+4,fresh::model::event::CursorId(0),None))] {
+        let mut batch=replacement(id,revision,"not written"); batch.replacements=vec![target];
+        assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,batch).input_reply.unwrap().cancelled);
+        assert_eq!(text(&ed),original); assert_eq!(snapshot(&ed),before,"a rejected batch must not move any cursor");
+    }
+    ed.log_and_apply_event(&fresh::model::event::Event::Insert {position:tail+1,text:"X".into(),cursor_id:untouched});
+    let mut batch=replacement(36,revision,"not written"); batch.replacements=vec![extra(tail..tail+4,other,None)];
+    assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,batch).input_reply.unwrap().cancelled);
+    assert_eq!(text(&ed),original.replacen("Tail","TXail",1),"a stale secondary cannot leave an applied primary edit");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(37,"undo")); assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(38,"save"));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
 }
 
 fn rich_image_objects_select_edit_move_delete_and_undo_as_source(root:&std::path::Path,work:&std::path::Path) {

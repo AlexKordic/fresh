@@ -350,6 +350,7 @@ message ComposePane {
   optional bool ready = 18;
   string error = 19;
   ComposeTextContext text_context = 20;
+  repeated ComposeTextChunk text_chunks = 21;
 }
 
 // Raw source near the primary caret, independent of display conceals and
@@ -360,6 +361,14 @@ message ComposeTextContext {
   uint64 utf16_start = 3;
   uint64 selection_start = 4;
   uint64 selection_end = 5;
+}
+
+// Coalesced raw source windows around additional carets. Each byte occurs
+// at most once in this list, independently of the number of carets.
+message ComposeTextChunk {
+  string text = 1;
+  uint64 source_start = 2;
+  uint64 utf16_start = 3;
 }
 
 // kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
@@ -398,6 +407,8 @@ message ComposeSelection {
   optional uint64 anchor = 2;
   uint64 id = 3;
   bool primary = 4;
+  optional uint64 utf16_position = 5;
+  optional uint64 utf16_anchor = 6;
 }
 
 // A revisioned input was applied exactly once, requires a fresh layout,
@@ -739,6 +750,15 @@ message ComposeInput {
   optional uint64 replacement_end = 17;
   bool text_input = 18;
   optional uint64 replacement_cursor = 19;
+  repeated ComposeReplacementTarget replacements = 20;
+}
+// Additional captured carets in the same atomic source transaction. An omitted
+// text uses the primary Paste payload; an explicitly empty text deletes.
+message ComposeReplacementTarget {
+  optional uint64 start = 1;
+  optional uint64 end = 2;
+  optional uint64 cursor = 3;
+  optional string text = 4;
 }
 // Type 28: read the image annotation identified by this source range through
 // its document authority. No client-supplied path. Cancellation needs only id.

@@ -60,6 +60,48 @@ pub(crate) struct Input<'a> {
     pub replacement: Option<Range<usize>>,
     pub replacement_cursor: Option<usize>,
     pub text_input: bool,
+    pub replacements: Vec<TextReplacement>,
+}
+
+pub(crate) struct TextReplacement {
+    pub range: Range<usize>,
+    pub cursor: usize,
+    pub text: Option<String>,
+}
+
+impl TextReplacement {
+    fn parse(bytes: &[u8]) -> Result<Self, super::wire::WireError> {
+        use super::wire::{Reader, WireError};
+        let (mut start, mut end, mut cursor, mut text) = (None, None, None, None);
+        for field in Reader::new(bytes) {
+            let (tag, value) = field?;
+            let slot = match tag {
+                1 => &mut start,
+                2 => &mut end,
+                3 => &mut cursor,
+                4 => {
+                    if text.is_some() {
+                        return Err(WireError::InvalidField("duplicate replacement text"));
+                    }
+                    text = Some(value.text()?.to_owned());
+                    continue;
+                }
+                _ => continue,
+            };
+            if slot.is_some() {
+                return Err(WireError::InvalidField("duplicate replacement target"));
+            }
+            *slot = Some(usize::try_from(value.uint()).map_err(|_| WireError::LongVarint)?);
+        }
+        match (start, end, cursor) {
+            (Some(start), Some(end), Some(cursor)) if start <= end => Ok(Self {
+                range: start..end,
+                cursor,
+                text,
+            }),
+            _ => Err(WireError::InvalidField("replacement target")),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +197,7 @@ impl<'a> Input<'a> {
             replacement: None,
             replacement_cursor: None,
             text_input: false,
+            replacements: Vec::new(),
         };
         let mut start = None;
         let mut end = None;
@@ -199,6 +242,9 @@ impl<'a> Input<'a> {
                             .map_err(|_| super::wire::WireError::LongVarint)?,
                     )
                 }
+                (20, Field::Bytes(bytes)) => {
+                    input.replacements.push(TextReplacement::parse(bytes)?)
+                }
                 _ => {}
             }
         }
@@ -240,6 +286,7 @@ impl<'a> Input<'a> {
         }
         if input.replacement.is_none()
             && (input.replacement_cursor.is_some()
+                || !input.replacements.is_empty()
                 || input.text_input && input.source_revision.is_some())
         {
             return Err(super::wire::WireError::InvalidField("replacement metadata"));
@@ -290,9 +337,6 @@ impl<'a> Input<'a> {
         if revision > state.buffer.version() {
             return Err("The replacement refers to an unavailable file revision.".into());
         }
-        let range = state.coord_map.map_unchanged_range(range, revision).ok_or(
-            "Text was not inserted because its original range changed. Retry your text input.",
-        )?;
         let valid = |p| {
             p <= state.buffer.len()
                 && (p == state.buffer.len()
@@ -302,16 +346,31 @@ impl<'a> Input<'a> {
                         .first()
                         .is_some_and(|b| b & 0xc0 != 0x80))
         };
-        if !valid(range.start) || !valid(range.end) {
-            return Err("The replacement is not at a UTF-8 source boundary.".into());
-        }
         let text = self.text()?;
-        editor.focus_split(scope.leaf, scope.buffer);
-        let cursor = crate::model::event::CursorId(
+        let mut replacements = Vec::with_capacity(self.replacements.len() + 1);
+        for (range, cursor, text) in std::iter::once((
+            range,
             self.replacement_cursor
                 .ok_or("The text replacement has no cursor.")?,
-        );
-        editor.replace_native_text(range, text, cursor)
+            text.clone(),
+        ))
+        .chain(self.replacements.iter().map(|target| {
+            (
+                target.range.clone(),
+                target.cursor,
+                target.text.clone().unwrap_or_else(|| text.clone()),
+            )
+        })) {
+            let range = state.coord_map.map_unchanged_range(range, revision).ok_or(
+                "Text was not inserted because an original range changed. Retry your text input.",
+            )?;
+            if !valid(range.start) || !valid(range.end) {
+                return Err("The replacement is not at a UTF-8 source boundary.".into());
+            }
+            replacements.push((range, text, crate::model::event::CursorId(cursor)));
+        }
+        editor.focus_split(scope.leaf, scope.buffer);
+        editor.replace_native_texts(replacements)
     }
 
     fn text(&self) -> Result<String, String> {
@@ -515,6 +574,8 @@ pub(crate) struct ComposeSelection {
     pub anchor: Option<usize>,
     pub id: usize,
     pub primary: bool,
+    pub utf16_position: Option<usize>,
+    pub utf16_anchor: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -539,6 +600,7 @@ pub(crate) struct ComposePane {
     pub ready: Option<bool>,
     pub error: String,
     pub text_context: Option<super::compose_text::Context>,
+    pub text_chunks: Vec<super::compose_text::Chunk>,
 }
 
 struct Document {
@@ -897,6 +959,8 @@ impl ComposeCache {
                 anchor: c.anchor,
                 id: id.0,
                 primary: id == view.cursors.primary_id(),
+                utf16_position: None,
+                utf16_anchor: None,
             })
             .collect();
         cursors.sort_by_key(|c| c.id);
@@ -1091,7 +1155,7 @@ impl ComposePane {
         p: Projection,
         doc: &Document,
         revision: u64,
-        cursors: Vec<ComposeSelection>,
+        mut cursors: Vec<ComposeSelection>,
         focused: bool,
         top_byte: usize,
         context: &str,
@@ -1145,6 +1209,12 @@ impl ComposePane {
             .collect();
         let projection_revision = hash.finish();
         let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for cursor in &mut cursors {
+            cursor.utf16_position = doc.text_index.utf16_at(&doc.text, cursor.position);
+            cursor.utf16_anchor = cursor
+                .anchor
+                .and_then(|p| doc.text_index.utf16_at(&doc.text, p));
+        }
         cursors.hash(&mut hash);
         context.hash(&mut hash);
         let text_context = cursors
@@ -1154,6 +1224,11 @@ impl ComposePane {
                 doc.text_index
                     .context(&doc.text, cursor.position, cursor.anchor)
             });
+        let text_chunks = doc.text_index.chunks(
+            &doc.text,
+            &cursors.iter().map(|c| c.position).collect::<Vec<_>>(),
+            text_context.as_ref(),
+        );
         Self {
             buffer_revision: revision,
             projection_revision,
@@ -1175,6 +1250,7 @@ impl ComposePane {
             ready: Some(true),
             error: String::new(),
             text_context,
+            text_chunks,
         }
     }
 }
@@ -1182,6 +1258,48 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn additional_replacements_require_complete_unambiguous_captured_targets() {
+        use super::super::wire::field;
+        let target = |fields: &[(u32, u64)], texts: &[&str]| {
+            let mut bytes = Vec::new();
+            for &(tag, value) in fields {
+                field::opt_uint(&mut bytes, tag, Some(value));
+            }
+            for text in texts {
+                field::raw_bytes(&mut bytes, 4, text.as_bytes());
+            }
+            bytes
+        };
+        let complete = [(1, 0), (2, 3), (3, 0)];
+        let bytes = target(&complete, &[""]);
+        let parsed = TextReplacement::parse(&bytes).unwrap();
+        assert_eq!(parsed.range, 0..3);
+        assert_eq!(parsed.cursor, 0);
+        assert_eq!(parsed.text.as_deref(), Some(""));
+        assert!(TextReplacement::parse(&target(&complete, &[]))
+            .unwrap()
+            .text
+            .is_none());
+        for missing in [1, 2, 3] {
+            let fields: Vec<_> = complete
+                .into_iter()
+                .filter(|(tag, _)| *tag != missing)
+                .collect();
+            assert!(TextReplacement::parse(&target(&fields, &[])).is_err());
+        }
+        for duplicate in complete {
+            let mut fields = complete.to_vec();
+            fields.push(duplicate);
+            assert!(TextReplacement::parse(&target(&fields, &[])).is_err());
+        }
+        assert!(TextReplacement::parse(&target(&complete, &["a", "b"])).is_err());
+        assert!(TextReplacement::parse(&target(&[(1, 4), (2, 3), (3, 0)], &[])).is_err());
+        let mut orphan = Vec::new();
+        field::raw_bytes(&mut orphan, 20, &bytes);
+        assert!(Input::parse(&orphan).is_err());
+    }
 
     #[test]
     fn text_input_requires_captured_targets_and_refuses_pointer_geometry() {
