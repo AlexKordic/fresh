@@ -263,6 +263,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_image_source_previews_reveal_nested_and_reference_markup(&root,&work);
     rich_list_markers_are_source_anchors_not_cell_widths(&root,&work);
     rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(&root,&work);
+    rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
 }
@@ -383,6 +384,110 @@ fn rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_
     id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(id,original.len() as u64,false));
     assert!(current(&app).text.ends_with("---"),"an EOF rule reveals at its collapsed source edge");
     apply_step(&mut ed,&json!({"action":"save"}));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+}
+
+fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root:&std::path::Path,work:&std::path::Path) {
+    let original="# Text\r\n\r\n**café** 👩🏽‍💻 end\r\n\r\nTail\r\n";
+    let file=work.join("text-input.md"); std::fs::write(&file,original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 {apply_step(&mut ed,&json!({}));}
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("text-input.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap(); let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let hello=ready_scene(&mut bridge,&mut ed,&mut app);
+    let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let epoch=pane.compose.as_ref().unwrap().viewport.as_ref().unwrap().epoch;
+    let mut scope=pane_scope(hello.window_id.unwrap(),pane);
+    let text=|ed:&fresh::app::Editor|{let b=&ed.active_window().active_state().buffer;String::from_utf8(b.slice_bytes(0..b.len())).unwrap()};
+    let start=original.find("café").unwrap() as u64; let end=start+"café".len() as u64;
+    let replacement=|id,revision,value:&str|pb::ComposeInput {id,kind:20,source_revision:Some(revision),buffer_epoch:epoch,
+        replacement_start:Some(start),replacement_end:Some(end),replacement_cursor:Some(0),payload:pb::Paste {text:value.into()}.encode_to_vec(),..Default::default()};
+    let action=|id,name:&str|pb::ComposeInput {id,kind:21,payload:pb::Action {name:name.into(),..Default::default()}.encode_to_vec(),..Default::default()};
+    let secondary=ed.active_cursors_mut().add(fresh::model::cursor::Cursor::new(original.len()-2));
+    let revision=scope.buffer_revision;
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(1,revision,"東京"));
+    assert_eq!(text(&ed),original.replacen("café","東京",1));
+    assert_eq!(ed.active_cursors().get(secondary).unwrap().position,original.len()-1);
+    assert_eq!(ed.active_cursors().count(),2,"an explicit range does not collapse secondary cursors");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(2,"undo")); assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(3,"redo")); assert_eq!(text(&ed),original.replacen("café","東京",1));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(4,"undo")); assert_eq!(text(&ed),original);
+    ed.active_cursors_mut().insert_with_id(fresh::model::event::CursorId(0),fresh::model::cursor::Cursor::new(0));
+    let captured=scope.buffer_revision;
+    *ed.active_cursors_mut().primary_mut()=fresh::model::cursor::Cursor::new(0);
+    ed.active_cursors_mut().remove_secondary();
+    ed.paste_text("前置 ".into());
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(5,captured,"東京"));
+    assert_eq!(text(&ed),format!("前置 {}",original.replacen("café","東京",1)),"reflow/cursor movement cannot retarget an explicit replacement");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(6,"undo")); assert_eq!(text(&ed),format!("前置 {original}"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(7,"undo")); assert_eq!(text(&ed),original);
+    let captured=scope.buffer_revision;
+    *ed.active_cursors_mut().primary_mut()=fresh::model::cursor::Cursor::with_selection(start as usize,start as usize+1);
+    ed.paste_text("k".into());
+    let changed=text(&ed);
+    let cancelled=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,replacement(8,captured,"東京"));
+    assert!(cancelled.input_reply.unwrap().cancelled); assert_eq!(text(&ed),changed);
+    let retry=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,replacement(8,captured,"wrong"));
+    assert!(retry.input_reply.unwrap().cancelled); assert_eq!(text(&ed),changed);
+    let current=ed.active_window().active_state().buffer.version();
+    let mut invalid=replacement(9,current,""); invalid.replacement_start=Some(end-1); invalid.replacement_end=Some(end-1);
+    assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,invalid).input_reply.unwrap().cancelled,"UTF-8 interiors are not legal replacement boundaries");
+    let current=ed.active_window().active_state().buffer.version();
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(10,current,""));
+    assert_eq!(text(&ed),original.replacen("café","",1),"empty replacement deletes the intended source range");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(11,"undo")); assert_eq!(text(&ed),changed);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(12,"undo")); assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(13,"save"));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    *ed.active_cursors_mut().primary_mut()=fresh::model::cursor::Cursor::new(0);
+    ed.active_cursors_mut().add(fresh::model::cursor::Cursor::new(original.len()));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:14,kind:20,buffer_epoch:epoch,text_input:true,
+        payload:pb::Paste {text:"甲\n乙".into()}.encode_to_vec(),..Default::default()});
+    assert_eq!(text(&ed),format!("甲\r\n乙{original}甲\r\n乙"),"text input never distributes its lines among cursors like a clipboard column paste");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(15,"undo")); assert_eq!(text(&ed),original);
+    let buffer=ed.active_window().active_buffer();
+    ed.active_window_mut().mark_buffer_read_only(buffer,true);
+    let current=ed.active_window().active_state().buffer.version();
+    assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,replacement(16,current,"not written")).input_reply.unwrap().cancelled);
+    assert_eq!(text(&ed),original);
+    let blocked=pb::ComposeInput {id:17,kind:20,buffer_epoch:epoch,text_input:true,
+        payload:pb::Paste {text:"not written".into()}.encode_to_vec(),..Default::default()};
+    assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,blocked).input_reply.unwrap().cancelled);
+    assert_eq!(text(&ed),original);
+    ed.active_window_mut().mark_buffer_read_only(buffer,false);
+    let mut missing=replacement(18,current,"not written"); missing.replacement_cursor=Some(999_999);
+    assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,missing).input_reply.unwrap().cancelled);
+    assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:19,kind:20,
+        payload:pb::Paste {text:"甲\n乙".into()}.encode_to_vec(),..Default::default()});
+    assert_eq!(text(&ed),format!("甲{original}乙"),"ordinary clipboard paste retains its column distribution");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(20,"undo")); assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(21,"save"));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    // A dialog can acquire the keyboard after AppKit captured a document
+    // replacement. The same input waits, then applies once after raw Escape.
+    let revision=scope.buffer_revision;
+    apply_step(&mut ed,&json!({"action":"command_palette"}));
+    let pending=replacement(22,revision,"東京");
+    let waiting=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,pending.clone()).input_reply.unwrap();
+    assert!(waiting.needs_layout && !waiting.accepted && !waiting.cancelled);
+    assert_eq!(text(&ed),original);
+    app.send(17,pb::Key {key:"Escape".into(),..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pending);
+    assert_eq!(text(&ed),original.replacen("café","東京",1));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(23,"undo")); assert_eq!(text(&ed),original);
+    apply_step(&mut ed,&json!({"action":"command_palette"}));
+    let pending=pb::ComposeInput {id:24,kind:20,buffer_epoch:epoch,text_input:true,
+        payload:pb::Paste {text:"東京".into()}.encode_to_vec(),..Default::default()};
+    let waiting=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,pending.clone()).input_reply.unwrap();
+    assert!(waiting.needs_layout && !waiting.accepted && !waiting.cancelled);
+    assert_eq!(text(&ed),original);
+    app.send(17,pb::Key {key:"Escape".into(),..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pending);
+    assert_eq!(text(&ed).matches("東京").count(),2,"literal text waits for its document, then reaches both cursors once");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(25,"undo")); assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(26,"save"));
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
 }
 
@@ -790,7 +895,7 @@ fn rich_accepted(bridge:&mut SceneBridge,ed:&mut fresh::app::Editor,app:&mut App
     for _ in 0..10 {
         let frame=rich_step(bridge,ed,app,scope,input.clone());
         if frame.input_reply.as_ref().is_some_and(|r|r.accepted) { return frame; }
-        if let Some(reply)=frame.input_reply.as_ref().filter(|reply|reply.cancelled) { panic!("input was cancelled: {}",reply.error); }
+        if let Some(reply)=frame.input_reply.as_ref().filter(|reply|reply.cancelled) { panic!("input {} was cancelled: {}",input.id,reply.error); }
     }
     panic!("source input did not settle against the latest decoration revision");
 }

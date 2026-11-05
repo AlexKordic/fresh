@@ -1291,6 +1291,15 @@ impl Editor {
     /// - Atomic undo (single undo step for entire operation)
     /// - Routing to prompt if one is open
     pub fn paste_text(&mut self, paste_text: String) {
+        self.paste_text_with_distribution(paste_text, true);
+    }
+
+    #[cfg(feature = "web")]
+    pub(crate) fn insert_native_text(&mut self, text: String) {
+        self.paste_text_with_distribution(text, false);
+    }
+
+    fn paste_text_with_distribution(&mut self, paste_text: String, clipboard_paste: bool) {
         self.mark_plugin_snapshot_dirty();
         if paste_text.is_empty() {
             return;
@@ -1365,7 +1374,8 @@ impl Editor {
         if lines_for_distribution.len() > 1 && lines_for_distribution.last() == Some(&"") {
             lines_for_distribution.pop();
         }
-        let use_column_paste = cursor_data.len() > 1
+        let use_column_paste = clipboard_paste
+            && cursor_data.len() > 1
             && lines_for_distribution.len() > 1
             && lines_for_distribution.len() == cursor_data.len();
 
@@ -1441,7 +1451,70 @@ impl Editor {
             self.log_and_apply_event(&event);
         }
 
-        self.active_window_mut().status_message = Some(t!("clipboard.pasted").to_string());
+        if clipboard_paste {
+            self.active_window_mut().status_message = Some(t!("clipboard.pasted").to_string());
+        }
+    }
+
+    /// An explicit native input-method range addresses its captured cursor.
+    /// Other cursors retain their identities and follow the edit;
+    /// ordinary text input/paste keeps the existing multi-cursor behavior.
+    #[cfg(feature = "web")]
+    pub(crate) fn replace_native_text(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: String,
+        id: CursorId,
+    ) -> Result<(), String> {
+        if self.active_window().is_editing_disabled() {
+            return Err("The document is read-only; text was not inserted.".into());
+        }
+        if self.active_cursors().get(id).is_none() {
+            return Err("The text replacement cursor is no longer available.".into());
+        }
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = match self.active_state().buffer.line_ending() {
+            crate::model::buffer::LineEnding::LF => text,
+            crate::model::buffer::LineEnding::CRLF => text.replace('\n', "\r\n"),
+            crate::model::buffer::LineEnding::CR => text.replace('\n', "\r"),
+        };
+        let mut events = Vec::new();
+        if !range.is_empty() {
+            let deleted_text = self
+                .active_state_mut()
+                .get_text_range(range.start, range.end);
+            events.push(Event::Delete {
+                range: range.clone(),
+                deleted_text,
+                cursor_id: id,
+            });
+        }
+        if !text.is_empty() {
+            events.push(Event::Insert {
+                position: range.start,
+                text,
+                cursor_id: id,
+            });
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        let cursor = self.active_cursors_mut().get_mut(id).unwrap();
+        *cursor = if range.is_empty() {
+            Cursor::new(range.start)
+        } else {
+            Cursor::with_selection(range.start, range.end)
+        };
+        self.mark_plugin_snapshot_dirty();
+        if events.len() > 1 {
+            let applied = self
+                .apply_events_as_bulk_edit(events, "Text input".into())
+                .ok_or("Text replacement could not be applied.")?;
+            self.active_event_log_mut().append(applied);
+        } else if let Some(event) = events.into_iter().next() {
+            self.log_and_apply_event(&event);
+        }
+        Ok(())
     }
 
     /// Set clipboard content for testing purposes

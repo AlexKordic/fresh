@@ -156,6 +156,40 @@ impl CoordMap {
         self.map_with_gravity(coord, from_version, false)
     }
 
+    /// Rebase an explicit replacement without absorbing intervening edits.
+    /// Insertions at its edges remain outside the range; edits touching its
+    /// contents cancel it. A collapsed insertion follows earlier typing.
+    pub fn map_unchanged_range(
+        &self,
+        range: std::ops::Range<usize>,
+        from_version: u64,
+    ) -> Option<std::ops::Range<usize>> {
+        if range.start > range.end || from_version < self.min_mappable {
+            return None;
+        }
+        let mut range = range;
+        for delta in self.deltas.iter().filter(|d| d.version > from_version) {
+            let end = delta.pos.checked_add(delta.removed)?;
+            if range.is_empty() {
+                if delta.pos < range.start && range.start < end {
+                    return None;
+                }
+                let point =
+                    apply_delta(range.start, delta.pos, delta.removed, delta.inserted, false);
+                range = point..point;
+            } else {
+                if delta.pos < range.end && range.start < end
+                    || delta.inserted > 0 && range.start < delta.pos && delta.pos < range.end
+                {
+                    return None;
+                }
+                range = apply_delta(range.start, delta.pos, delta.removed, delta.inserted, false)
+                    ..apply_delta(range.end, delta.pos, delta.removed, delta.inserted, true);
+            }
+        }
+        Some(range)
+    }
+
     /// Map with the same insertion gravity as a source marker. Viewport
     /// anchors use left gravity so typing at the first visible byte stays in
     /// view, while ordinary plugin coordinates retain right gravity.
@@ -220,6 +254,32 @@ fn apply_delta(coord: usize, pos: usize, removed: usize, inserted: usize, left: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_ranges_keep_boundary_insertions_outside_and_refuse_content_changes() {
+        let mut map = CoordMap::default();
+        map.record_insert(1, 5, 2);
+        assert_eq!(map.map_unchanged_range(5..10, 0), Some(7..12));
+        assert_eq!(map.map_unchanged_range(0..5, 0), Some(0..5));
+        assert_eq!(map.map_unchanged_range(5..5, 0), Some(7..7));
+        assert_eq!(map.map_unchanged_range(4..8, 0), None);
+        map.record_delete(2, 0, 3);
+        assert_eq!(map.map_unchanged_range(5..10, 0), Some(4..9));
+        map.record_replace(3, 5, 1, 1);
+        assert_eq!(map.map_unchanged_range(5..10, 0), None);
+    }
+
+    #[test]
+    fn replacement_ranges_refuse_deleted_carets_opaque_changes_and_evicted_history() {
+        let mut map = CoordMap::new(1);
+        map.record_delete(1, 3, 4);
+        assert_eq!(map.map_unchanged_range(4..4, 0), None);
+        assert_eq!(map.map_unchanged_range(3..3, 0), Some(3..3));
+        map.record_insert(2, 0, 1);
+        assert_eq!(map.map_unchanged_range(10..12, 0), None);
+        map.record_barrier(3);
+        assert_eq!(map.map_unchanged_range(10..12, 2), None);
+    }
 
     #[test]
     fn left_and_right_gravity_match_owned_markers_through_edits() {

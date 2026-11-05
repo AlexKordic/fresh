@@ -1227,6 +1227,10 @@ message ComposeInput {
   optional uint64 source_revision = 13;
   uint64 buffer_epoch = 14;
   bool cancel = 15;
+  optional uint64 replacement_start = 16;
+  optional uint64 replacement_end = 17;
+  bool text_input = 18;
+  optional uint64 replacement_cursor = 19;
 }
 // Type 28: read the image annotation identified by this source range through
 // its document authority. No client-supplied path. Cancellation needs only id.

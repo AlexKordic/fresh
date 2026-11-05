@@ -1219,6 +1219,14 @@ pub struct ComposeInput {
     pub buffer_epoch: u64,
     #[prost(bool, tag = "15")]
     pub cancel: bool,
+    #[prost(uint64, optional, tag = "16")]
+    pub replacement_start: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "17")]
+    pub replacement_end: ::core::option::Option<u64>,
+    #[prost(bool, tag = "18")]
+    pub text_input: bool,
+    #[prost(uint64, optional, tag = "19")]
+    pub replacement_cursor: ::core::option::Option<u64>,
 }
 /// Type 28: read the image annotation identified by this source range through
 /// its document authority. No client-supplied path. Cancellation needs only id.

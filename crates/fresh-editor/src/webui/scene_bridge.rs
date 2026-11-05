@@ -643,6 +643,24 @@ impl SceneClient {
                     out.frame_owed = true;
                     return Ok(());
                 }
+                if input.replacement.is_some() || input.text_input {
+                    if !super::compose::document_keyboard(editor) {
+                        self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                        out.frame_owed = true;
+                        return Ok(());
+                    }
+                    let result = input.replace(editor);
+                    match result {
+                        Ok(()) => {
+                            out.mutated = true;
+                            self.navigation.clear();
+                            self.finish_input(super::compose::InputReply { id: input.id, accepted: true, ..Default::default() });
+                        }
+                        Err(error) => self.cancel_input(input.id, &error),
+                    }
+                    out.frame_owed = true;
+                    return Ok(());
+                }
                 if input.source_revision.is_some() {
                     match input.rebase_pointer(editor, compose) {
                         Ok(()) if input.pointer(editor) => {

@@ -57,6 +57,9 @@ pub(crate) struct Input<'a> {
     pub source_revision: Option<u64>,
     pub buffer_epoch: usize,
     pub cancel: bool,
+    pub replacement: Option<Range<usize>>,
+    pub replacement_cursor: Option<usize>,
+    pub text_input: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -149,7 +152,12 @@ impl<'a> Input<'a> {
             source_revision: None,
             buffer_epoch: 0,
             cancel: false,
+            replacement: None,
+            replacement_cursor: None,
+            text_input: false,
         };
+        let mut start = None;
+        let mut end = None;
         for field in Reader::new(bytes) {
             match field? {
                 (1, value) => input.id = value.uint(),
@@ -172,10 +180,152 @@ impl<'a> Input<'a> {
                         .map_err(|_| super::wire::WireError::LongVarint)?
                 }
                 (15, value) => input.cancel = value.flag(),
+                (16, value) => {
+                    start = Some(
+                        usize::try_from(value.uint())
+                            .map_err(|_| super::wire::WireError::LongVarint)?,
+                    )
+                }
+                (17, value) => {
+                    end = Some(
+                        usize::try_from(value.uint())
+                            .map_err(|_| super::wire::WireError::LongVarint)?,
+                    )
+                }
+                (18, value) => input.text_input = value.flag(),
+                (19, value) => {
+                    input.replacement_cursor = Some(
+                        usize::try_from(value.uint())
+                            .map_err(|_| super::wire::WireError::LongVarint)?,
+                    )
+                }
                 _ => {}
             }
         }
+        if start.is_some() || end.is_some() {
+            let (Some(start), Some(end)) = (start, end) else {
+                return Err(super::wire::WireError::InvalidField("replacement range"));
+            };
+            if start > end
+                || input.position.is_some()
+                || input.kind != super::wire::kind::PASTE
+                || input.scope.is_none()
+                || input.source_revision.is_none()
+                || input.buffer_epoch == 0
+                || input.attachment_start.is_some()
+                || input.extend
+                || input.region.is_some()
+                || input.layout.is_some()
+                || input.layout_id != 0
+            {
+                return Err(super::wire::WireError::InvalidField("replacement input"));
+            }
+            if input.replacement_cursor.is_none() {
+                return Err(super::wire::WireError::InvalidField("replacement cursor"));
+            }
+            input.replacement = Some(start..end);
+        }
+        if input.text_input
+            && (input.kind != super::wire::kind::PASTE
+                || input.scope.is_none()
+                || input.buffer_epoch == 0
+                || input.position.is_some()
+                || input.attachment_start.is_some()
+                || input.extend
+                || input.layout.is_some()
+                || input.layout_id != 0
+                || input.region.is_some())
+        {
+            return Err(super::wire::WireError::InvalidField("text input"));
+        }
+        if input.replacement.is_none()
+            && (input.replacement_cursor.is_some()
+                || input.text_input && input.source_revision.is_some())
+        {
+            return Err(super::wire::WireError::InvalidField("replacement metadata"));
+        }
         Ok(input)
+    }
+
+    pub fn replace(&self, editor: &mut Editor) -> Result<(), String> {
+        let scope = self
+            .scope
+            .ok_or("The text replacement has no editor view.")?;
+        if !(InputTarget {
+            id: self.id,
+            scope,
+            epoch: self.buffer_epoch,
+            pointer: false,
+        })
+        .valid(editor)
+        {
+            return Err(
+                "The text input view was closed or replaced; text was not inserted.".into(),
+            );
+        }
+        if self.replacement.is_none() {
+            if !document_keyboard(editor) {
+                return Err(
+                    "Text was not inserted because an editor dialog has the keyboard.".into(),
+                );
+            }
+            editor.focus_split(scope.leaf, scope.buffer);
+            if editor.active_window().is_editing_disabled() {
+                return Err("The document is read-only; text was not inserted.".into());
+            }
+            editor.insert_native_text(self.text()?);
+            return Ok(());
+        }
+        let range = self.replacement.clone().unwrap();
+        let revision = self
+            .source_revision
+            .ok_or("The text replacement has no source revision.")?;
+        if !document_keyboard(editor) {
+            return Err("Text was not inserted because an editor dialog has the keyboard. Retry your text input.".into());
+        }
+        let state = editor
+            .active_window()
+            .buffer_state(scope.buffer)
+            .ok_or("The replaced file is no longer available.")?;
+        if revision > state.buffer.version() {
+            return Err("The replacement refers to an unavailable file revision.".into());
+        }
+        let range = state.coord_map.map_unchanged_range(range, revision).ok_or(
+            "Text was not inserted because its original range changed. Retry your text input.",
+        )?;
+        let valid = |p| {
+            p <= state.buffer.len()
+                && (p == state.buffer.len()
+                    || state
+                        .buffer
+                        .slice_bytes(p..p + 1)
+                        .first()
+                        .is_some_and(|b| b & 0xc0 != 0x80))
+        };
+        if !valid(range.start) || !valid(range.end) {
+            return Err("The replacement is not at a UTF-8 source boundary.".into());
+        }
+        let text = self.text()?;
+        editor.focus_split(scope.leaf, scope.buffer);
+        let cursor = crate::model::event::CursorId(
+            self.replacement_cursor
+                .ok_or("The text replacement has no cursor.")?,
+        );
+        editor.replace_native_text(range, text, cursor)
+    }
+
+    fn text(&self) -> Result<String, String> {
+        let mut text = None;
+        for field in super::wire::Reader::new(self.payload) {
+            let (tag, value) = field.map_err(|e| e.to_string())?;
+            if tag == 1 {
+                if text.is_some() {
+                    return Err("Text replacement has duplicate text.".into());
+                }
+                text = Some(value.text().map_err(|e| e.to_string())?.to_owned());
+            }
+        }
+        Ok(text.unwrap_or_default())
     }
 
     /// A graphical click addresses the source seen when it happened. Scrolling
@@ -1021,6 +1171,61 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_input_requires_captured_targets_and_refuses_pointer_geometry() {
+        use super::super::wire::field;
+        let encode = |fields: &[(u32, u64)], scope: bool| {
+            let mut bytes = Vec::new();
+            if scope {
+                field::raw_bytes(&mut bytes, 2, &[]);
+            }
+            for &(tag, value) in fields {
+                field::opt_uint(&mut bytes, tag, Some(value));
+            }
+            bytes
+        };
+        let replacement = [(3, 20), (13, 0), (14, 1), (16, 0), (17, 3), (19, 0)];
+        let bytes = encode(&replacement, true);
+        let parsed = Input::parse(&bytes).unwrap();
+        assert_eq!(parsed.replacement, Some(0..3));
+        assert_eq!(parsed.replacement_cursor, Some(0));
+        assert_eq!(
+            parsed.text().unwrap(),
+            "",
+            "an omitted proto3 string deletes its range"
+        );
+        assert!(Input::parse(&encode(&replacement, false)).is_err());
+        for missing in [3, 13, 14, 16, 17, 19] {
+            let fields: Vec<_> = replacement
+                .into_iter()
+                .filter(|(tag, _)| *tag != missing)
+                .collect();
+            assert!(
+                Input::parse(&encode(&fields, true)).is_err(),
+                "missing field {missing}"
+            );
+        }
+        for bad in [(3, 17), (5, 0), (6, 1), (9, 7), (11, 0), (12, 0), (16, 4)] {
+            let mut fields = replacement.to_vec();
+            fields.push(bad);
+            assert!(
+                Input::parse(&encode(&fields, true)).is_err(),
+                "mixed replacement field {bad:?}"
+            );
+        }
+        let literal = [(3, 20), (14, 1), (18, 1)];
+        assert!(Input::parse(&encode(&literal, true)).is_ok());
+        assert!(Input::parse(&encode(&literal, false)).is_err());
+        for bad in [(3, 17), (5, 0), (9, 1), (11, 0), (13, 0), (19, 0)] {
+            let mut fields = literal.to_vec();
+            fields.push(bad);
+            assert!(
+                Input::parse(&encode(&fields, true)).is_err(),
+                "mixed literal field {bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn native_ornaments_preserve_grid_decorations_joins_and_exact_source_reveal() {
