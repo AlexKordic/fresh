@@ -7,7 +7,7 @@
 use crate::app::Editor;
 use crate::model::event::{BufferId, LeafId};
 use crate::state::ViewMode;
-use fresh_core::compose::{Projection, SegmentKind};
+use fresh_core::compose::{Conceal, Projection, SegmentKind};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -337,7 +337,7 @@ pub(crate) struct ComposeSpan {
     pub start: usize,
     pub end: usize,
     /// 0 body; 1..6 heading; 7 inline code; 8 table; 9 quote;
-    /// 10 list; 11 paragraph; 12 code block; 13 list item.
+    /// 10 list; 11 paragraph; 12 code block; 13 list item; 14 thematic rule.
     pub role: u32,
     /// Bold 1, italic 2, underline 4, strikethrough 8, link 16.
     pub flags: u32,
@@ -397,6 +397,7 @@ struct Document {
     spans: Vec<ComposeSpan>,
     images: Vec<ComposeImage>,
     paragraphs: Vec<Range<usize>>,
+    underlines: Vec<(Range<usize>, Range<usize>)>,
     used: u64,
 }
 
@@ -406,6 +407,7 @@ impl Document {
         let mut images = Vec::new();
         let mut image_stack: Vec<ComposeImage> = Vec::new();
         let mut paragraphs = Vec::new();
+        let mut underlines = Vec::new();
         let mut items: Vec<(usize, usize)> = Vec::new();
         for (event, range) in Parser::new_ext(&text, Options::all()).into_offset_iter() {
             // Use the parser's item ownership and inline ranges. Tight lists
@@ -441,7 +443,14 @@ impl Document {
             let mut role = 0;
             let mut flags = 0;
             match event {
-                Event::Start(Tag::Heading { level, .. }) => role = level as u32,
+                Event::Start(Tag::Heading { level, .. }) => {
+                    role = level as u32;
+                    if let Some(underline) = heading_underline(&text, &range) {
+                        let line_start = text[..range.start].rfind('\n').map_or(0, |n| n + 1);
+                        underlines.push((line_start..range.end, underline));
+                    }
+                }
+                Event::Rule => role = 14,
                 Event::Start(Tag::CodeBlock(_)) => role = 12,
                 Event::Code(text) => {
                     role = 7;
@@ -496,7 +505,11 @@ impl Document {
             if role != 0 || flags != 0 {
                 spans.push(ComposeSpan {
                     start: range.start,
-                    end: range.end,
+                    end: if role == 14 {
+                        range.start + text[range.clone()].trim_end_matches(['\r', '\n']).len()
+                    } else {
+                        range.end
+                    },
                     role,
                     flags,
                     content_start: None,
@@ -516,9 +529,177 @@ impl Document {
             spans,
             images,
             paragraphs,
+            underlines,
             used,
         }
     }
+
+    /// Native-only overrides are resolved from parsed block ownership and
+    /// active grid conceals. In particular, leave quote join conceals whole:
+    /// removing a marker inside a join would accidentally unflow the prose.
+    fn native_projection(
+        &self,
+        state: &crate::state::EditorState,
+        start: usize,
+        end: usize,
+        cursors: &[usize],
+        objects: &[Range<usize>],
+        revealed: &[Range<usize>],
+    ) -> Option<Projection> {
+        let mut overrides: Vec<_> = objects
+            .iter()
+            .cloned()
+            .map(|source| Conceal {
+                source,
+                replacement: Some("\u{fffc}"),
+            })
+            .collect();
+        let mut revealed = revealed.to_vec();
+        let active = state
+            .conceals
+            .query_viewport(start, end, &state.marker_list, cursors);
+        for (heading, underline) in &self.underlines {
+            if underline.start < start || underline.end > end {
+                continue;
+            }
+            if cursors.iter().any(|p| {
+                heading.contains(p) || (*p == heading.end && heading.end == self.text.len())
+            }) {
+                revealed.push(underline.clone());
+            } else {
+                overrides.push(Conceal {
+                    source: underline.clone(),
+                    replacement: None,
+                });
+            }
+        }
+        for rule in self
+            .spans
+            .iter()
+            .filter(|s| s.role == 14 && s.start >= start && s.end <= end)
+        {
+            let line_start = self.text[..rule.start].rfind('\n').map_or(0, |n| n + 1);
+            let line_end = self.text[rule.end..]
+                .find('\n')
+                .map_or(self.text.len(), |n| rule.end + n + 1);
+            let source = rule.start..rule.end;
+            // A grid flow join can swallow a quoted rule's line break. The
+            // parsed block must still have its own native line, including
+            // while its markup is revealed. Preserve the original EOL bytes.
+            for (join, replacement) in &active {
+                if overrides
+                    .iter()
+                    .any(|c| c.source.start < join.end && join.start < c.source.end)
+                {
+                    continue;
+                }
+                if *replacement == Some(" ") && join.end == rule.start && join.start < line_start {
+                    let raw = &self.text[join.clone()];
+                    if let Some(n) = raw.find('\n') {
+                        let from = if n > 0 && raw.as_bytes()[n - 1] == b'\r' {
+                            n - 1
+                        } else {
+                            n
+                        };
+                        overrides.push(Conceal {
+                            source: join.clone(),
+                            replacement: Some(&raw[from..n + 1]),
+                        });
+                    }
+                }
+            }
+            if cursors.iter().any(|p| {
+                (line_start..line_end).contains(p)
+                    || (*p == line_end && line_end == self.text.len())
+            }) {
+                revealed.push(source);
+            } else {
+                overrides.push(Conceal {
+                    source,
+                    replacement: None,
+                });
+            }
+        }
+        for (range, replacement) in active {
+            if replacement != Some("▌")
+                || self.text.get(range.clone()) != Some(">")
+                || !self
+                    .spans
+                    .iter()
+                    .any(|s| s.role == 9 && s.start <= range.start && range.end <= s.end)
+            {
+                continue;
+            }
+            let code = self
+                .spans
+                .iter()
+                .any(|s| [7, 12].contains(&s.role) && s.start <= range.start && range.end <= s.end);
+            let to =
+                if !code && self.text.as_bytes().get(range.end) == Some(&b' ') && range.end < end {
+                    range.end + 1
+                } else {
+                    range.end
+                };
+            let source = range.start..to;
+            if overrides
+                .iter()
+                .any(|c| c.source.start < source.end && source.start < c.source.end)
+                || revealed
+                    .iter()
+                    .any(|r| r.start < source.end && source.start < r.end)
+            {
+                continue;
+            }
+            if code {
+                revealed.push(source);
+            } else {
+                overrides.push(Conceal {
+                    source,
+                    replacement: None,
+                });
+            }
+        }
+        state
+            .conceals
+            .project_text_with_overrides(
+                &self.text[start..end],
+                start,
+                &state.marker_list,
+                cursors,
+                &overrides,
+                &revealed,
+            )
+            .ok()
+    }
+}
+
+/// The Markdown parser has already classified a heading. Its final source
+/// line is a setext underline only when it is a separate delimiter line;
+/// quoted/list headings can have container whitespace and `>` before it.
+fn heading_underline(text: &str, heading: &Range<usize>) -> Option<Range<usize>> {
+    let body = text[heading.clone()].trim_end_matches(['\r', '\n']);
+    let end = heading.start + body.len();
+    let start = text[..end].rfind('\n')? + 1;
+    if start <= heading.start {
+        return None;
+    }
+    let line = text[start..end].trim_end();
+    let delimiter = line.as_bytes().last().copied()?;
+    if ![b'=', b'-'].contains(&delimiter) {
+        return None;
+    }
+    let marker = line
+        .as_bytes()
+        .iter()
+        .rposition(|b| *b != delimiter)
+        .map_or(0, |p| p + 1);
+    if !line[..marker]
+        .bytes()
+        .all(|b| [b' ', b'\t', b'>'].contains(&b))
+    {
+        return None;
+    }
+    Some(start..heading.end)
 }
 
 /// Bounded per-bridge semantic cache; only composing buffers enter it. Parsing
@@ -727,17 +908,7 @@ impl ComposeCache {
             .collect();
         let status = status(start, end);
         let projection = if status == Status::Ready {
-            state
-                .conceals
-                .project_text_with_revealed_objects(
-                    raw,
-                    start,
-                    &state.marker_list,
-                    &cursor_positions,
-                    &objects,
-                    &revealed,
-                )
-                .ok()?
+            doc.native_projection(state, start, end, &cursor_positions, &objects, &revealed)?
         } else {
             // Never publish a partially applied replacement/conceal map.
             Projection::new(raw, start, &[]).ok()?
@@ -850,6 +1021,128 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_ornaments_preserve_grid_decorations_joins_and_exact_source_reveal() {
+        let text = "Title\r\n-----\r\n\r\n> first\r\n> continued\r\n\r\n***\r\n";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        assert_eq!(doc.underlines.len(), 1);
+        assert_eq!(doc.spans.iter().filter(|s| s.role == 14).count(), 1);
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(text.len());
+        let ns = crate::view::overlay::OverlayNamespace::from_string("md-syntax".into());
+        let underline = doc.underlines[0].1.clone();
+        state.conceals.add(
+            &mut state.marker_list,
+            ns.clone(),
+            underline.start..underline.end - 2,
+            Some("─".repeat(78)),
+        );
+        let quote = text.find('>').unwrap();
+        state.conceals.add(
+            &mut state.marker_list,
+            ns.clone(),
+            quote..quote + 1,
+            Some("▌".into()),
+        );
+        let join = text.find("first").unwrap() + 5..text.find("continued").unwrap();
+        state
+            .conceals
+            .add(&mut state.marker_list, ns.clone(), join, Some(" ".into()));
+        let rule = text.find("***").unwrap();
+        state.conceals.add(
+            &mut state.marker_list,
+            ns,
+            rule..rule + 3,
+            Some("─".repeat(78)),
+        );
+        let native = doc
+            .native_projection(&state, 0, text.len(), &[], &[], &[])
+            .unwrap();
+        assert!(native.text.starts_with("Title\r\n\r\n"));
+        assert!(
+            native.text.contains("first continued"),
+            "quote joins must not be dropped while removing a rail"
+        );
+        assert!(!native.text.contains(['─', '▌', '>']));
+        let editing = doc
+            .native_projection(&state, 0, text.len(), &[1], &[], &[])
+            .unwrap();
+        assert!(
+            editing.text.contains("-----\r\n"),
+            "heading source is revealed rather than a terminal ruler"
+        );
+        let grid = state
+            .conceals
+            .project_text(text, 0, &state.marker_list, &[])
+            .unwrap();
+        assert!(grid.text.contains('─') && grid.text.contains('▌'));
+        assert_eq!(doc.text, text);
+    }
+
+    #[test]
+    fn native_heading_delimiters_come_from_parsed_headings_and_rules_reveal_at_eof() {
+        let text="## Not setext -\r\n\r\n> Quoted\r\n> ======\r\n\r\n- Listed\r\n  ------\r\n\r\n```md\r\nFake\r\n----\r\n```\r\n\r\n---";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        assert_eq!(
+            doc.underlines.len(),
+            2,
+            "code and ATX headings have no setext delimiter"
+        );
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(text.len());
+        let reading = doc
+            .native_projection(&state, 0, text.len(), &[], &[], &[])
+            .unwrap();
+        assert!(reading.text.contains("Fake\r\n----\r\n"));
+        assert!(!reading.text.ends_with("---"));
+        let editing = doc
+            .native_projection(&state, 0, text.len(), &[text.len()], &[], &[])
+            .unwrap();
+        assert!(
+            editing.text.ends_with("---"),
+            "an EOF rule can be entered at its collapsed source end"
+        );
+    }
+
+    #[test]
+    fn a_quoted_rule_keeps_its_own_line_even_with_duplicate_grid_joins() {
+        let text = "> `─ ▌ > literal`\r\n> ***\r\n";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(text.len());
+        let join = text.find('\r').unwrap()..text.find("***").unwrap();
+        for name in ["first", "duplicate"] {
+            state.conceals.add(
+                &mut state.marker_list,
+                crate::view::overlay::OverlayNamespace::from_string(name.into()),
+                join.clone(),
+                Some(" ".into()),
+            );
+        }
+        let native = doc
+            .native_projection(&state, 0, text.len(), &[], &[], &[])
+            .unwrap();
+        assert!(
+            native.text.contains("`─ ▌ > literal`\r\n\r\n"),
+            "literal glyphs survive while the joined rule receives its own line"
+        );
+    }
 
     #[test]
     fn captured_pointer_refuses_opaque_edits_and_replaced_marker_owners() {

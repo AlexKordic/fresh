@@ -262,6 +262,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_image_objects_select_edit_move_delete_and_undo_as_source(&root,&work);
     rich_image_source_previews_reveal_nested_and_reference_markup(&root,&work);
     rich_list_markers_are_source_anchors_not_cell_widths(&root,&work);
+    rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
 }
@@ -330,6 +331,57 @@ fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,wo
         payload:pb::Action {name:"undo".into(),..Default::default()}.encode_to_vec(),..Default::default()});
     let current=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
     assert_eq!(current.spans.iter().find(|s|s.role==13).unwrap().content_start,Some(body));
+    apply_step(&mut ed,&json!({"action":"save"}));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+}
+
+fn rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(root:&std::path::Path,work:&std::path::Path) {
+    let original="# Native ornaments\r\n\r\nSetext title\r\n--------------\r\n\r\n> Quoted proportional words that wrap across the available measure without a repeated terminal bar.\r\n> A joined continuation that stays in the same paragraph.\r\n>\r\n> > Nested quote words that also wrap across the measure and retain their own source positions.\r\n>\r\n> `> literal code`\r\n>\r\n> ***\r\n\r\n***\r\n\r\n---";
+    let file=work.join("ornaments.md"); std::fs::write(&file,original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 {apply_step(&mut ed,&json!({}));}
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("ornaments.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap(); let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let hello=ready_scene(&mut bridge,&mut ed,&mut app);
+    let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let compose=pane.compose.as_ref().unwrap();
+    assert!(!compose.text.contains(['─','▌']));
+    assert!(!compose.text.contains("--------------"));
+    assert!(compose.text.contains("> literal code"),"literal code is not a quote marker");
+    assert_eq!(compose.spans.iter().filter(|s|s.role==14).count(),3);
+    assert!(compose.text.contains("bar. A joined continuation"),"native quote bars cannot unflow joined source lines");
+    let state=ed.active_window().active_state();
+    let grid=state.conceals.project_text(original,0,&state.marker_list,&[]).unwrap();
+    assert!(grid.text.contains('▌') && grid.text.contains('─'),"terminal decorations are still present on the same buffer");
+    if let Some(path)=std::env::var_os("FC_COMPOSE_ORNAMENT_SCENE_FILE") {
+        let mut fixture=compose.clone(); fixture.asset_authority=1; fixture.asset_document=1;
+        std::fs::write(path,fixture.encode_to_vec()).unwrap();
+    }
+    let mut scope=pane_scope(hello.window_id.unwrap(),pane); let mut id=0;
+    let at=|id,position,extend|pb::ComposeInput {id,position:Some(position),extend,..Default::default()};
+    let current=|app:&App|app.panes.iter().find_map(|p|p.compose.clone()).unwrap();
+    for position in [original.find("Setext").unwrap()+2,original.find("--------------").unwrap()+2] {
+        id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(id,position as u64,false));
+        assert!(current(&app).text.contains("--------------\r\n"),"title and underline edits reveal exact source");
+    }
+    id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(id,original.find("Quoted").unwrap() as u64,false));
+    assert!(current(&app).text.contains("> Quoted"));
+    let rule=original.rfind("***").unwrap() as u64;
+    id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(id,rule+1,false));
+    assert!(current(&app).text.contains("***"));
+    id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,kind:17,
+        payload:pb::Key {key:"Delete".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    assert_eq!(current(&app).spans.iter().filter(|s|s.role==14).count(),2);
+    id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,kind:21,
+        payload:pb::Action {name:"undo".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(id,rule,false));
+    id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(id,rule+3,true));
+    id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,kind:21,
+        payload:pb::Action {name:"copy".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    assert_eq!(ed.clipboard_text(),"***");
+    id+=1; rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(id,original.len() as u64,false));
+    assert!(current(&app).text.ends_with("---"),"an EOF rule reveals at its collapsed source edge");
     apply_step(&mut ed,&json!({"action":"save"}));
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
 }

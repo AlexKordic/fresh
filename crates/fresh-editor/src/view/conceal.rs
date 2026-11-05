@@ -344,6 +344,35 @@ impl ConcealManager {
         objects: &[Range<usize>],
         revealed: &[Range<usize>],
     ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
+        let objects: Vec<_> = objects
+            .iter()
+            .cloned()
+            .map(|source| fresh_core::compose::Conceal {
+                source,
+                replacement: Some("\u{fffc}"),
+            })
+            .collect();
+        self.project_text_with_overrides(
+            source,
+            source_start,
+            marker_list,
+            cursors,
+            &objects,
+            revealed,
+        )
+    }
+
+    /// Native ornaments and objects replace whole crossing grid decorations.
+    /// Revealed source wins by the caller's choice of disjoint overrides.
+    pub fn project_text_with_overrides(
+        &self,
+        source: &str,
+        source_start: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+        overrides: &[fresh_core::compose::Conceal<'_>],
+        revealed: &[Range<usize>],
+    ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
         use fresh_core::compose::{Conceal, Projection, ProjectionError};
         let source_end = source_start
             .checked_add(source.len())
@@ -353,8 +382,9 @@ impl ConcealManager {
         let mut conceals: Vec<_> = ranges
             .into_iter()
             .filter(|(range, _)| {
-                !objects
+                !overrides
                     .iter()
+                    .map(|c| &c.source)
                     .chain(revealed)
                     .any(|object| range.start < object.end && range.end > object.start)
             })
@@ -376,10 +406,7 @@ impl ConcealManager {
                 replacement,
             })
             .collect();
-        conceals.extend(objects.iter().cloned().map(|source| Conceal {
-            source,
-            replacement: Some("\u{fffc}"),
-        }));
+        conceals.extend(overrides.iter().cloned());
         Projection::new(source, source_start, &conceals)
     }
 
