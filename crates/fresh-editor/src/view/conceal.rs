@@ -294,6 +294,32 @@ impl ConcealManager {
         self.query_viewport_excluding(start, end, marker_list, None, cursors)
     }
 
+    /// The same activated conceals as the grid, with a complete source map
+    /// for a graphical Compose view. The caller supplies a complete source
+    /// slice: replacements spanning its edges are refused, never clipped into
+    /// misleading partial attachments. This performs no I/O or Markdown parse.
+    pub fn project_text(
+        &self,
+        source: &str,
+        source_start: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+    ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
+        use fresh_core::compose::{Conceal, Projection, ProjectionError};
+        let source_end = source_start
+            .checked_add(source.len())
+            .ok_or(ProjectionError::CoordinateOverflow)?;
+        let ranges = self.query_viewport(source_start, source_end, marker_list, cursors);
+        let conceals: Vec<_> = ranges
+            .into_iter()
+            .map(|(source, replacement)| Conceal {
+                source,
+                replacement,
+            })
+            .collect();
+        Projection::new(source, source_start, &conceals)
+    }
+
     /// Earliest conceal in `start..end` whose cursor-dependent activation
     /// currently differs from the canonical (cursor-less) evaluation.
     ///
@@ -442,6 +468,61 @@ impl Default for ConcealManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rich_projection_uses_the_same_cursor_reveal_rules_without_marker_churn() {
+        use fresh_core::compose::Affinity;
+        let source = "# Héllo\r\n\r\nbody";
+        let mut markers = MarkerList::new();
+        markers.set_buffer_size(source.len());
+        let mut manager = ConcealManager::new();
+        manager.add_with_activation(
+            &mut markers,
+            ns(),
+            0..2,
+            None,
+            Some(MarkerActivation {
+                if_cursor_in: false,
+                scope_start: 0,
+                scope_end: 9,
+            }),
+        );
+        let version = manager.version();
+        let rendered = manager.project_text(source, 0, &markers, &[12]).unwrap();
+        assert_eq!(rendered.text, "Héllo\r\n\r\nbody");
+        assert_eq!(rendered.source_position(0, Affinity::Downstream), Some(2));
+        let editing = manager.project_text(source, 0, &markers, &[5]).unwrap();
+        assert_eq!(editing.text, source);
+        assert_eq!(editing.source_position(5, Affinity::Downstream), Some(5));
+        assert_eq!(
+            manager.version(),
+            version,
+            "Moving a caret must not rebuild the decorations"
+        );
+    }
+
+    #[test]
+    fn rich_projection_tracks_source_edits_through_the_existing_markers() {
+        use fresh_core::compose::Affinity;
+        let mut markers = MarkerList::new();
+        markers.set_buffer_size(9);
+        let mut manager = ConcealManager::new();
+        manager.add(&mut markers, ns(), 3..5, None);
+        assert_eq!(
+            manager
+                .project_text("a  **word", 0, &markers, &[])
+                .unwrap()
+                .text,
+            "a  word"
+        );
+        // The native presentation does not maintain a second decoration map.
+        markers.adjust_for_insert(0, 2);
+        let p = manager
+            .project_text("éa  **word", 0, &markers, &[])
+            .unwrap();
+        assert_eq!(p.text, "éa  word");
+        assert_eq!(p.source_position(5, Affinity::Downstream), Some(7));
+    }
 
     fn ns() -> OverlayNamespace {
         OverlayNamespace::from_string("test".to_string())
