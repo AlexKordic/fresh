@@ -618,6 +618,8 @@ pub struct ComposeImage {
     pub block: bool,
     #[prost(bool, tag = "7")]
     pub rendered: bool,
+    #[prost(bool, tag = "8")]
+    pub source_preview: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeSelection {

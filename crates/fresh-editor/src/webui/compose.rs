@@ -352,6 +352,8 @@ pub(crate) struct ComposeImage {
     pub title: String,
     pub block: bool,
     pub rendered: bool,
+    /// The exact markup is editable text, with a separate flow preview.
+    pub source_preview: bool,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -438,6 +440,7 @@ impl Document {
                         alt: String::new(),
                         block: before.trim().is_empty() && after.trim().is_empty(),
                         rendered: false,
+                        source_preview: false,
                     });
                 }
                 Event::Text(text) => {
@@ -669,16 +672,29 @@ impl ComposeCache {
             })
             .map(|image| image.start..image.end)
             .collect();
+        let revealed: Vec<_> = doc
+            .images
+            .iter()
+            .filter(|image| {
+                image.start >= start
+                    && image.end <= end
+                    && cursor_positions
+                        .iter()
+                        .any(|&position| position > image.start && position < image.end)
+            })
+            .map(|image| image.start..image.end)
+            .collect();
         let status = status(start, end);
         let projection = if status == Status::Ready {
             state
                 .conceals
-                .project_text_with_objects(
+                .project_text_with_revealed_objects(
                     raw,
                     start,
                     &state.marker_list,
                     &cursor_positions,
                     &objects,
+                    &revealed,
                 )
                 .ok()?
         } else {
@@ -695,6 +711,7 @@ impl ComposeCache {
         if status != Status::Ready {
             for image in &mut pane.images {
                 image.rendered = false;
+                image.source_preview = false;
             }
         }
         if status == Status::Failed {
@@ -729,6 +746,7 @@ impl ComposePane {
                 image.rendered = !cursors
                     .iter()
                     .any(|cursor| cursor.position > image.start && cursor.position < image.end);
+                image.source_preview = !image.rendered;
                 image
             })
             .collect();

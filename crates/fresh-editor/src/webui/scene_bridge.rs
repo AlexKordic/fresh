@@ -691,7 +691,7 @@ impl SceneClient {
                     }
                     if input.position.is_some() {
                         if let Some(start) = input.attachment_start {
-                            if input.extend || !snapshot.as_ref().is_some_and(|pane| pane.images.iter().any(|image| image.rendered && image.start == start && Some(image.end) == input.position)) {
+                            if input.extend || !snapshot.as_ref().is_some_and(|pane| pane.images.iter().any(|image| (image.rendered || image.source_preview) && image.start == start && Some(image.end) == input.position)) {
                                 return Err("image selection does not match its source annotation".into());
                             }
                         }

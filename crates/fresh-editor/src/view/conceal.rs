@@ -321,6 +321,29 @@ impl ConcealManager {
         cursors: &[usize],
         objects: &[Range<usize>],
     ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
+        self.project_text_with_revealed_objects(
+            source,
+            source_start,
+            marker_list,
+            cursors,
+            objects,
+            &[],
+        )
+    }
+
+    /// A graphical object's source editor reveals its entire markup, including
+    /// nested emphasis or a crossing table-cell replacement. Drop a crossing
+    /// decoration whole, just as for rendered objects; never invent fragments
+    /// of replacement text. Revealed objects remain ordinary copied source.
+    pub fn project_text_with_revealed_objects(
+        &self,
+        source: &str,
+        source_start: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+        objects: &[Range<usize>],
+        revealed: &[Range<usize>],
+    ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
         use fresh_core::compose::{Conceal, Projection, ProjectionError};
         let source_end = source_start
             .checked_add(source.len())
@@ -332,6 +355,7 @@ impl ConcealManager {
             .filter(|(range, _)| {
                 !objects
                     .iter()
+                    .chain(revealed)
                     .any(|object| range.start < object.end && range.end > object.start)
             })
             // The grid consumes ranges in source order. A containing range
@@ -507,6 +531,42 @@ impl Default for ConcealManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_graphical_object_reveals_nested_markup_and_crossing_replacements() {
+        let source = "| ![**café**](a.png) | **other** |\r\n";
+        let start = source.find('!').unwrap();
+        let end = source.find(')').unwrap() + 1;
+        let mut markers = MarkerList::new();
+        markers.set_buffer_size(source.len());
+        let mut manager = ConcealManager::new();
+        manager.add(&mut markers, ns(), 0..end + 2, Some("padded cell".into()));
+        let bold = source.find("**").unwrap();
+        manager.add(&mut markers, ns(), bold..bold + 2, None);
+        let projected = manager
+            .project_text_with_revealed_objects(
+                source,
+                0,
+                &markers,
+                &[start + 2],
+                &[],
+                &[start..end],
+            )
+            .unwrap();
+        assert_eq!(
+            projected.text, source,
+            "a preview contributes no source text"
+        );
+        assert!(projected
+            .segments
+            .iter()
+            .all(|s| s.kind == fresh_core::compose::SegmentKind::Copy));
+        assert_eq!(
+            manager.project_text(source, 0, &markers, &[]).unwrap().text,
+            format!("padded cell{}", &source[end + 2..]),
+            "terminal conceals remain unchanged"
+        );
+    }
 
     #[test]
     fn graphical_objects_replace_crossing_cell_decorations_without_losing_source() {

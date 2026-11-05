@@ -94,7 +94,7 @@ impl App {
             if let Some(pane)=&update.pane {
                 if let Some(compose) = pane.compose.as_ref().filter(|c|c.ready == Some(false)) {
                     assert!(compose.segments.iter().all(|s|s.kind == 0), "pending formatting cannot expose partial conceal/replacement maps");
-                    assert!(compose.images.iter().all(|image|!image.rendered));
+                    assert!(compose.images.iter().all(|image|!image.rendered && !image.source_preview));
                     assert_eq!(compose.source_end-compose.source_start, compose.text.len() as u64);
                 }
                 let index=update.index as usize;
@@ -152,6 +152,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
         home.join(".config/fresh/config.json"),
         json!({
             "check_for_updates": false,
+            "clipboard": {"use_osc52": false, "use_system_clipboard": false},
             "plugins": {
                 "orchestrator": {"enabled": true, "settings": {"autoOpenDock": "never"}},
                 "welcome_screen": {"enabled": true, "settings": {"showOnStartup": false}}
@@ -259,6 +260,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_input_intents_rebase_and_cancel_when_the_view_changes(&root, &work);
     rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(&root,&work);
     rich_image_objects_select_edit_move_delete_and_undo_as_source(&root,&work);
+    rich_image_source_previews_reveal_nested_and_reference_markup(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
 }
@@ -330,6 +332,8 @@ fn rich_image_objects_select_edit_move_delete_and_undo_as_source(root:&std::path
     assert_eq!(ed.active_window().active_cursors().primary().position,image.start as usize+2);
     let source=edited.panes.iter().find_map(|u|u.pane.as_ref().and_then(|p|p.compose.as_ref())).unwrap();
     assert!(!source.images[0].rendered,"double-click reveals the exact markup for source editing");
+    assert!(source.images[0].source_preview,"source editing retains a separate preview");
+    assert!(source.text.contains("![inline](x.png)"));
     let at=|id,position|pb::ComposeInput {id,position:Some(position),..Default::default()};
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(5,image.start));
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,key(6,"ArrowRight",false));
@@ -346,6 +350,78 @@ fn rich_image_objects_select_edit_move_delete_and_undo_as_source(root:&std::path
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(14,"undo")); assert_eq!(text(&ed),original);
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(15,"save"));
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes(),"native object editing and undo preserve exact CRLF bytes");
+
+    // A click on the source-edit preview selects the Markdown range, and the
+    // scene's clipboard contains those exact bytes, never a U+FFFC placeholder.
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,point(16,2));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,point(17,1));
+    assert!(app.panes.iter().filter_map(|p|p.compose.as_ref()).any(|p|p.images.iter().any(|i|i.start==image.start && i.rendered && !i.source_preview)));
+    let copied=rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(18,"copy"));
+    let markup=&original[image.start as usize..image.end as usize];
+    assert_eq!(ed.clipboard_text(),markup);
+    assert_eq!(copied.clipboard.as_ref().unwrap().text,markup);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(19,"cut"));
+    assert_eq!(text(&ed),without); assert_eq!(ed.clipboard_text(),markup);
+    let pasted=pb::ComposeInput {id:20,kind:20,payload:pb::Paste {text:markup.into()}.encode_to_vec(),..Default::default()};
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pasted);
+    assert_eq!(text(&ed),original,"native paste restores exactly the copied source");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(21,"undo")); assert_eq!(text(&ed),without);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(22,"redo")); assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(23,"save"));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+}
+
+fn rich_image_source_previews_reveal_nested_and_reference_markup(root:&std::path::Path,work:&std::path::Path) {
+    let original="# Nested\r\n\r\n> ![**café**](<a b.png>)\r\n\r\n| Picture | More |\r\n| --- | --- |\r\n| ![a *pic*][asset] | **other** |\r\n\r\n[asset]: <a b.png> \"title\"\r\n";
+    let file=work.join("image-source.md"); std::fs::write(&file,original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed,&json!({})); }
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("image-source.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let hello=ready_scene(&mut bridge,&mut ed,&mut app);
+    let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let mut scope=pane_scope(hello.window_id.unwrap(),pane);
+    let images=pane.compose.as_ref().unwrap().images.clone(); assert_eq!(images.len(),2);
+    let mut id=0;
+    for image in images {
+        id+=1;
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,
+            position:Some(image.end),attachment_start:Some(image.start),click_count:2,..Default::default()});
+        let compose=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+        let annotation=compose.images.iter().find(|i|i.start==image.start).unwrap();
+        assert!(annotation.source_preview && !annotation.rendered);
+        let markup=&original[image.start as usize..image.end as usize];
+        assert!(compose.text.contains(markup),"source reveal retains exact nested/reference markup: {markup:?}");
+        assert!(compose.segments.iter().filter(|s|s.source_start<image.end && s.source_end>image.start).all(|s|s.kind==0),
+            "crossing table padding and nested emphasis cannot hide image-source characters");
+        id+=1;
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,
+            position:Some(image.end),attachment_start:Some(image.start),click_count:1,..Default::default()});
+        id+=1;
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,kind:21,
+            payload:pb::Action {name:"copy".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+        assert_eq!(ed.clipboard_text(),markup,"copy retains reference syntax and Unicode exactly");
+        let text=|ed:&fresh::app::Editor|{let b=&ed.active_window().active_state().buffer;String::from_utf8(b.slice_bytes(0..b.len())).unwrap()};
+        let without=original.replacen(markup,"",1);
+        id+=1;
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,kind:21,
+            payload:pb::Action {name:"cut".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+        assert_eq!(text(&ed),without);
+        id+=1;
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,kind:20,
+            payload:pb::Paste {text:markup.into()}.encode_to_vec(),..Default::default()});
+        assert_eq!(text(&ed),original);
+        for (name,expected) in [("undo",without.as_str()),("redo",original)] {
+            id+=1;
+            rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,kind:21,
+                payload:pb::Action {name:name.into(),..Default::default()}.encode_to_vec(),..Default::default()});
+            assert_eq!(text(&ed),expected);
+        }
+    }
+    apply_step(&mut ed,&json!({"action":"save"}));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
 }
 
 fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path::Path,work:&std::path::Path) {

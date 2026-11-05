@@ -378,6 +378,7 @@ message ComposeImage {
   string title = 5;
   bool block = 6;
   bool rendered = 7;
+  bool source_preview = 8;
 }
 
 message ComposeSelection {

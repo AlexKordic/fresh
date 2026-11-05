@@ -939,7 +939,7 @@ proto! {
     ComposeSpan { 1 start: uint64, 2 end: uint64, 3 role: uint32, 4 flags: uint32 }
     ComposeImage {
         1 start: uint64, 2 end: uint64, 3 target: string,
-        4 alt: string, 5 title: string, 6 block: bool, 7 rendered: bool,
+        4 alt: string, 5 title: string, 6 block: bool, 7 rendered: bool, 8 source_preview: bool,
     }
     ComposeSelection { 1 position: uint64, 2 anchor: optional uint64, 3 id: uint64, 4 primary: bool }
     /// A revisioned input was applied exactly once, requires a fresh layout,
