@@ -750,7 +750,8 @@ impl Document {
     }
 
     /// Native-only overrides are resolved from parsed block ownership and
-    /// active grid conceals. In particular, leave quote join conceals whole:
+    /// active grid conceals. Column-formatted blocks retain editable source
+    /// until native cell/frame layout is available. Quote joins remain whole:
     /// removing a marker inside a join would accidentally unflow the prose.
     fn native_projection(
         &self,
@@ -770,6 +771,17 @@ impl Document {
             })
             .collect();
         let mut revealed = revealed.to_vec();
+        // Grid table replacements can pad, truncate or wrap whole cells to a
+        // terminal measure; code fences become character-sized frame strings.
+        // None is content for a pixel-measured client. Retain the exact source
+        // of these parsed blocks instead of adopting that terminal layout.
+        // Explicit native image overrides still apply within a source table.
+        revealed.extend(
+            self.spans
+                .iter()
+                .filter(|s| [8, 12].contains(&s.role))
+                .map(|s| s.start..s.end),
+        );
         let active = state
             .conceals
             .query_viewport(start, end, &state.marker_list, cursors);
@@ -836,6 +848,22 @@ impl Document {
             }
         }
         for (range, replacement) in active {
+            // The grid expands a nested item's leading whitespace according
+            // to its column measure. Native indentation already comes from
+            // parsed container depth, so keep only the original whitespace.
+            if replacement.is_some()
+                && self.text.get(range.clone()).is_some_and(|raw| {
+                    !raw.is_empty() && raw.bytes().all(|c| c == b' ' || c == b'\t')
+                })
+                && self.text[..range.start].rfind('\n').map_or(0, |p| p + 1) == range.start
+                && self
+                    .spans
+                    .iter()
+                    .any(|s| s.role == 13 && s.start == range.end && s.content_start.is_some())
+            {
+                revealed.push(range);
+                continue;
+            }
             if replacement != Some("▌")
                 || self.text.get(range.clone()) != Some(">")
                 || !self
@@ -1354,6 +1382,75 @@ mod tests {
                 "mixed literal field {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn native_blocks_do_not_inherit_terminal_column_padding_or_truncation() {
+        let text = "| Header | More |\r\n| --- | --- |\r\n| all café content | tail |\r\n\r\n```rust\r\nlet value = 1;\r\n```\r\n\r\n- outer\r\n  - inner\r\n";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        let table = doc.spans.iter().find(|s| s.role == 8).unwrap();
+        let code = doc.spans.iter().find(|s| s.role == 12).unwrap();
+        let mut native_text = None;
+        for columns in [12, 160] {
+            let mut state = crate::state::EditorState::new(
+                columns,
+                24,
+                1 << 20,
+                Arc::new(crate::model::filesystem::StdFileSystem),
+            );
+            state.marker_list.set_buffer_size(text.len());
+            let ns = crate::view::overlay::OverlayNamespace::from_string("md-syntax".into());
+            state.conceals.add(
+                &mut state.marker_list,
+                ns.clone(),
+                table.start..table.end,
+                Some(format!("│ truncated{}│", " ".repeat(columns as usize))),
+            );
+            state.conceals.add(
+                &mut state.marker_list,
+                ns.clone(),
+                code.start..code.end,
+                Some(format!("┌{}┐", "─".repeat(columns as usize))),
+            );
+            let indent = text.find("  - inner").unwrap();
+            state.conceals.add(
+                &mut state.marker_list,
+                ns,
+                indent..indent + 2,
+                Some(" ".repeat(columns as usize / 4)),
+            );
+            let projection = doc
+                .native_projection(&state, 0, text.len(), &[], &[], &[])
+                .unwrap();
+            assert_eq!(
+                projection.text, text,
+                "all source survives at every terminal measure"
+            );
+            if let Some(previous) = &native_text {
+                assert_eq!(&projection.text, previous);
+            }
+            native_text = Some(projection.text);
+            let grid = state
+                .conceals
+                .project_text(text, 0, &state.marker_list, &[])
+                .unwrap();
+            assert!(grid.text.contains("truncated") && grid.text.contains('─'));
+            let cell = text.find("all café content").unwrap();
+            let clipped = doc
+                .native_projection(&state, cell, code.end, &[], &[], &[])
+                .unwrap();
+            assert_eq!(
+                clipped.text,
+                &text[cell..code.end],
+                "clipping cannot restore a crossing terminal replacement"
+            );
+            let object = cell..cell + "all café content".len();
+            let images = doc
+                .native_projection(&state, 0, text.len(), &[], &[object], &[])
+                .unwrap();
+            assert!(images.text.contains("| \u{fffc} | tail |"));
+        }
+        assert_eq!(doc.text, text);
     }
 
     #[test]

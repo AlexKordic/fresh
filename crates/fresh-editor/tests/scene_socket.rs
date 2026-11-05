@@ -263,6 +263,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_image_source_previews_reveal_nested_and_reference_markup(&root,&work);
     rich_list_markers_are_source_anchors_not_cell_widths(&root,&work);
     rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(&root,&work);
+    rich_native_content_is_independent_of_terminal_markdown_measure(&root,&work);
     rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
@@ -334,6 +335,33 @@ fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,wo
     assert_eq!(current.spans.iter().find(|s|s.role==13).unwrap().content_start,Some(body));
     apply_step(&mut ed,&json!({"action":"save"}));
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+}
+
+fn rich_native_content_is_independent_of_terminal_markdown_measure(root:&std::path::Path,work:&std::path::Path) {
+    let original="# Native width\r\n\r\n| Content | More |\r\n| --- | --- |\r\n| all café 👩🏽‍💻 cell text must survive even when it cannot fit the terminal allocation | tail |\r\n\r\n```rust\r\nlet wide_value = \"all code content stays available\";\r\n```\r\n\r\n1. Parent\r\n    - Child with enough proportional words to demonstrate that nesting does not depend on the terminal page width.\r\n";
+    let file=work.join("native-width.md"); std::fs::write(&file,original).unwrap();
+    let mut first=None;
+    let mut terminal=Vec::new();
+    for measure in [24,80,140] {
+        let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+        let mut config=ed.config().clone(); config.editor.page_width=Some(measure); ed.set_config(config);
+        for _ in 0..12 { apply_step(&mut ed,&json!({})); }
+        apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+        let path=root.join(format!("native-width-{measure}.sock")); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+        let mut app=App::connect(&path);
+        app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+        ready_scene(&mut bridge,&mut ed,&mut app);
+        let compose=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+        assert!(compose.text.contains("all café 👩🏽‍💻 cell text must survive even when it cannot fit the terminal allocation"));
+        assert!(compose.text.contains("```rust\r\nlet wide_value = \"all code content stays available\";\r\n```"));
+        if let Some(first)=&first { assert_eq!(&compose.text,first,"native content cannot depend on editor.page_width={measure}"); }
+        else { first=Some(compose.text.clone()); }
+        let state=ed.active_window().active_state();
+        terminal.push(state.conceals.project_text(original,0,&state.marker_list,&[]).unwrap().text);
+        apply_step(&mut ed,&json!({"action":"save"}));
+        assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    }
+    assert_ne!(terminal[0],terminal[1],"the fixture must exercise different terminal layouts");
 }
 
 fn rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(root:&std::path::Path,work:&std::path::Path) {
