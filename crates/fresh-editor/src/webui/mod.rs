@@ -113,6 +113,7 @@ use crate::view::scene::Rgb;
 mod wire;
 mod compose;
 mod compose_assets;
+mod compose_text;
 pub(crate) mod compose_navigation;
 pub(crate) mod compose_viewport;
 #[cfg(unix)]

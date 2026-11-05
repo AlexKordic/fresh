@@ -327,8 +327,8 @@ message Pane {
   ComposePane compose = 10;
 }
 
-// A source-preserving rich Compose window. All offsets are UTF-8 bytes;
-// display offsets are relative to text, source offsets are buffer-wide.
+// A source-preserving rich Compose window. Projection offsets are UTF-8
+// bytes; text_context uses document-wide source UTF-16 for native input.
 message ComposePane {
   uint64 buffer_revision = 1;
   uint64 projection_revision = 2;
@@ -349,6 +349,17 @@ message ComposePane {
   ComposeViewport viewport = 17;
   optional bool ready = 18;
   string error = 19;
+  ComposeTextContext text_context = 20;
+}
+
+// Raw source near the primary caret, independent of display conceals and
+// viewport. source_start is UTF-8 bytes; all other offsets are UTF-16.
+message ComposeTextContext {
+  string text = 1;
+  uint64 source_start = 2;
+  uint64 utf16_start = 3;
+  uint64 selection_start = 4;
+  uint64 selection_end = 5;
 }
 
 // kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.

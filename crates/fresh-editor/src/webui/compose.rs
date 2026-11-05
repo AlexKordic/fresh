@@ -538,12 +538,14 @@ pub(crate) struct ComposePane {
     pub viewport: Option<super::compose_viewport::Value>,
     pub ready: Option<bool>,
     pub error: String,
+    pub text_context: Option<super::compose_text::Context>,
 }
 
 struct Document {
     revision: u64,
     epoch: usize,
     text: String,
+    text_index: super::compose_text::Index,
     spans: Vec<ComposeSpan>,
     images: Vec<ComposeImage>,
     paragraphs: Vec<Range<usize>>,
@@ -675,6 +677,7 @@ impl Document {
         Self {
             revision,
             epoch,
+            text_index: super::compose_text::Index::new(&text),
             text,
             spans,
             images,
@@ -1144,6 +1147,13 @@ impl ComposePane {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         cursors.hash(&mut hash);
         context.hash(&mut hash);
+        let text_context = cursors
+            .iter()
+            .find(|cursor| cursor.primary)
+            .and_then(|cursor| {
+                doc.text_index
+                    .context(&doc.text, cursor.position, cursor.anchor)
+            });
         Self {
             buffer_revision: revision,
             projection_revision,
@@ -1164,6 +1174,7 @@ impl ComposePane {
             viewport: None,
             ready: Some(true),
             error: String::new(),
+            text_context,
         }
     }
 }

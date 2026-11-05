@@ -762,6 +762,7 @@ impl<'a> Iterator for Reader<'a> {
 
 use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
 use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection};
+use super::compose_text::Context as ComposeTextContext;
 use super::compose_assets::Chunk;
 use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewportReply};
 use super::compose::InputReply;
@@ -917,8 +918,8 @@ proto! {
         5 tab_bar: TabBarView, 6 vscroll: Rect, 7 thumb_start: uint64, 8 thumb_end: uint64,
         9 markers: repeated ScrollbarMarker, 10 compose: maybe ComposePane,
     }
-    /// A source-preserving rich Compose window. All offsets are UTF-8 bytes;
-    /// display offsets are relative to text, source offsets are buffer-wide.
+    /// A source-preserving rich Compose window. Projection offsets are UTF-8
+    /// bytes; text_context uses document-wide source UTF-16 for native input.
     ComposePane {
         1 buffer_revision: uint64, 2 projection_revision: uint64,
         3 source_start: uint64, 4 source_end: uint64, 5 text: string,
@@ -927,6 +928,13 @@ proto! {
         10 focused: bool, 11 top_byte: uint64, 12 document_len: uint64,
         13 selection_revision: uint64, 14 keyboard: bool, 15 asset_authority: uint64, 16 asset_document: uint64,
         17 viewport: maybe ComposeViewport, 18 ready: optional bool, 19 error: string,
+        20 text_context: maybe ComposeTextContext,
+    }
+    /// Raw source near the primary caret, independent of display conceals and
+    /// viewport. source_start is UTF-8 bytes; all other offsets are UTF-16.
+    ComposeTextContext {
+        1 text: string, 2 source_start: uint64, 3 utf16_start: uint64,
+        4 selection_start: uint64, 5 selection_end: uint64,
     }
     /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
     ComposeSegment {

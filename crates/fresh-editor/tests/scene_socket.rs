@@ -398,6 +398,9 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     let hello=ready_scene(&mut bridge,&mut ed,&mut app);
     let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
     let epoch=pane.compose.as_ref().unwrap().viewport.as_ref().unwrap().epoch;
+    let context=pane.compose.as_ref().unwrap().text_context.as_ref().unwrap();
+    assert_eq!(context.text,original,"native text services receive the exact Markdown source, including concealed syntax");
+    assert_eq!((context.source_start,context.utf16_start,context.selection_start,context.selection_end),(0,0,0,0));
     let mut scope=pane_scope(hello.window_id.unwrap(),pane);
     let text=|ed:&fresh::app::Editor|{let b=&ed.active_window().active_state().buffer;String::from_utf8(b.slice_bytes(0..b.len())).unwrap()};
     let start=original.find("café").unwrap() as u64; let end=start+"café".len() as u64;
@@ -830,6 +833,7 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     let active = |app: &App| app.panes.iter().find(|pane| pane.compose.is_some()).unwrap().clone();
     let initial_a = active(&a);
     let scope_a = pane_scope(a.window, &initial_a);
+    let text_context = initial_a.compose.as_ref().unwrap().text_context.clone().unwrap();
     let mut scope_b = pane_scope(b.window, &active(&b));
     let epoch = initial_a.compose.unwrap().viewport.unwrap().epoch;
     let request = pb::ComposeViewportRequest {
@@ -844,6 +848,8 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     assert_eq!(shown.viewport.as_ref().unwrap().position, 100_000);
     assert_eq!(shown.viewport.as_ref().unwrap().offset, -7.5);
     assert_eq!(shown.cursors.iter().find(|c| c.primary).unwrap().position, 0);
+    assert_eq!(shown.text_context.as_ref().unwrap(), &text_context,
+        "scrolling to another source window cannot renumber the input-method context or selection");
     assert_eq!(active(&b).compose.unwrap().viewport.unwrap().position, 0);
     assert_eq!(ed.active_window().focused_view().viewport.top_byte(), 0, "a graphical scroll cannot move the terminal");
 

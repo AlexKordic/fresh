@@ -531,8 +531,8 @@ pub struct Pane {
     #[prost(message, optional, tag = "10")]
     pub compose: ::core::option::Option<ComposePane>,
 }
-/// A source-preserving rich Compose window. All offsets are UTF-8 bytes;
-/// display offsets are relative to text, source offsets are buffer-wide.
+/// A source-preserving rich Compose window. Projection offsets are UTF-8
+/// bytes; text_context uses document-wide source UTF-16 for native input.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComposePane {
     #[prost(uint64, tag = "1")]
@@ -573,6 +573,23 @@ pub struct ComposePane {
     pub ready: ::core::option::Option<bool>,
     #[prost(string, tag = "19")]
     pub error: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "20")]
+    pub text_context: ::core::option::Option<ComposeTextContext>,
+}
+/// Raw source near the primary caret, independent of display conceals and
+/// viewport. source_start is UTF-8 bytes; all other offsets are UTF-16.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeTextContext {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub source_start: u64,
+    #[prost(uint64, tag = "3")]
+    pub utf16_start: u64,
+    #[prost(uint64, tag = "4")]
+    pub selection_start: u64,
+    #[prost(uint64, tag = "5")]
+    pub selection_end: u64,
 }
 /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
