@@ -937,11 +937,13 @@ proto! {
         4 alt: string, 5 title: string, 6 block: bool, 7 rendered: bool,
     }
     ComposeSelection { 1 position: uint64, 2 anchor: optional uint64, 3 id: uint64, 4 primary: bool }
-    /// A revisioned input was applied exactly once, or requires a fresh layout.
+    /// A revisioned input was applied exactly once, requires a fresh layout,
+    /// or was cancelled with a terminal explanation. Cancelled ids are consumed.
     InputReply {
         1 id: uint64, 2 accepted: bool, 3 needs_layout: bool,
         4 need_region: optional uint64, 5 carets: repeated ComposeCaret,
         6 need_y: optional double, 7 compose: maybe ComposePane,
+        8 cancelled: bool, 9 error: string,
     }
     CaretState as ComposeCaret { 1 id: uint64, 2 position: uint64, 3 affinity: uint32 }
     /// A line between panes.
@@ -1200,7 +1202,10 @@ message ComposeScope {
 }
 // Type 27: serialized input for a rich client. kind/payload carry an existing
 // input message unchanged. A pointer instead supplies a source position.
-// Fresh acknowledges even a no-op. Rejected input is retried after the frame.
+// Fresh acknowledges even a no-op. Nonterminal rejections are retried after
+// the frame. A source_revision pointer is rebased from event-time coordinates;
+// buffer_epoch prevents reusing them after buffer replacement. cancel consumes
+// this id and clears its deferred action without executing it.
 message ComposeInput {
   uint64 id = 1;
   ComposeScope scope = 2;
@@ -1214,6 +1219,9 @@ message ComposeInput {
   uint32 affinity = 10;
   optional uint64 region = 11;
   optional uint64 attachment_start = 12;
+  optional uint64 source_revision = 13;
+  uint64 buffer_epoch = 14;
+  bool cancel = 15;
 }
 // Type 28: read the image annotation identified by this source range through
 // its document authority. No client-supplied path. Cancellation needs only id.

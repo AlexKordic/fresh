@@ -18,6 +18,15 @@ const SOURCE_LIMIT: usize = 2 << 20;
 const WINDOW_BYTES: usize = 64 << 10;
 const CACHE_LIMIT: usize = 8;
 
+pub(super) fn document_keyboard(editor: &mut Editor) -> bool {
+    use crate::input::keybindings::KeyContext;
+    editor.menu_state().active_menu.is_none()
+        && matches!(
+            editor.get_key_context(),
+            KeyContext::Normal | KeyContext::Mode(_) | KeyContext::CompositeBuffer
+        )
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct InputReply {
     pub id: u64,
@@ -27,6 +36,9 @@ pub(crate) struct InputReply {
     pub need_y: Option<f64>,
     pub carets: Vec<super::compose_navigation::CaretState>,
     pub compose: Option<ComposePane>,
+    /// Terminal outcome: this request will never be retried or applied.
+    pub cancelled: bool,
+    pub error: String,
 }
 
 pub(crate) struct Input<'a> {
@@ -42,6 +54,35 @@ pub(crate) struct Input<'a> {
     pub affinity: super::compose_navigation::Affinity,
     pub region: Option<usize>,
     pub attachment_start: Option<usize>,
+    pub source_revision: Option<u64>,
+    pub buffer_epoch: usize,
+    pub cancel: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InputTarget {
+    pub id: u64,
+    pub scope: Scope,
+    pub epoch: usize,
+    pub pointer: bool,
+}
+
+impl InputTarget {
+    pub fn valid(&self, editor: &Editor) -> bool {
+        let window = editor.active_window();
+        window.id.0 == self.scope.window
+            && (self.pointer || window.effective_active_split() == self.scope.leaf)
+            && window.pane_buffer(self.scope.leaf) == Some(self.scope.buffer)
+            && window
+                .buffer_state(self.scope.buffer)
+                .is_some_and(|state| state.marker_list.instance_id() == self.epoch)
+            && window.buffers.splits().is_some_and(|(_, views)| {
+                views
+                    .get(&self.scope.leaf)
+                    .and_then(|view| view.buffer_state(self.scope.buffer))
+                    .is_some_and(|view| view.view_mode == ViewMode::PageView)
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +157,9 @@ impl<'a> Input<'a> {
             affinity: super::compose_navigation::Affinity::Downstream,
             region: None,
             attachment_start: None,
+            source_revision: None,
+            buffer_epoch: 0,
+            cancel: false,
         };
         for field in Reader::new(bytes) {
             match field? {
@@ -133,10 +177,103 @@ impl<'a> Input<'a> {
                 }
                 (11, value) => input.region = Some(value.uint() as usize),
                 (12, value) => input.attachment_start = Some(value.uint() as usize),
+                (13, value) => input.source_revision = Some(value.uint()),
+                (14, value) => {
+                    input.buffer_epoch = usize::try_from(value.uint())
+                        .map_err(|_| super::wire::WireError::LongVarint)?
+                }
+                (15, value) => input.cancel = value.flag(),
                 _ => {}
             }
         }
         Ok(input)
+    }
+
+    /// A graphical click addresses the source seen when it happened. Scrolling
+    /// or another edit may have replaced the visible projection by the time it
+    /// is dispatched; never hit-test that old screen point a second time.
+    pub fn rebase_pointer(
+        &mut self,
+        editor: &mut Editor,
+        cache: &mut ComposeCache,
+    ) -> Result<(), String> {
+        let scope = self
+            .scope
+            .ok_or("The clicked file is no longer available.")?;
+        let revision = self
+            .source_revision
+            .ok_or("The click has no source revision.")?;
+        if self.buffer_epoch == 0
+            || !(InputTarget {
+                id: self.id,
+                scope,
+                epoch: self.buffer_epoch,
+                pointer: true,
+            })
+            .valid(editor)
+        {
+            return Err("The clicked file was closed or replaced. Click again.".into());
+        }
+        let state = editor.active_window().buffer_state(scope.buffer).unwrap();
+        let position = self.position.ok_or("The click has no source position.")?;
+        if revision > state.buffer.version() {
+            return Err("The click refers to an unavailable file revision. Click again.".into());
+        }
+        let mapped = state
+            .coord_map
+            .map_with_gravity(
+                position,
+                revision,
+                self.affinity == super::compose_navigation::Affinity::Upstream,
+            )
+            .ok_or("The file changed before this click could be applied. Click again.")?;
+        let valid = |position: usize| {
+            position <= state.buffer.len()
+                && (position == state.buffer.len()
+                    || state
+                        .buffer
+                        .slice_bytes(position..position + 1)
+                        .first()
+                        .is_none_or(|byte| byte & 0xc0 != 0x80))
+        };
+        if !valid(mapped) {
+            return Err("The clicked source position is no longer available. Click again.".into());
+        }
+        if let Some(start) = self.attachment_start {
+            if self.extend {
+                return Err("The image selection is no longer available. Click again.".into());
+            }
+            let start = state
+                .coord_map
+                .map(start, revision)
+                .ok_or("The image changed before this click could be applied. Click again.")?;
+            let end = state
+                .coord_map
+                .map_with_gravity(position, revision, true)
+                .ok_or("The image changed before this click could be applied. Click again.")?;
+            if start >= end || !valid(start) || !valid(end) {
+                return Err(
+                    "The image changed before this click could be applied. Click again.".into(),
+                );
+            }
+            let pane = cache
+                .gather_at(editor, scope.leaf, scope.buffer, Some(start))
+                .ok_or("The image is no longer available. Click again.")?;
+            if !pane
+                .images
+                .iter()
+                .any(|image| image.start == start && image.end == end)
+            {
+                return Err(
+                    "The image changed before this click could be applied. Click again.".into(),
+                );
+            }
+            self.attachment_start = Some(start);
+            self.position = Some(end);
+        } else {
+            self.position = Some(mapped);
+        }
+        Ok(())
     }
 
     pub fn pointer(&self, editor: &mut Editor) -> bool {
@@ -365,12 +502,8 @@ impl ComposeCache {
         buffer: BufferId,
         region: Option<usize>,
     ) -> Option<ComposePane> {
-        use crate::input::keybindings::KeyContext;
         let context = editor.get_key_context();
-        let owns_keyboard = matches!(
-            context,
-            KeyContext::Normal | KeyContext::Mode(_) | KeyContext::CompositeBuffer
-        );
+        let owns_keyboard = document_keyboard(editor);
         let context = format!("{context:?}");
         let window_id = editor.active_window().id.0;
         let window = editor.active_window();
@@ -601,6 +734,47 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_pointer_refuses_opaque_edits_and_replaced_marker_owners() {
+        let mut editor = crate::webui::build_editor(80, 24, &[], false).unwrap();
+        crate::webui::apply_step(&mut editor, &serde_json::json!({"type":"alpha café\n"}));
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        let scope = Scope {
+            window: editor.active_window().id.0,
+            leaf: editor.active_window().effective_active_split(),
+            buffer: editor.active_window().active_buffer(),
+            revision: editor.active_window().active_state().buffer.version(),
+            projection: 0,
+            selection: 0,
+        };
+        let mut input = Input::parse(&[]).unwrap();
+        input.id = 1;
+        input.scope = Some(scope);
+        input.position = Some(6);
+        input.source_revision = Some(scope.revision);
+        input.buffer_epoch = editor
+            .active_window()
+            .active_state()
+            .marker_list
+            .instance_id();
+        let mut cache = ComposeCache::default();
+        assert!(input.rebase_pointer(&mut editor, &mut cache).is_ok());
+        crate::webui::apply_step(&mut editor, &serde_json::json!({"type":"X"}));
+        let state = editor.active_window_mut().active_state_mut();
+        state.coord_map.record_barrier(state.buffer.version());
+        assert!(input
+            .rebase_pointer(&mut editor, &mut cache)
+            .unwrap_err()
+            .contains("file changed"));
+        input.source_revision = Some(editor.active_window().active_state().buffer.version());
+        editor.active_window_mut().active_state_mut().marker_list =
+            crate::model::marker::MarkerList::new();
+        assert!(input
+            .rebase_pointer(&mut editor, &mut cache)
+            .unwrap_err()
+            .contains("closed or replaced"));
+    }
 
     #[test]
     fn nested_image_alt_stays_one_attachment() {

@@ -546,6 +546,7 @@ impl Session {
         self.cached = None;
         self.memory.clear();
         self.pending = None;
+        self.regions.clear();
     }
 }
 

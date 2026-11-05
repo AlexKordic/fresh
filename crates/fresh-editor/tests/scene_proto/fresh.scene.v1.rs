@@ -617,7 +617,8 @@ pub struct ComposeSelection {
     #[prost(bool, tag = "4")]
     pub primary: bool,
 }
-/// A revisioned input was applied exactly once, or requires a fresh layout.
+/// A revisioned input was applied exactly once, requires a fresh layout,
+/// or was cancelled with a terminal explanation. Cancelled ids are consumed.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InputReply {
     #[prost(uint64, tag = "1")]
@@ -634,6 +635,10 @@ pub struct InputReply {
     pub need_y: ::core::option::Option<f64>,
     #[prost(message, optional, tag = "7")]
     pub compose: ::core::option::Option<ComposePane>,
+    #[prost(bool, tag = "8")]
+    pub cancelled: bool,
+    #[prost(string, tag = "9")]
+    pub error: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeCaret {
@@ -1161,7 +1166,10 @@ pub struct ComposeScope {
 }
 /// Type 27: serialized input for a rich client. kind/payload carry an existing
 /// input message unchanged. A pointer instead supplies a source position.
-/// Fresh acknowledges even a no-op. Rejected input is retried after the frame.
+/// Fresh acknowledges even a no-op. Nonterminal rejections are retried after
+/// the frame. A source_revision pointer is rebased from event-time coordinates;
+/// buffer_epoch prevents reusing them after buffer replacement. cancel consumes
+/// this id and clears its deferred action without executing it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComposeInput {
     #[prost(uint64, tag = "1")]
@@ -1188,6 +1196,12 @@ pub struct ComposeInput {
     pub region: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "12")]
     pub attachment_start: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "13")]
+    pub source_revision: ::core::option::Option<u64>,
+    #[prost(uint64, tag = "14")]
+    pub buffer_epoch: u64,
+    #[prost(bool, tag = "15")]
+    pub cancel: bool,
 }
 /// Type 28: read the image annotation identified by this source range through
 /// its document authority. No client-supplied path. Cancellation needs only id.

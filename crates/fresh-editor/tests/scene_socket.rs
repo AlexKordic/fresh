@@ -232,6 +232,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_navigation_uses_measured_lines_after_resolving_a_key_chord(&root, &work);
     rich_source_regions_belong_to_each_client_and_expire_after_edits(&root,&work);
     rich_viewports_are_independent_and_rebase_queued_scrolls(&root, &work);
+    rich_input_intents_rebase_and_cancel_when_the_view_changes(&root, &work);
     rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(&root,&work);
     rich_image_objects_select_edit_move_delete_and_undo_as_source(&root,&work);
     drop(std::fs::remove_dir_all(&root));
@@ -523,6 +524,7 @@ fn rich_accepted(bridge:&mut SceneBridge,ed:&mut fresh::app::Editor,app:&mut App
     for _ in 0..10 {
         let frame=rich_step(bridge,ed,app,scope,input.clone());
         if frame.input_reply.as_ref().is_some_and(|r|r.accepted) { return frame; }
+        if let Some(reply)=frame.input_reply.as_ref().filter(|reply|reply.cancelled) { panic!("input was cancelled: {}",reply.error); }
     }
     panic!("source input did not settle against the latest decoration revision");
 }
@@ -540,6 +542,11 @@ fn rich_step(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor, app: &mut Ap
     let request=input.id;
     app.send(27, input);
     settle_bridge(bridge, ed);
+    rich_reply(bridge, ed, app, scope, request)
+}
+
+fn rich_reply(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor, app: &mut App,
+    scope: &mut pb::ComposeScope, request: u64) -> pb::Frame {
     for _ in 0..10 {
         let frame=app.frame().expect("a reply to the revisioned input");
         for update in &frame.panes {
@@ -560,6 +567,120 @@ fn rich_step(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor, app: &mut Ap
         settle_bridge(bridge,ed);
     }
     panic!("input reply was not delivered");
+}
+
+fn rich_input_intents_rebase_and_cancel_when_the_view_changes(root: &std::path::Path, work: &std::path::Path) {
+    let original = "# Input\n\nalpha café omega\n\n![picture](x.png)\n\n".to_string()
+        + &(0..3000).map(|i| format!("Paragraph {i} with several words and **emphasis**.\n\n")).collect::<String>();
+    let file = work.join("input-intents.md");
+    let other = work.join("input-intents-other.md");
+    std::fs::write(&file, &original).unwrap();
+    std::fs::write(&other, "Other file\n").unwrap();
+    let mut ed = build_editor(COLS, ROWS, &[other.clone(), file.clone()], true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed, &json!({})); }
+    apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));
+    for _ in 0..50 {
+        apply_step(&mut ed, &json!({}));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let path = root.join("input-intents.sock");
+    let mut bridge = SceneBridge::bind(&path, &ed).unwrap();
+    let mut app = App::connect(&path);
+    app.send(16, pb::ClientHello { version: 1, rich_compose: true, ..Default::default() });
+    settle_bridge(&mut bridge, &mut ed);
+    app.receive().unwrap();
+    let initial = app.panes.iter().find(|pane| pane.compose.is_some()).unwrap().clone();
+    let mut scope = pane_scope(app.window, &initial);
+    let captured_revision = scope.buffer_revision;
+    let epoch = initial.compose.as_ref().unwrap().viewport.as_ref().unwrap().epoch;
+    let point = original.find("café").unwrap() as u64;
+    let image = original.find("![picture]").unwrap() as u64;
+    let image_end = image + "![picture](x.png)".len() as u64;
+    let pointer = |id, position, affinity, attachment_start| pb::ComposeInput {
+        id, position: Some(position), affinity, attachment_start,
+        source_revision: Some(captured_revision), buffer_epoch: epoch,
+        click_count: 1, ..Default::default()
+    };
+    viewport_step(&mut bridge, &mut ed, &mut app, pb::ComposeViewportRequest {
+        id: 1, scope: Some(scope.clone()), position: 100_000, epoch, ..Default::default()
+    });
+    assert!(app.panes.iter().find_map(|pane| pane.compose.as_ref()).unwrap().source_start > point,
+        "the captured click is outside the current visible source window");
+    // Another editor input changes the document while the graphical click is
+    // queued. Only Fresh's coordinate history can rebase its captured source.
+    apply_step(&mut ed, &json!({"type":"é"}));
+    let clicked = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, pointer(1, point, 0, None));
+    assert!(clicked.input_reply.unwrap().accepted);
+    assert_eq!(ed.active_window().active_cursors().primary().position as u64, point + 2);
+    apply_step(&mut ed, &json!({"type":"X"}));
+    assert!(rich_step(&mut bridge, &mut ed, &mut app, &mut scope, pointer(2, point, 1, None)).input_reply.unwrap().accepted);
+    assert_eq!(ed.active_window().active_cursors().primary().position as u64, point + 2, "upstream stays before an insertion at the captured byte");
+    assert!(rich_step(&mut bridge, &mut ed, &mut app, &mut scope, pointer(3, point, 0, None)).input_reply.unwrap().accepted);
+    assert_eq!(ed.active_window().active_cursors().primary().position as u64, point + 3, "downstream stays with the original text after the insertion");
+    assert!(rich_step(&mut bridge, &mut ed, &mut app, &mut scope, pointer(4, image_end, 1, Some(image))).input_reply.unwrap().accepted);
+    let cursor = ed.active_window().active_cursors().primary();
+    assert_eq!(cursor.anchor, Some(image as usize + 3));
+    assert_eq!(cursor.position, image_end as usize + 3);
+    let before_delete = ed.active_window().active_state().buffer.len();
+    apply_step(&mut ed, &json!({"action":"delete_forward"}));
+    assert_eq!(ed.active_window().active_state().buffer.len(), before_delete - (image_end - image) as usize);
+    let rejected = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, pointer(5, image_end, 1, Some(image))).input_reply.unwrap();
+    assert!(rejected.cancelled && !rejected.accepted && !rejected.needs_layout, "{rejected:?}");
+    assert!(rejected.error.contains("image"));
+    let action = |id| pb::ComposeInput { id, kind: 21, buffer_epoch: epoch,
+        payload: pb::Action { name: "move_down".into(), ..Default::default() }.encode_to_vec(), ..Default::default() };
+    let waiting = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, action(6)).input_reply.unwrap();
+    assert!(waiting.needs_layout && !waiting.accepted && !waiting.cancelled);
+    // A presentation toggle cancels a waiting command without another client
+    // request. Source mode must never inherit its deferred measured motion.
+    apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));
+    for _ in 0..20 {
+        if ed.active_window().focused_view().view_mode == fresh::state::ViewMode::Source { break; }
+        apply_step(&mut ed, &json!({}));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(ed.active_window().focused_view().view_mode, fresh::state::ViewMode::Source);
+    let (mut cols, mut rows) = (COLS, ROWS);
+    assert!(bridge.poll(&mut ed, &mut cols, &mut rows).frame_owed, "view changes terminate pending input without a client request");
+    // Delay sending that outcome, as frame backpressure could. A legal retry
+    // of the earlier needs-layout reply races the unsent cancellation.
+    let mut retry = action(6); retry.scope = Some(scope.clone());
+    app.send(27, retry);
+    std::thread::sleep(Duration::from_millis(20));
+    bridge.poll(&mut ed, &mut cols, &mut rows);
+    assert!(bridge.is_busy(), "the cancellation/retry race must not disconnect the client");
+    bridge.push_scene(&mut ed, COLS, ROWS);
+    bridge.maintain();
+    let cancelled = rich_reply(&mut bridge, &mut ed, &mut app, &mut scope, 6).input_reply.unwrap();
+    assert!(cancelled.cancelled && !cancelled.accepted);
+    assert!(!cancelled.error.is_empty());
+    let duplicate = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, action(6)).input_reply.unwrap();
+    assert_eq!(duplicate, cancelled, "a retry racing terminal cancellation receives the same outcome");
+
+    apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));
+    apply_step(&mut ed, &json!({"action":"save"}));
+    settle_bridge(&mut bridge, &mut ed);
+    // Reopening the Compose projection uses the same buffer lifetime. Refresh
+    // its scope from a plain no-op before beginning another deferred action.
+    rich_accepted(&mut bridge, &mut ed, &mut app, &mut scope, pb::ComposeInput {
+        id: 7, kind: 17, payload: pb::Key { key: "Escape".into(), ..Default::default() }.encode_to_vec(), ..Default::default()
+    });
+    let waiting = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, action(8)).input_reply.unwrap();
+    assert!(waiting.needs_layout && !waiting.accepted);
+    apply_step(&mut ed, &json!({"action":"close_tab"}));
+    settle_bridge(&mut bridge, &mut ed);
+    let closed = rich_reply(&mut bridge, &mut ed, &mut app, &mut scope, 8).input_reply.unwrap();
+    assert!(closed.cancelled && !closed.accepted);
+    assert_ne!(ed.active_window().active_buffer().0 as u64, scope.buffer);
+    assert_eq!(ed.active_window().active_state().buffer.file_path().unwrap().canonicalize().unwrap(), other.canonicalize().unwrap());
+    let next = pb::ComposeInput { id: 9, kind: 17,
+        payload: pb::Key { key: "Q".into(), ..Default::default() }.encode_to_vec(), ..Default::default() };
+    app.send(27, next);
+    settle_bridge(&mut bridge, &mut ed);
+    assert!(rich_reply(&mut bridge, &mut ed, &mut app, &mut scope, 9).input_reply.unwrap().accepted,
+        "a cancelled id is consumed and cannot strand later input");
+    assert_eq!(ed.active_window().active_cursors().primary().position, 1, "the deferred down action did not leak into the other file");
+    assert_eq!(std::fs::read(&other).unwrap(), b"Other file\n", "new dirty input was not saved implicitly");
 }
 
 fn rich_navigation_uses_measured_lines_after_resolving_a_key_chord(root: &std::path::Path, work: &std::path::Path) {

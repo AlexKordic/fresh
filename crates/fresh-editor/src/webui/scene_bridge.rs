@@ -92,6 +92,8 @@ struct SceneClient {
     telemetry: bool,
     rich_compose: bool,
     last_input: u64,
+    last_input_reply: Option<super::compose::InputReply>,
+    pending_input_target: Option<super::compose::InputTarget>,
     input_reply: Option<super::compose::InputReply>,
     input_scope: Option<super::compose::Scope>,
     navigation: super::compose_navigation::Session,
@@ -193,6 +195,12 @@ impl SceneBridge {
             }
         }
         let live: HashSet<_> = self.clients.iter().map(|client| client.id).collect();
+        for client in &mut self.clients {
+            if let Some(target) = client.pending_input_target.filter(|target| !target.valid(editor)) {
+                client.cancel_input(target.id, "The pending editor action was cancelled because its file or view changed.");
+                out.frame_owed = true;
+            }
+        }
         self.assets.retain_clients(&live);
         if live != self.viewport_clients {
             super::compose_viewport::retain(editor, &live);
@@ -409,6 +417,8 @@ impl SceneClient {
             telemetry: false,
             rich_compose: false,
             last_input: 0,
+            last_input_reply: None,
+            pending_input_target: None,
             input_reply: None,
             input_scope: None,
             navigation: Default::default(),
@@ -468,6 +478,21 @@ impl SceneClient {
         self.inbuf = inbuf;
         self.inbuf.drain(..used);
         result
+    }
+
+    fn finish_input(&mut self, reply: super::compose::InputReply) {
+        if reply.accepted || reply.cancelled {
+            self.last_input = self.last_input.max(reply.id);
+            self.last_input_reply = Some(reply.clone());
+            self.pending_input_target = None;
+        }
+        self.input_reply = Some(reply);
+    }
+
+    fn cancel_input(&mut self, id: u64, error: &str) {
+        self.navigation.clear();
+        self.input_scope = None;
+        self.finish_input(super::compose::InputReply { id, cancelled: true, error: error.into(), ..Default::default() });
     }
 
     fn handle(
@@ -559,24 +584,80 @@ impl SceneClient {
             }
             kind::COMPOSE_INPUT => {
                 if !self.rich_compose { return Err("rich input requires rich_compose in hello".into()); }
-                let input = super::compose::Input::parse(payload).map_err(w)?;
+                let mut input = super::compose::Input::parse(payload).map_err(w)?;
                 self.input_scope = input.scope;
                 if input.id == 0 { return Err("rich input has no request id".into()); }
                 if input.id > self.last_input.saturating_add(1) { return Err("rich input request ids must be sequential".into()); }
-                if self.input_reply.is_some() { return Err("rich inputs must wait for their reply".into()); }
-                let mut accepted = input.id <= self.last_input;
+                if let Some(reply) = &self.input_reply {
+                    // A terminal cancellation can race a legal retry of the
+                    // earlier needs-layout reply. Keep the terminal outcome;
+                    // do not drop the connection or run the action again.
+                    if reply.id == input.id && (reply.accepted || reply.cancelled) {
+                        out.frame_owed = true;
+                        return Ok(());
+                    }
+                    return Err("rich inputs must wait for their reply".into());
+                }
+                if input.id <= self.last_input {
+                    self.input_reply = Some(self.last_input_reply.as_ref().filter(|reply| reply.id == input.id).cloned()
+                        .unwrap_or(super::compose::InputReply { id: input.id, accepted: true, ..Default::default() }));
+                    out.frame_owed = true;
+                    return Ok(());
+                }
+                if input.cancel {
+                    self.cancel_input(input.id, "The pending editor action was cancelled because its file or view changed.");
+                    out.frame_owed = true;
+                    return Ok(());
+                }
+                self.pending_input_target = input.scope.map(|scope| {
+                    let epoch = if input.buffer_epoch != 0 { input.buffer_epoch } else {
+                        editor.windows.get(&fresh_core::WindowId(scope.window)).and_then(|window| window.buffer_state(scope.buffer))
+                            .map_or(0, |state| state.marker_list.instance_id())
+                    };
+                    super::compose::InputTarget { id: input.id, scope, epoch, pointer: input.position.is_some() }
+                });
+                if self.pending_input_target.is_some_and(|target| !target.valid(editor)) {
+                    self.cancel_input(input.id, "The pending editor action was cancelled because its file or view changed.");
+                    out.frame_owed = true;
+                    return Ok(());
+                }
+                if input.source_revision.is_some() {
+                    match input.rebase_pointer(editor, compose) {
+                        Ok(()) if input.pointer(editor) => {
+                            out.mutated = true;
+                            self.navigation.clear();
+                            let carets = self.navigation.pointer(editor, &input);
+                            self.finish_input(super::compose::InputReply { id: input.id, accepted: true, carets, ..Default::default() });
+                        }
+                        Ok(()) => self.cancel_input(input.id, "The clicked file is no longer available. Click again."),
+                        Err(error) => self.cancel_input(input.id, &error),
+                    }
+                    out.frame_owed = true;
+                    return Ok(());
+                }
+                if input.scope.is_some() && !super::compose::document_keyboard(editor) {
+                    self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                    out.frame_owed = true;
+                    return Ok(());
+                }
+                let mut accepted = false;
                 let snapshot = input.scope.as_ref().and_then(|scope| {
                     let viewport = (scope.window == editor.active_window().id.0).then(|| super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer)).flatten();
                     let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision).or(viewport.map(|v| v.position));
                     scope.snapshot(editor, compose, region)
                 });
+                if snapshot.is_none() && input.scope.is_some_and(|scope| compose.gather_at(editor, scope.leaf, scope.buffer, None).is_none()) {
+                    self.cancel_input(input.id, "Rich Compose is no longer available in this view. Retry your action.");
+                    out.frame_owed = true;
+                    return Ok(());
+                }
                 let mut reply = super::compose::InputReply { id: input.id, accepted, ..Default::default() };
                 if !accepted && (input.scope.is_none() || snapshot.is_some()) {
                     if let (Some(scope), Some(region)) = (&input.scope, input.region) {
                         if region > snapshot.as_ref().unwrap().document_len { return Err("source region is outside the document".into()); }
                         self.navigation.request_region(scope, region);
                         reply.needs_layout = true;
-                        self.input_reply = Some(reply);
+                        self.finish_input(reply);
                         out.frame_owed = true;
                         return Ok(());
                     }
@@ -612,9 +693,8 @@ impl SceneClient {
                         return Err("unsupported input inside ComposeInput".into());
                     }
                 }
-                if accepted { self.last_input = self.last_input.max(input.id); }
                 reply.accepted = accepted;
-                self.input_reply = Some(reply);
+                self.finish_input(reply);
                 out.frame_owed = true;
             }
             kind::KEY => {
