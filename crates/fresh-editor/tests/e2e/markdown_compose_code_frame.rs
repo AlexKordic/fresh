@@ -89,6 +89,19 @@ fn bottoms(screen: &str) -> Vec<usize> {
     frame_rows(screen, '└')
 }
 
+#[test]
+fn supplementary_code_characters_do_not_abort_frame_decoration_or_wrapping() {
+    let code = format!("let rockets = \"{}\";", "🚀".repeat(50));
+    let doc = format!("# Unicode code\n\n```text\n{code}\nlet café = 1;\n```\n\nTail.\n");
+    let (mut harness, _tmp) = compose_harness(&doc);
+    harness.wait_until(|h| {
+        let screen = h.screen_to_string();
+        tops(&screen).len() == 1 && bottoms(&screen).len() == 1
+            && screen.contains('🚀') && screen.contains("café") && screen.contains("Tail.")
+    }).expect("supplementary characters and their wrap boundaries must not abort the decoration batch");
+    assert_eq!(harness.get_buffer_content().unwrap(), doc);
+}
+
 /// Park the cursor somewhere with no markup, so nothing on screen is being
 /// revealed for editing. Compose deliberately reveals the markup on the
 /// cursor's own line (and the line above it when the cursor is at column 0),

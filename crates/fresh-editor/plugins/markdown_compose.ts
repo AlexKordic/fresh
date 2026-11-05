@@ -370,8 +370,12 @@ function codeRowLayout(text: string, measure: number): { breaks: number[]; rows:
   let lastSpace = -1;
   let column = 0;
 
-  for (let i = 0; i < text.length; i++) {
-    const w = displayWidth(text[i]);
+  // Positions remain UTF-16 indices for charToByte and slicing, but width
+  // calls must receive whole scalars. A half of an emoji's surrogate pair
+  // cannot cross the UTF-8 plugin boundary and would abort the whole batch.
+  for (let i = 0; i < text.length; i += text.codePointAt(i)! > 0xffff ? 2 : 1) {
+    const cp = text.codePointAt(i)!;
+    const w = editor.charWidth(cp);
     if (column + w > inner && i > rowStart) {
       if (lastSpace > rowStart) {
         // Word break: the space ends the row and is consumed by it.
@@ -386,8 +390,7 @@ function codeRowLayout(text: string, measure: number): { breaks: number[]; rows:
         rowStart = i;
       }
       lastSpace = -1;
-      column = 0;
-      for (let j = rowStart; j <= i; j++) column += displayWidth(text[j]);
+      column = displayWidth(text.slice(rowStart, i + (cp > 0xffff ? 2 : 1)));
       continue;
     }
     if (text[i] === " ") lastSpace = i;
