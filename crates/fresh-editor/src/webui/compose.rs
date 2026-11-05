@@ -601,6 +601,7 @@ pub(crate) struct ComposePane {
     pub error: String,
     pub text_context: Option<super::compose_text::Context>,
     pub text_chunks: Vec<super::compose_text::Chunk>,
+    pub tables: Vec<super::compose_tables::Table>,
 }
 
 struct Document {
@@ -613,6 +614,7 @@ struct Document {
     paragraphs: Vec<Range<usize>>,
     underlines: Vec<(Range<usize>, Range<usize>)>,
     code: Vec<CodeBlock>,
+    tables: super::compose_tables::Tables,
     used: u64,
 }
 
@@ -631,8 +633,10 @@ impl Document {
         let mut underlines = Vec::new();
         let mut code: Vec<CodeBlock> = Vec::new();
         let mut active_code = None;
+        let mut tables = super::compose_tables::Tables::default();
         let mut items: Vec<(usize, usize)> = Vec::new();
         for (event, range) in Parser::new_ext(&text, Options::all()).into_offset_iter() {
+            tables.event(&text, &event, &range);
             // Use the parser's item ownership and inline ranges. Tight lists
             // have no Paragraph event; task markers precede their body. An
             // empty item whose first child is on another line has no prefix
@@ -767,6 +771,7 @@ impl Document {
             paragraphs,
             underlines,
             code,
+            tables,
             used,
         }
     }
@@ -775,6 +780,7 @@ impl Document {
     /// active grid conceals. Column-formatted tables retain editable source
     /// until native cell layout is available. Quote joins remain whole:
     /// removing a marker inside a join would accidentally unflow the prose.
+    #[cfg(test)]
     fn native_projection(
         &self,
         state: &crate::state::EditorState,
@@ -783,6 +789,19 @@ impl Document {
         cursors: &[usize],
         objects: &[Range<usize>],
         revealed: &[Range<usize>],
+    ) -> Option<Projection> {
+        self.native_table_projection(state, start, end, cursors, objects, revealed, &[])
+    }
+
+    fn native_table_projection(
+        &self,
+        state: &crate::state::EditorState,
+        start: usize,
+        end: usize,
+        cursors: &[usize],
+        objects: &[Range<usize>],
+        revealed: &[Range<usize>],
+        tables: &[super::compose_tables::Table],
     ) -> Option<Projection> {
         let mut overrides: Vec<_> = objects
             .iter()
@@ -793,6 +812,14 @@ impl Document {
             })
             .collect();
         let mut revealed = revealed.to_vec();
+        revealed.extend(
+            tables
+                .iter()
+                .flat_map(|t| t.rows.iter())
+                .filter(|r| r.source)
+                .map(|r| r.start..r.end),
+        );
+        overrides.extend(self.tables.conceals(&self.text, start..end, tables));
         // Grid table replacements can pad, truncate or wrap whole cells to a
         // terminal measure; code fences become character-sized frame strings.
         // None is content for a pixel-measured client. Retain the exact source
@@ -1069,7 +1096,7 @@ fn source_line_has_cursor(text: &str, position: usize, cursors: &[usize]) -> boo
     })
 }
 
-fn source_line_end(text: &str, position: usize) -> usize {
+pub(super) fn source_line_end(text: &str, position: usize) -> usize {
     let mut end = text[position..]
         .find(['\r', '\n'])
         .map_or(text.len(), |p| position + p + 1);
@@ -1132,6 +1159,17 @@ impl ComposeCache {
         leaf: LeafId,
         buffer: BufferId,
         region: Option<usize>,
+    ) -> Option<ComposePane> {
+        self.gather_tables_at(editor, leaf, buffer, region, false)
+    }
+
+    pub fn gather_tables_at(
+        &mut self,
+        editor: &mut Editor,
+        leaf: LeafId,
+        buffer: BufferId,
+        region: Option<usize>,
+        measured_tables: bool,
     ) -> Option<ComposePane> {
         let context = editor.get_key_context();
         let owns_keyboard = document_keyboard(editor);
@@ -1317,14 +1355,28 @@ impl ComposeCache {
             .map(|image| image.start..image.end)
             .collect();
         let status = status(start, end);
+        let tables = if measured_tables && status == Status::Ready {
+            doc.tables
+                .snapshot(&doc.text, start..end, &cursor_positions)
+        } else {
+            Vec::new()
+        };
         let projection = if status == Status::Ready {
-            doc.native_projection(state, start, end, &cursor_positions, &objects, &revealed)?
+            doc.native_table_projection(
+                state,
+                start,
+                end,
+                &cursor_positions,
+                &objects,
+                &revealed,
+                &tables,
+            )?
         } else {
             // Never publish a partially applied replacement/conceal map.
             Projection::new(raw, start, &[]).ok()?
         };
         let mut pane = ComposePane::from_projection(
-            projection, doc, revision, cursors, focused, top_byte, &context,
+            projection, doc, revision, cursors, focused, top_byte, &context, tables,
         );
         pane.keyboard = owns_keyboard && focused;
         pane.asset_authority = asset_authority;
@@ -1352,6 +1404,7 @@ impl ComposePane {
         focused: bool,
         top_byte: usize,
         context: &str,
+        tables: Vec<super::compose_tables::Table>,
     ) -> Self {
         let spans: Vec<_> = doc
             .spans
@@ -1378,6 +1431,7 @@ impl ComposePane {
         p.text.hash(&mut hash);
         spans.hash(&mut hash);
         images.hash(&mut hash);
+        tables.hash(&mut hash);
         let segments = p
             .segments
             .iter()
@@ -1444,6 +1498,7 @@ impl ComposePane {
             error: String::new(),
             text_context,
             text_chunks,
+            tables,
         }
     }
 }
@@ -1451,6 +1506,59 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measured_table_projection_keeps_image_objects_and_revealed_image_source_disjoint() {
+        let text = "Intro\n\n| A | B |\n|---|---|\n| ![**pic**](x.png) | `code` |\n";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        let image = doc.images[0].start..doc.images[0].end;
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(text.len());
+        let table = doc.spans.iter().find(|s| s.role == 8).unwrap();
+        state.conceals.add(
+            &mut state.marker_list,
+            crate::view::overlay::OverlayNamespace::from_string("md-syntax".into()),
+            table.start..table.end,
+            Some("TRUNCATED".into()),
+        );
+        let tables = doc.tables.snapshot(text, 0..text.len(), &[]);
+        let p = doc
+            .native_table_projection(&state, 0, text.len(), &[], &[image.clone()], &[], &tables)
+            .unwrap();
+        assert_eq!(p.text, "Intro\n\nA\tB\n\u{fffc}\tcode\n");
+        let cursor = image.start + 3;
+        let tables = doc.tables.snapshot(text, 0..text.len(), &[cursor]);
+        let p = doc
+            .native_table_projection(
+                &state,
+                0,
+                text.len(),
+                &[cursor],
+                &[],
+                &[image.clone()],
+                &tables,
+            )
+            .unwrap();
+        assert!(p.text.contains(&text[image.clone()]));
+        assert!(!p.text.contains("TRUNCATED"));
+        assert!(p
+            .segments
+            .iter()
+            .filter(|s| s.source.start < image.end && s.source.end > image.start)
+            .all(|s| s.kind == SegmentKind::Copy));
+        let legacy = doc
+            .native_projection(&state, 0, text.len(), &[], &[], &[])
+            .unwrap();
+        assert_eq!(
+            legacy.text, text,
+            "clients without table capability keep editable source"
+        );
+    }
 
     #[test]
     fn additional_replacements_require_complete_unambiguous_captured_targets() {

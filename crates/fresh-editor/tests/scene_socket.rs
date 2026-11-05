@@ -190,6 +190,13 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     assert!(error.reason.contains("protocol 99"), "{}", error.reason);
     assert!(stranger.receive().is_none(), "then the connection ends");
 
+    let mut invalid_tables = App::connect(&path);
+    invalid_tables.send(16,pb::ClientHello {version:1,measured_tables:true,..Default::default()});
+    settle_bridge(&mut bridge,&mut ed);
+    let (kind,payload)=invalid_tables.receive().expect("an invalid table capability is refused");
+    assert_eq!(kind,3);
+    assert!(pb::Error::decode(&payload[..]).unwrap().reason.contains("require rich_compose"));
+
     // Hello: the whole scene.
     let mut app = App::connect(&path);
     app.send(16, pb::ClientHello { version: 1, telemetry: true, ..Default::default() });
@@ -269,6 +276,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(&root,&work);
     rich_native_content_is_independent_of_terminal_markdown_measure(&root,&work);
     rich_native_code_frames_reveal_and_edit_parser_owned_source(&root,&work);
+    rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(&root,&work);
     rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
@@ -304,6 +312,75 @@ fn scoped_compose_commands_follow_their_window_and_buffer_lifetime(root: &std::p
         command: Box::new(PluginCommand::ClearConcealNamespace { buffer_id: id,
             namespace: fresh_core::overlay::OverlayNamespace::from_string("scope-test".into()) }) }).unwrap();
     assert_eq!(shown(&editor, "**alpha**\n"), "alpha**\n", "a different buffer lifetime cannot clear current source decorations");
+}
+
+fn rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(root:&std::path::Path,work:&std::path::Path) {
+    let text=|ed:&fresh::app::Editor|{let b=&ed.active_window().active_state().buffer;String::from_utf8(b.slice_bytes(0..b.len())).unwrap()};
+    let original="# Native table cells\r\n\r\n| Text | Value | Image |\r\n| :--- | :---: | ---: |\r\n| **café 👩🏽‍💻** and [link](target.md) with enough proportional words to wrap within a measured cell | `a\\|b` &amp; | ![**pic**](<a b.png>) |\r\n| | empty | |\r\n| short |\r\n\r\n> A | B\r\n> --- | ---\r\n> quoted | value\r\n";
+    let original=original.replace("| short |\r\n", &format!("| short |\r\n| {} | long | |\r\n||||\r\n", "🚀".repeat(50)));
+    let file=work.join("native-tables.md"); std::fs::write(&file,&original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed,&json!({})); }
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("native-tables.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut legacy=App::connect(&path);
+    legacy.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    ready_scene(&mut bridge,&mut ed,&mut legacy);
+    let old=legacy.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert!(old.tables.is_empty());
+    assert!(old.text.contains("| Text | Value | Image |"));
+    let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,measured_tables:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let hello=ready_scene(&mut bridge,&mut ed,&mut app);
+    let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let compose=pane.compose.as_ref().unwrap();
+    assert_eq!(compose.tables.len(),2);
+    assert_eq!(compose.tables[0].alignments,[1,2,3]);
+    assert_eq!(compose.tables[0].rows.len(),6);
+    assert!(compose.tables[0].rows[3].cells[1..].iter().all(|c|c.missing));
+    assert!(compose.tables[0].rows[5].cells.iter().all(|c|!c.missing && c.start==c.end));
+    assert!(compose.text.contains("Text\tValue\tImage\r\n"));
+    assert!(compose.text.contains("café 👩🏽‍💻 and link"));
+    assert!(compose.text.contains(&"🚀".repeat(50)), "native cells retain long supplementary-character content without wrapping it on the wire");
+    assert!(compose.text.contains("a|b &\t\u{fffc}"));
+    if let Some(path)=std::env::var_os("FC_COMPOSE_TABLE_SCENE_FILE") {
+        let mut fixture=compose.clone(); fixture.asset_authority=1; fixture.asset_document=1;
+        std::fs::write(path,fixture.encode_to_vec()).unwrap();
+    }
+    let empty=compose.tables[0].rows[2].cells[0].start;
+    let missing=compose.tables[0].rows[3].content_end;
+    let mut scope=pane_scope(hello.window_id.unwrap(),pane);
+    let word=original.find("café").unwrap()+2;
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some(word as u64),..Default::default()});
+    let current=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert!(current.tables[0].rows[1].cells[0].revealed && !current.tables[0].rows[1].source);
+    assert!(current.text.contains("**café 👩🏽‍💻** and [link](target.md)"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:2,kind:20,payload:pb::Paste {text:"X".into()}.encode_to_vec(),..Default::default()});
+    assert!(text(&ed).contains("caXfé"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:3,kind:21,payload:pb::Action {name:"undo".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    let separator=original.find(":---").unwrap();
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:4,position:Some(separator as u64),..Default::default()});
+    let current=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert!(current.tables[0].rows.iter().any(|r|r.source && r.cells.is_empty()));
+    assert!(current.text.contains("| :--- | :---: | ---: |\r\n"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:5,position:Some(empty),..Default::default()});
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:6,kind:20,payload:pb::Paste {text:"filled".into()}.encode_to_vec(),..Default::default()});
+    assert!(text(&ed).contains("|filled | empty"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:7,kind:21,payload:pb::Action {name:"undo".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:8,position:Some(missing),..Default::default()});
+    assert!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().tables[0].rows[3].source);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:9,kind:21,payload:pb::Action {name:"save".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    // A legacy rich client and the table client share source/history, while
+    // each keeps the representation it negotiated in its own hello.
+    for _ in 0..4 {
+        if let Some(frame)=legacy.frame() {
+            legacy.send(26,pb::Applied {seq:frame.seq}); settle_bridge(&mut bridge,&mut ed);
+        }
+    }
+    let old=legacy.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert!(old.tables.is_empty());
+    assert!(old.text.contains("| Text | Value | Image |"));
 }
 
 fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,work:&std::path::Path) {
@@ -346,6 +423,7 @@ fn rich_native_content_is_independent_of_terminal_markdown_measure(root:&std::pa
     let original="# Native width\r\n\r\n| Content | More |\r\n| --- | --- |\r\n| all café 👩🏽‍💻 cell text must survive even when it cannot fit the terminal allocation | tail |\r\n\r\n```rust\r\nlet wide_value = \"all code content stays available\";\r\n```\r\n\r\n1. Parent\r\n    - Child with enough proportional words to demonstrate that nesting does not depend on the terminal page width.\r\n";
     let file=work.join("native-width.md"); std::fs::write(&file,original).unwrap();
     let mut first=None;
+    let mut measured_first=None;
     let mut terminal=Vec::new();
     for measure in [24,80,140] {
         let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
@@ -362,6 +440,15 @@ fn rich_native_content_is_independent_of_terminal_markdown_measure(root:&std::pa
         assert!(!compose.text.contains("```"));
         if let Some(first)=&first { assert_eq!(&compose.text,first,"native content cannot depend on editor.page_width={measure}"); }
         else { first=Some(compose.text.clone()); }
+        let mut measured=App::connect(&path);
+        measured.send(16,pb::ClientHello {version:1,rich_compose:true,measured_tables:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+        ready_scene(&mut bridge,&mut ed,&mut measured);
+        let compose=measured.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+        assert_eq!(compose.tables.len(),1);
+        assert!(compose.text.contains("all café 👩🏽‍💻 cell text must survive even when it cannot fit the terminal allocation"));
+        let data=(compose.text.clone(),compose.segments.clone(),compose.tables.clone());
+        if let Some(first)=&measured_first { assert_eq!(&data,first,"native cell content and source mappings cannot depend on editor.page_width={measure}"); }
+        else { measured_first=Some(data); }
         let state=ed.active_window().active_state();
         terminal.push(state.conceals.project_text(original,0,&state.marker_list,&[]).unwrap().text);
         apply_step(&mut ed,&json!({"action":"save"}));

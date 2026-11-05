@@ -762,6 +762,7 @@ impl<'a> Iterator for Reader<'a> {
 
 use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
 use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection};
+use super::compose_tables::{Table as ComposeTable, Row as ComposeTableRow, Cell as ComposeTableCell};
 use super::compose_text::Context as ComposeTextContext;
 use super::compose_text::Chunk as ComposeTextChunk;
 use super::compose_assets::Chunk;
@@ -931,7 +932,17 @@ proto! {
         17 viewport: maybe ComposeViewport, 18 ready: optional bool, 19 error: string,
         20 text_context: maybe ComposeTextContext,
         21 text_chunks: repeated ComposeTextChunk,
+        22 tables: repeated ComposeTable,
     }
+    /// Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.
+    ComposeTable { 1 start: uint64, 2 end: uint64, 3 alignments: repeated uint32, 4 rows: repeated ComposeTableRow }
+    /// source selects exact structural Markdown; rows may be a bounded subset.
+    ComposeTableRow {
+        1 start: uint64, 2 end: uint64, 3 content_end: uint64,
+        4 header: bool, 5 source: bool, 6 cells: repeated ComposeTableCell,
+    }
+    /// Missing cells have no editable source; real empty cells retain their anchor.
+    ComposeTableCell { 1 start: uint64, 2 end: uint64, 3 revealed: bool, 4 missing: bool }
     /// Raw source near the primary caret, independent of display conceals and
     /// viewport. source_start is UTF-8 bytes; all other offsets are UTF-16.
     ComposeTextContext {
@@ -1211,6 +1222,8 @@ message ClientHello {
   bool telemetry = 2;
   // Opt in to source-mapped Compose panes. Grid cells remain available.
   bool rich_compose = 3;
+  // Opt in to measured table cells; requires rich_compose.
+  bool measured_tables = 4;
 }
 // A pane identity and the exact source/projection the client interacted with.
 message ComposeScope {

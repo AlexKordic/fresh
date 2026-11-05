@@ -351,6 +351,33 @@ message ComposePane {
   string error = 19;
   ComposeTextContext text_context = 20;
   repeated ComposeTextChunk text_chunks = 21;
+  repeated ComposeTable tables = 22;
+}
+
+// Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.
+message ComposeTable {
+  uint64 start = 1;
+  uint64 end = 2;
+  repeated uint32 alignments = 3;
+  repeated ComposeTableRow rows = 4;
+}
+
+// source selects exact structural Markdown; rows may be a bounded subset.
+message ComposeTableRow {
+  uint64 start = 1;
+  uint64 end = 2;
+  uint64 content_end = 3;
+  bool header = 4;
+  bool source = 5;
+  repeated ComposeTableCell cells = 6;
+}
+
+// Missing cells have no editable source; real empty cells retain their anchor.
+message ComposeTableCell {
+  uint64 start = 1;
+  uint64 end = 2;
+  bool revealed = 3;
+  bool missing = 4;
 }
 
 // Raw source near the primary caret, independent of display conceals and
@@ -714,6 +741,8 @@ message ClientHello {
   bool telemetry = 2;
   // Opt in to source-mapped Compose panes. Grid cells remain available.
   bool rich_compose = 3;
+  // Opt in to measured table cells; requires rich_compose.
+  bool measured_tables = 4;
 }
 // A pane identity and the exact source/projection the client interacted with.
 message ComposeScope {

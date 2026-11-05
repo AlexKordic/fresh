@@ -577,6 +577,48 @@ pub struct ComposePane {
     pub text_context: ::core::option::Option<ComposeTextContext>,
     #[prost(message, repeated, tag = "21")]
     pub text_chunks: ::prost::alloc::vec::Vec<ComposeTextChunk>,
+    #[prost(message, repeated, tag = "22")]
+    pub tables: ::prost::alloc::vec::Vec<ComposeTable>,
+}
+/// Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeTable {
+    #[prost(uint64, tag = "1")]
+    pub start: u64,
+    #[prost(uint64, tag = "2")]
+    pub end: u64,
+    #[prost(uint32, repeated, tag = "3")]
+    pub alignments: ::prost::alloc::vec::Vec<u32>,
+    #[prost(message, repeated, tag = "4")]
+    pub rows: ::prost::alloc::vec::Vec<ComposeTableRow>,
+}
+/// source selects exact structural Markdown; rows may be a bounded subset.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeTableRow {
+    #[prost(uint64, tag = "1")]
+    pub start: u64,
+    #[prost(uint64, tag = "2")]
+    pub end: u64,
+    #[prost(uint64, tag = "3")]
+    pub content_end: u64,
+    #[prost(bool, tag = "4")]
+    pub header: bool,
+    #[prost(bool, tag = "5")]
+    pub source: bool,
+    #[prost(message, repeated, tag = "6")]
+    pub cells: ::prost::alloc::vec::Vec<ComposeTableCell>,
+}
+/// Missing cells have no editable source; real empty cells retain their anchor.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeTableCell {
+    #[prost(uint64, tag = "1")]
+    pub start: u64,
+    #[prost(uint64, tag = "2")]
+    pub end: u64,
+    #[prost(bool, tag = "3")]
+    pub revealed: bool,
+    #[prost(bool, tag = "4")]
+    pub missing: bool,
 }
 /// Raw source near the primary caret, independent of display conceals and
 /// viewport. source_start is UTF-8 bytes; all other offsets are UTF-16.
@@ -1198,6 +1240,9 @@ pub struct ClientHello {
     /// Opt in to source-mapped Compose panes. Grid cells remain available.
     #[prost(bool, tag = "3")]
     pub rich_compose: bool,
+    /// Opt in to measured table cells; requires rich_compose.
+    #[prost(bool, tag = "4")]
+    pub measured_tables: bool,
 }
 /// A pane identity and the exact source/projection the client interacted with.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
