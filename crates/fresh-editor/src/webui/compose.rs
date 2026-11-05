@@ -612,7 +612,14 @@ struct Document {
     images: Vec<ComposeImage>,
     paragraphs: Vec<Range<usize>>,
     underlines: Vec<(Range<usize>, Range<usize>)>,
+    code: Vec<CodeBlock>,
     used: u64,
+}
+
+struct CodeBlock {
+    source: Range<usize>,
+    content: Vec<Range<usize>>,
+    fenced: bool,
 }
 
 impl Document {
@@ -622,6 +629,8 @@ impl Document {
         let mut image_stack: Vec<ComposeImage> = Vec::new();
         let mut paragraphs = Vec::new();
         let mut underlines = Vec::new();
+        let mut code: Vec<CodeBlock> = Vec::new();
+        let mut active_code = None;
         let mut items: Vec<(usize, usize)> = Vec::new();
         for (event, range) in Parser::new_ext(&text, Options::all()).into_offset_iter() {
             // Use the parser's item ownership and inline ranges. Tight lists
@@ -665,7 +674,16 @@ impl Document {
                     }
                 }
                 Event::Rule => role = 14,
-                Event::Start(Tag::CodeBlock(_)) => role = 12,
+                Event::Start(Tag::CodeBlock(kind)) => {
+                    role = 12;
+                    active_code = Some(code.len());
+                    code.push(CodeBlock {
+                        source: range.clone(),
+                        content: Vec::new(),
+                        fenced: matches!(kind, pulldown_cmark::CodeBlockKind::Fenced(_)),
+                    });
+                }
+                Event::End(TagEnd::CodeBlock) => active_code = None,
                 Event::Code(text) => {
                     role = 7;
                     if let Some(image) = image_stack.last_mut() {
@@ -701,6 +719,9 @@ impl Document {
                     });
                 }
                 Event::Text(text) => {
+                    if let Some(index) = active_code {
+                        code[index].content.push(range.clone());
+                    }
                     if let Some(image) = image_stack.last_mut() {
                         image.alt.push_str(&text);
                     }
@@ -745,13 +766,14 @@ impl Document {
             images,
             paragraphs,
             underlines,
+            code,
             used,
         }
     }
 
     /// Native-only overrides are resolved from parsed block ownership and
-    /// active grid conceals. Column-formatted blocks retain editable source
-    /// until native cell/frame layout is available. Quote joins remain whole:
+    /// active grid conceals. Column-formatted tables retain editable source
+    /// until native cell layout is available. Quote joins remain whole:
     /// removing a marker inside a join would accidentally unflow the prose.
     fn native_projection(
         &self,
@@ -785,6 +807,125 @@ impl Document {
         let active = state
             .conceals
             .query_viewport(start, end, &state.marker_list, cursors);
+        for block in self
+            .code
+            .iter()
+            .filter(|b| b.source.start < end && b.source.end >= start)
+        {
+            let line_start = self.text[..block.source.start]
+                .rfind(['\r', '\n'])
+                .map_or(0, |p| p + 1);
+            let prefix = line_start..block.source.start;
+            // The parser excludes a first line's container prefix from the
+            // code block range. Never consume a list marker on that line.
+            let strip_prefix = !prefix.is_empty()
+                && self.text[prefix.clone()]
+                    .bytes()
+                    .all(|c| matches!(c, b' ' | b'\t' | b'>'));
+            if strip_prefix {
+                revealed.push(prefix.clone());
+            }
+            let first_part = block.content.partition_point(|part| part.end <= start);
+            let mut from = if first_part == 0 {
+                block.source.start
+            } else {
+                block.content[first_part - 1].end
+            };
+            let mut gaps = Vec::new();
+            if strip_prefix {
+                gaps.push(prefix);
+            }
+            // A hidden opener on its own line does not need a blank header
+            // row. Keep its EOL for an empty block or a preceding list marker.
+            if block.fenced
+                && !block.content.is_empty()
+                && (strip_prefix || line_start == block.source.start)
+                && !source_line_has_cursor(&self.text, block.source.start, cursors)
+            {
+                let opener_end = source_line_end(&self.text, block.source.start);
+                if opener_end <= block.content[0].start
+                    && block.source.start >= start
+                    && opener_end <= end
+                {
+                    overrides.push(Conceal {
+                        source: from..opener_end,
+                        replacement: None,
+                    });
+                    from = opener_end;
+                }
+            }
+            for part in block.content[first_part..]
+                .iter()
+                .take_while(|part| part.start < end)
+            {
+                if from < part.start {
+                    gaps.push(from..part.start);
+                }
+                from = part.end;
+            }
+            if from < block.source.end {
+                gaps.push(from..block.source.end);
+            }
+            // The parser excludes a closing fence's final EOL. Conceal that
+            // syntax-owned line ending as well, leaving code EOL bytes copied.
+            if block.fenced
+                && self
+                    .text
+                    .as_bytes()
+                    .get(block.source.end)
+                    .is_some_and(|b| matches!(b, b'\r' | b'\n'))
+                && !source_line_has_cursor(&self.text, block.source.end - 1, cursors)
+            {
+                let to = source_line_end(&self.text, block.source.end);
+                if block.source.end >= start && to <= end {
+                    overrides.push(Conceal {
+                        source: block.source.end..to,
+                        replacement: None,
+                    });
+                }
+            }
+            for gap in gaps {
+                let gap = gap.start.max(start)..gap.end.min(end);
+                if gap.is_empty() {
+                    continue;
+                }
+                // Copy the original CR/LF bytes. These source-owned line
+                // boundaries are not terminal wrapping or generated padding.
+                let mut at = gap.start;
+                while at < gap.end {
+                    let to = self.text[at..gap.end]
+                        .find(['\r', '\n'])
+                        .map_or(gap.end, |p| at + p);
+                    if at < to
+                        && at >= start
+                        && to <= end
+                        && !source_line_has_cursor(&self.text, at, cursors)
+                    {
+                        overrides.push(Conceal {
+                            source: at..to,
+                            replacement: None,
+                        });
+                    }
+                    at = to + 1;
+                }
+            }
+            // An empty, unterminated fence at EOF still needs one measurable
+            // native line. Its placeholder never enters the source buffer.
+            if block.content.is_empty()
+                && !self.text[block.source.clone()].contains(['\r', '\n'])
+                && block.source.start >= start
+                && block.source.end <= end
+                && !source_line_has_cursor(&self.text, block.source.start, cursors)
+            {
+                overrides.retain(|c| {
+                    !(c.source.start < block.source.end && block.source.start < c.source.end)
+                });
+                overrides.push(Conceal {
+                    source: block.source.clone(),
+                    replacement: Some("\n"),
+                });
+            }
+        }
         for (heading, underline) in &self.underlines {
             if underline.start < start || underline.end > end {
                 continue;
@@ -914,6 +1055,30 @@ impl Document {
             )
             .ok()
     }
+}
+
+fn source_line_has_cursor(text: &str, position: usize, cursors: &[usize]) -> bool {
+    let start = text[..position].rfind(['\r', '\n']).map_or(0, |p| p + 1);
+    let end = source_line_end(text, position);
+    let ends_without_newline = text
+        .as_bytes()
+        .last()
+        .is_some_and(|b| !matches!(b, b'\r' | b'\n'));
+    cursors.iter().any(|&p| {
+        start <= p && (p < end || (p == end && end == text.len() && ends_without_newline))
+    })
+}
+
+fn source_line_end(text: &str, position: usize) -> usize {
+    let mut end = text[position..]
+        .find(['\r', '\n'])
+        .map_or(text.len(), |p| position + p + 1);
+    if text.as_bytes().get(end.wrapping_sub(1)) == Some(&b'\r')
+        && text.as_bytes().get(end) == Some(&b'\n')
+    {
+        end += 1;
+    }
+    end
 }
 
 /// The Markdown parser has already classified a heading. Its final source
@@ -1385,6 +1550,110 @@ mod tests {
     }
 
     #[test]
+    fn native_code_uses_parser_owned_content_and_preserves_source_endings_and_reveal() {
+        let text = "Intro\r\n\r\n> ```rs\r\n> let a = \"café 👩🏽‍💻\";\r\n> > literal\r\n> ```\r\n\r\n    café\r\n    second\r\n";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        assert_eq!(doc.code.len(), 2);
+        let state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        let projection = doc
+            .native_projection(&state, 0, text.len(), &[], &[], &[])
+            .unwrap();
+        assert!(!projection.text.contains("```"));
+        assert!(projection
+            .text
+            .contains("let a = \"café 👩🏽‍💻\";\r\n> literal\r\n"));
+        assert!(projection.text.ends_with("café\r\nsecond\r\n"));
+        assert_eq!(
+            projection.text.matches("\r\n").count(),
+            text.matches("\r\n").count() - 2,
+            "only fence-owned line endings disappear"
+        );
+        for block in &doc.code {
+            for part in &block.content {
+                assert!(
+                    projection
+                        .segments
+                        .iter()
+                        .any(|s| s.kind == SegmentKind::Copy
+                            && s.source.start <= part.start
+                            && s.source.end >= part.end),
+                    "code bytes remain individually addressable: {part:?}"
+                );
+            }
+        }
+        let opening = text.find("```rs").unwrap();
+        let editing = doc
+            .native_projection(&state, 0, text.len(), &[opening + 1], &[], &[])
+            .unwrap();
+        assert!(
+            editing.text.contains("> ```rs\r\n"),
+            "editing reveals the exact fence/container line"
+        );
+        assert_eq!(editing.text.matches("```").count(), 1);
+        let body = text.find("let a").unwrap();
+        let editing = doc
+            .native_projection(&state, 0, text.len(), &[body + 1], &[], &[])
+            .unwrap();
+        assert!(
+            editing.text.contains("> let a"),
+            "container source reveals on the edited body line"
+        );
+        let start = text.find("literal").unwrap();
+        let end = doc.code[0].content.last().unwrap().end;
+        let clipped = doc
+            .native_projection(&state, start, end, &[], &[], &[])
+            .unwrap();
+        assert_eq!(
+            clipped.text,
+            &text[start..end],
+            "a window inside a code event retains the original content"
+        );
+        assert_eq!(clipped.source, start..end);
+        for text in [
+            "```",
+            "```\n```",
+            "```\r\n",
+            "```\nbody",
+            "- ```\n  code\n  ```\n",
+        ] {
+            let doc = Document::parse(text.into(), 0, 0, 1);
+            let p = doc
+                .native_projection(&state, 0, text.len(), &[], &[], &[])
+                .unwrap();
+            assert!(!p.text.contains("```"));
+            assert!(!p.text.is_empty(), "empty code keeps a native line");
+            assert_eq!(doc.text, text);
+        }
+        let text = "Intro\r\r    café\r    second\r";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        let native = doc
+            .native_projection(&state, 0, text.len(), &[], &[], &[])
+            .unwrap();
+        // Pulldown owns the continuation spaces as literal code for CR-only
+        // input. Preserve that parser-owned content rather than guessing.
+        assert_eq!(native.text, "Intro\r\rcafé\r    second\r");
+        let text = "```rs\r\nbody\r\n```\r\n";
+        let doc = Document::parse(text.into(), 0, 0, 1);
+        assert!(
+            !doc.native_projection(&state, 0, text.len(), &[text.len()], &[], &[])
+                .unwrap()
+                .text
+                .contains("```"),
+            "EOF after a newline belongs to the next line"
+        );
+        assert!(doc
+            .native_projection(&state, 0, text.len(), &[text.len() - 2], &[], &[])
+            .unwrap()
+            .text
+            .contains("```\r\n"));
+    }
+
+    #[test]
     fn native_blocks_do_not_inherit_terminal_column_padding_or_truncation() {
         let text = "| Header | More |\r\n| --- | --- |\r\n| all café content | tail |\r\n\r\n```rust\r\nlet value = 1;\r\n```\r\n\r\n- outer\r\n  - inner\r\n";
         let doc = Document::parse(text.into(), 0, 0, 1);
@@ -1422,10 +1691,9 @@ mod tests {
             let projection = doc
                 .native_projection(&state, 0, text.len(), &[], &[], &[])
                 .unwrap();
-            assert_eq!(
-                projection.text, text,
-                "all source survives at every terminal measure"
-            );
+            assert!(projection.text.contains("| all café content | tail |\r\n"));
+            assert!(projection.text.contains("\r\nlet value = 1;\r\n"));
+            assert!(!projection.text.contains("```"));
             if let Some(previous) = &native_text {
                 assert_eq!(&projection.text, previous);
             }
@@ -1439,11 +1707,9 @@ mod tests {
             let clipped = doc
                 .native_projection(&state, cell, code.end, &[], &[], &[])
                 .unwrap();
-            assert_eq!(
-                clipped.text,
-                &text[cell..code.end],
-                "clipping cannot restore a crossing terminal replacement"
-            );
+            assert!(clipped.text.contains("all café content | tail |\r\n"));
+            assert!(clipped.text.contains("let value = 1;\r\n"));
+            assert!(!clipped.text.contains(['┌', '─', '`']));
             let object = cell..cell + "all café content".len();
             let images = doc
                 .native_projection(&state, 0, text.len(), &[], &[object], &[])

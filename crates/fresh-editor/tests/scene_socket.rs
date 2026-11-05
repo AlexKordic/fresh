@@ -128,7 +128,8 @@ fn ready_scene(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor, app: &mut 
         std::thread::sleep(Duration::from_millis(2));
     }
     app.stream.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-    assert!(app.panes.iter().filter_map(|pane|pane.compose.as_ref()).all(|c|c.error.is_empty()), "formatting must succeed, not fall back after a timeout");
+    let errors:Vec<_>=app.panes.iter().filter_map(|pane|pane.compose.as_ref()).filter(|c|!c.error.is_empty()).map(|c|c.error.as_str()).collect();
+    assert!(errors.is_empty(), "formatting must succeed, not fall back after a timeout: {errors:?}");
     pb::Frame { seq: app.sequence, window_id: Some(app.window), pane_len: Some(app.panes.len() as u32),
         panes: app.panes.iter().enumerate().map(|(index,pane)|pb::PaneUpdate {index:index as u32,pane:Some(pane.clone())}).collect(), ..Default::default() }
 }
@@ -143,6 +144,9 @@ fn settle_bridge(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor) {
 
 #[test]
 fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
+    }
     let root = std::env::temp_dir().join(format!("fresh-scene-socket-{}", std::process::id()));
     let home = root.join("home");
     let work = root.join("work");
@@ -264,6 +268,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_list_markers_are_source_anchors_not_cell_widths(&root,&work);
     rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(&root,&work);
     rich_native_content_is_independent_of_terminal_markdown_measure(&root,&work);
+    rich_native_code_frames_reveal_and_edit_parser_owned_source(&root,&work);
     rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
@@ -353,7 +358,8 @@ fn rich_native_content_is_independent_of_terminal_markdown_measure(root:&std::pa
         ready_scene(&mut bridge,&mut ed,&mut app);
         let compose=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
         assert!(compose.text.contains("all café 👩🏽‍💻 cell text must survive even when it cannot fit the terminal allocation"));
-        assert!(compose.text.contains("```rust\r\nlet wide_value = \"all code content stays available\";\r\n```"));
+        assert!(compose.text.contains("\r\nlet wide_value = \"all code content stays available\";\r\n"));
+        assert!(!compose.text.contains("```"));
         if let Some(first)=&first { assert_eq!(&compose.text,first,"native content cannot depend on editor.page_width={measure}"); }
         else { first=Some(compose.text.clone()); }
         let state=ed.active_window().active_state();
@@ -362,6 +368,48 @@ fn rich_native_content_is_independent_of_terminal_markdown_measure(root:&std::pa
         assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
     }
     assert_ne!(terminal[0],terminal[1],"the fixture must exercise different terminal layouts");
+}
+
+fn rich_native_code_frames_reveal_and_edit_parser_owned_source(root:&std::path::Path,work:&std::path::Path) {
+    let text=|ed:&fresh::app::Editor|{let b=&ed.active_window().active_state().buffer;String::from_utf8(b.slice_bytes(0..b.len())).unwrap()};
+    let original="# Native code frames\r\n\r\nProportional prose before the code.\r\n\r\n```rust\r\nlet long_value = \"café 👩🏽‍💻 and enough code to wrap at narrow pixel widths without a terminal frame\";\r\nlet second = 2;\r\n```\r\n\r\n> > ```text\r\n> > quoted code\r\n> > > literal greater-than\r\n> > ```\r\n\r\n1. Parent item\r\n\r\n   ```rs\r\n   nested code\r\n   ```\r\n\r\n- ```\r\n  first child code\r\n  ```\r\n\r\n```\r\n```\r\n\r\n```text\r\nunterminated code\r\n";
+    let file=work.join("native-code.md"); std::fs::write(&file,original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed,&json!({})); }
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("native-code.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let hello=ready_scene(&mut bridge,&mut ed,&mut app);
+    let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let compose=pane.compose.as_ref().unwrap();
+    assert_eq!(compose.spans.iter().filter(|s|s.role==12).count(),6);
+    assert!(!compose.text.contains("```"));
+    assert!(compose.text.contains("> literal greater-than\r\n"));
+    assert!(!compose.text.contains("> > quoted code"));
+    if let Some(path)=std::env::var_os("FC_COMPOSE_CODE_SCENE_FILE") {
+        let mut fixture=compose.clone(); fixture.asset_authority=1; fixture.asset_document=1;
+        std::fs::write(path,fixture.encode_to_vec()).unwrap();
+    }
+    let mut scope=pane_scope(hello.window_id.unwrap(),pane);
+    let opening=original.find("```rust").unwrap();
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some((opening+3) as u64),..Default::default()});
+    assert!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().text.contains("```rust\r\n"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:2,kind:20,payload:pb::Paste {text:"x".into()}.encode_to_vec(),..Default::default()});
+    assert!(text(&ed).contains("```xrust"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:3,kind:21,payload:pb::Action {name:"undo".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    let body=original.find("café").unwrap();
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:4,position:Some(body as u64),..Default::default()});
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:5,kind:20,payload:pb::Paste {text:"X".into()}.encode_to_vec(),..Default::default()});
+    assert!(text(&ed).contains("Xcafé"));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:6,kind:21,payload:pb::Action {name:"undo".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:7,kind:21,payload:pb::Action {name:"save".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    let first=original.find("let long_value").unwrap();
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:8,position:Some(first as u64),..Default::default()});
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:9,kind:17,payload:pb::Key {key:"ArrowLeft".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    assert!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().text.contains("```rust"), "ordinary source movement can reveal the hidden opener");
+    assert_eq!(text(&ed),original);
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
 }
 
 fn rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(root:&std::path::Path,work:&std::path::Path) {
