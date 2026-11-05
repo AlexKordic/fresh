@@ -310,8 +310,20 @@ impl ConcealManager {
             .checked_add(source.len())
             .ok_or(ProjectionError::CoordinateOverflow)?;
         let ranges = self.query_viewport(source_start, source_end, marker_list, cursors);
+        let mut covered = None;
         let conceals: Vec<_> = ranges
             .into_iter()
+            // The grid consumes ranges in source order. A containing range
+            // wins until its end; an overlapping range extending past that
+            // end emits its replacement once on the still-uncovered suffix.
+            .filter_map(|(mut range, replacement)| {
+                if let Some(end) = covered {
+                    if range.end <= end { return None; }
+                    range.start = range.start.max(end);
+                }
+                covered = Some(range.end);
+                Some((range, replacement))
+            })
             .map(|(source, replacement)| Conceal {
                 source,
                 replacement,
@@ -468,6 +480,20 @@ impl Default for ConcealManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rich_projection_keeps_the_grid_precedence_for_crossing_and_nested_ranges() {
+        let mut markers = MarkerList::new();
+        markers.set_buffer_size(9);
+        let mut manager = ConcealManager::new();
+        manager.add(&mut markers, ns(), 1..5, Some("X".into()));
+        manager.add(&mut markers, ns(), 2..4, Some("nested".into()));
+        manager.add(&mut markers, ns(), 3..7, Some("Y".into()));
+        let projected = manager.project_text("abcdefghi", 0, &markers, &[]).unwrap();
+        assert_eq!(projected.text, "aXYhi");
+        assert!(manager.project_text("cdefghi", 2, &markers, &[]).is_err(),
+            "a requested window must still include the entire first conceal");
+    }
 
     #[test]
     fn rich_projection_uses_the_same_cursor_reveal_rules_without_marker_churn() {

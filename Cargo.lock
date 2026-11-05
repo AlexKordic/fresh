@@ -1415,6 +1415,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "similar",
  "ts-rs",
  "unicode-width",
 ]

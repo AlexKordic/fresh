@@ -19,6 +19,8 @@ pub enum SegmentKind {
     Copy,
     Hidden,
     Replacement,
+    /// Presentation text inserted at a source boundary, such as cell padding.
+    Insertion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,22 +96,80 @@ impl Projection {
         let mut from = source_start;
         for conceal in ordered {
             result.copy(source, source_start, from..conceal.source.start);
-            let start = result.text.len();
-            result.text.push_str(conceal.replacement.unwrap_or(""));
-            let end = result.text.len();
-            result.segments.push(Segment {
-                source: conceal.source.clone(),
-                display: start..end,
-                kind: if start == end {
-                    SegmentKind::Hidden
-                } else {
-                    SegmentKind::Replacement
-                },
-            });
+            result.replace(source, source_start, conceal);
             from = conceal.source.end;
         }
         result.copy(source, source_start, from..source_end);
         Ok(result)
+    }
+
+    fn replace(&mut self, source: &str, source_start: usize, conceal: &Conceal<'_>) {
+        use similar::{DiffTag, TextDiff};
+        let old = &source[conceal.source.start - source_start..conceal.source.end - source_start];
+        let new = conceal.replacement.unwrap_or("");
+        let display_start = self.text.len();
+        self.text.push_str(new);
+        // Retain identical source text inside replacements (notably padded
+        // table cells). A diff timeout only coalesces unmatched content into
+        // an atomic replacement; it cannot invent a source character.
+        let diff = TextDiff::configure()
+            .timeout(std::time::Duration::from_millis(2))
+            .diff_chars(old, new);
+        let old_bytes: Vec<_> = old
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain([old.len()])
+            .collect();
+        let new_bytes: Vec<_> = new
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain([new.len()])
+            .collect();
+        let mut from = (0, 0);
+        for op in diff.ops() {
+            if op.tag() != DiffTag::Equal {
+                continue;
+            }
+            let a = op.old_range();
+            let b = op.new_range();
+            let to = (old_bytes[a.start], new_bytes[b.start]);
+            self.segment(
+                conceal.source.start + from.0..conceal.source.start + to.0,
+                display_start + from.1..display_start + to.1,
+                false,
+            );
+            from = (old_bytes[a.end], new_bytes[b.end]);
+            self.segment(
+                conceal.source.start + to.0..conceal.source.start + from.0,
+                display_start + to.1..display_start + from.1,
+                true,
+            );
+        }
+        self.segment(
+            conceal.source.start + from.0..conceal.source.end,
+            display_start + from.1..display_start + new.len(),
+            false,
+        );
+    }
+
+    fn segment(&mut self, source: Range<usize>, display: Range<usize>, copied: bool) {
+        if source.is_empty() && display.is_empty() {
+            return;
+        }
+        let kind = if copied {
+            SegmentKind::Copy
+        } else if source.is_empty() {
+            SegmentKind::Insertion
+        } else if display.is_empty() {
+            SegmentKind::Hidden
+        } else {
+            SegmentKind::Replacement
+        };
+        self.segments.push(Segment {
+            source,
+            display,
+            kind,
+        });
     }
 
     fn copy(&mut self, source: &str, source_start: usize, range: Range<usize>) {
@@ -127,7 +187,8 @@ impl Projection {
     }
 
     /// Resolve a displayed caret, including the two sides of concealed markup.
-    /// A replacement is atomic: its interior addresses a source range edge.
+    /// Unmatched replacement content addresses a source edge; identical text
+    /// within a replacement remains individually addressable.
     pub fn source_position(&self, display: usize, affinity: Affinity) -> Option<usize> {
         if !self.text.is_char_boundary(display) {
             return None;
@@ -174,6 +235,10 @@ impl Projection {
             }
             let display = match segment.kind {
                 SegmentKind::Copy => segment.display.start + source - segment.source.start,
+                SegmentKind::Insertion => match affinity {
+                    Affinity::Upstream => segment.display.start,
+                    Affinity::Downstream => segment.display.end,
+                },
                 _ if source == segment.source.start => segment.display.start,
                 _ if source == segment.source.end => segment.display.end,
                 _ => match affinity {
@@ -279,10 +344,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.text, "one two");
-        assert_eq!(p.source_position(3, Affinity::Downstream), Some(5));
+        assert_eq!(p.source_position(3, Affinity::Upstream), Some(5));
+        assert_eq!(p.source_position(3, Affinity::Downstream), Some(8));
         assert_eq!(p.source_position(4, Affinity::Downstream), Some(9));
         assert_eq!(p.display_position(7, Affinity::Upstream), Some(3));
-        assert_eq!(p.display_position(7, Affinity::Downstream), Some(4));
+        assert_eq!(p.display_position(7, Affinity::Downstream), Some(3));
+    }
+
+    #[test]
+    fn padded_replacement_retains_the_source_characters_and_maps_insertions() {
+        let p = Projection::new(
+            "abc",
+            40,
+            &[Conceal {
+                source: 40..43,
+                replacement: Some("    abc   "),
+            }],
+        )
+        .unwrap();
+        assert_eq!(p.display_position(40, Affinity::Upstream), Some(0));
+        assert_eq!(p.display_position(40, Affinity::Downstream), Some(4));
+        assert_eq!(p.display_position(41, Affinity::Downstream), Some(5));
+        assert_eq!(p.source_position(5, Affinity::Downstream), Some(41));
+        assert_eq!(p.source_position(2, Affinity::Downstream), Some(40));
+        assert_eq!(p.source_position(9, Affinity::Downstream), Some(43));
+        assert_eq!(p.display_position(43, Affinity::Upstream), Some(7));
+        assert_eq!(p.display_position(43, Affinity::Downstream), Some(10));
+
+        let source = "  **café 👩🏽‍💻**  ";
+        let p = Projection::new(
+            source,
+            0,
+            &[Conceal {
+                source: 0..source.len(),
+                replacement: Some(" café 👩🏽‍💻     "),
+            }],
+        )
+        .unwrap();
+        for (byte, _) in "afé 👩🏽‍💻".char_indices() {
+            let source_byte = "  **c".len() + byte;
+            let display_byte = p
+                .display_position(source_byte, Affinity::Downstream)
+                .unwrap();
+            assert_eq!(
+                p.source_position(display_byte, Affinity::Downstream),
+                Some(source_byte)
+            );
+        }
     }
 
     #[test]
