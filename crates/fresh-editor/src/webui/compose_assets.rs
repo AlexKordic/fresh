@@ -12,6 +12,7 @@ use std::sync::{mpsc, Arc, Mutex};
 pub(crate) struct Target {
     pub scope: super::compose::Scope,
     pub fs: Arc<dyn FileSystem + Send + Sync>,
+    pub document: PathBuf,
 }
 
 impl Target {
@@ -22,9 +23,10 @@ impl Target {
             .is_some_and(|window| {
                 window.pane_buffer(self.scope.leaf) == Some(self.scope.buffer)
                     && Arc::ptr_eq(&self.fs, &window.authority().filesystem)
-                    && window
-                        .buffer_state(self.scope.buffer)
-                        .is_some_and(|state| state.buffer.version() == self.scope.revision)
+                    && window.buffer_state(self.scope.buffer).is_some_and(|state| {
+                        state.buffer.version() == self.scope.revision
+                            && state.buffer.file_path() == Some(self.document.as_path())
+                    })
             })
     }
 }
@@ -40,6 +42,7 @@ pub(crate) struct Request {
     pub end: usize,
     pub cancel: bool,
     pub authority: u64,
+    pub document: u64,
 }
 
 impl Request {
@@ -51,6 +54,7 @@ impl Request {
             end: 0,
             cancel: false,
             authority: 0,
+            document: 0,
         };
         for field in Reader::new(bytes) {
             match field? {
@@ -62,6 +66,7 @@ impl Request {
                 (4, v) => request.end = v.uint() as usize,
                 (5, v) => request.cancel = v.flag(),
                 (6, v) => request.authority = v.uint(),
+                (7, v) => request.document = v.uint(),
                 _ => {}
             }
         }

@@ -40,6 +40,7 @@ pub(crate) struct Input<'a> {
     pub layout_id: u64,
     pub affinity: super::compose_navigation::Affinity,
     pub region: Option<usize>,
+    pub attachment_start: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +114,7 @@ impl<'a> Input<'a> {
             layout_id: 0,
             affinity: super::compose_navigation::Affinity::Downstream,
             region: None,
+            attachment_start: None,
         };
         for field in Reader::new(bytes) {
             match field? {
@@ -129,6 +131,7 @@ impl<'a> Input<'a> {
                     input.affinity = super::compose_navigation::Affinity::Upstream
                 }
                 (11, value) => input.region = Some(value.uint() as usize),
+                (12, value) => input.attachment_start = Some(value.uint() as usize),
                 _ => {}
             }
         }
@@ -136,9 +139,14 @@ impl<'a> Input<'a> {
     }
 
     pub fn pointer(&self, editor: &mut Editor) -> bool {
-        let (Some(scope), Some(position)) = (&self.scope, self.position) else {
+        let (Some(scope), Some(mut position)) = (&self.scope, self.position) else {
             return false;
         };
+        if let Some(start) = self.attachment_start {
+            if self.count >= 2 {
+                position = start + 2;
+            }
+        }
         let Some(state) = editor.active_window().buffer_state(scope.buffer) else {
             return false;
         };
@@ -155,18 +163,27 @@ impl<'a> Input<'a> {
             return false;
         }
         editor.focus_split(scope.leaf, scope.buffer);
+        if let Some(start) = self.attachment_start.filter(|_| self.count < 2) {
+            editor
+                .active_window_mut()
+                .set_buffer_cursor_in_splits_selecting(scope.buffer, start, &[scope.leaf], false);
+        }
         editor
             .active_window_mut()
             .set_buffer_cursor_in_splits_selecting(
                 scope.buffer,
                 position,
                 &[scope.leaf],
-                self.extend,
+                self.extend || self.attachment_start.is_some() && self.count < 2,
             );
         editor.mark_plugin_snapshot_dirty();
         editor.shell_description_stale = true;
         use crate::input::keybindings::Action;
-        match self.count {
+        match if self.attachment_start.is_some() {
+            1
+        } else {
+            self.count
+        } {
             2 => {
                 let _ = editor.handle_action(Action::SelectWord);
             }
@@ -206,6 +223,7 @@ pub(crate) struct ComposeImage {
     pub alt: String,
     pub title: String,
     pub block: bool,
+    pub rendered: bool,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -233,6 +251,7 @@ pub(crate) struct ComposePane {
     pub top_byte: usize,
     pub document_len: usize,
     pub asset_authority: u64,
+    pub asset_document: u64,
 }
 
 struct Document {
@@ -280,6 +299,7 @@ impl Document {
                         title: title.into_string(),
                         alt: String::new(),
                         block: before.trim().is_empty() && after.trim().is_empty(),
+                        rendered: false,
                     });
                 }
                 Event::Text(text) => {
@@ -289,7 +309,9 @@ impl Document {
                 }
                 Event::End(TagEnd::Image) => {
                     if let Some(image) = image_stack.pop() {
-                        images.push(image);
+                        if let Some(parent) = image_stack.last_mut() {
+                            parent.alt.push_str(&image.alt);
+                        } else { images.push(image); }
                     }
                 }
                 _ => {}
@@ -390,6 +412,11 @@ impl ComposeCache {
             return None;
         }
         let revision = state.buffer.version();
+        let mut document_hash = std::collections::hash_map::DefaultHasher::new();
+        state.buffer.file_path().hash(&mut document_hash);
+        buffer.0.hash(&mut document_hash);
+        asset_authority.hash(&mut document_hash);
+        let asset_document = document_hash.finish();
         let key = (window_id, buffer.0);
         self.clock += 1;
         if !self
@@ -454,15 +481,28 @@ impl ComposeCache {
             }
         }
         let raw = doc.text.get(start..end)?;
+        let objects: Vec<_> = doc
+            .images
+            .iter()
+            .filter(|image| {
+                image.start >= start
+                    && image.end <= end
+                    && !cursor_positions
+                        .iter()
+                        .any(|&position| position > image.start && position < image.end)
+            })
+            .map(|image| image.start..image.end)
+            .collect();
         let projection = state
             .conceals
-            .project_text(raw, start, &state.marker_list, &cursor_positions)
+            .project_text_with_objects(raw, start, &state.marker_list, &cursor_positions, &objects)
             .ok()?;
         let mut pane = ComposePane::from_projection(
             projection, doc, revision, cursors, focused, top_byte, &context,
         );
         pane.keyboard = owns_keyboard && focused;
         pane.asset_authority = asset_authority;
+        pane.asset_document = asset_document;
         Some(pane)
     }
 }
@@ -488,6 +528,12 @@ impl ComposePane {
             .iter()
             .filter(|s| s.start >= p.source.start && s.end <= p.source.end)
             .cloned()
+            .map(|mut image| {
+                image.rendered = !cursors
+                    .iter()
+                    .any(|cursor| cursor.position > image.start && cursor.position < image.end);
+                image
+            })
             .collect();
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         p.source.hash(&mut hash);
@@ -536,6 +582,7 @@ impl ComposePane {
             top_byte,
             document_len: doc.text.len(),
             asset_authority: 0,
+            asset_document: 0,
         }
     }
 }
@@ -543,6 +590,14 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_image_alt_stays_one_attachment() {
+        let doc = Document::parse("![outer ![inner](inner.png)](outer.png)\n".into(), 0, 0);
+        assert_eq!(doc.images.len(), 1);
+        assert_eq!(doc.images[0].target, "outer.png");
+        assert_eq!(doc.images[0].alt, "outer inner");
+    }
 
     #[test]
     fn semantic_ranges_include_setext_headings_and_real_image_destinations() {

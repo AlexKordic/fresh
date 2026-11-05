@@ -163,6 +163,16 @@ impl SceneBridge {
     /// `_rows` are there for the browser bridge's HTTP `/resize`.
     pub fn poll(&mut self, editor: &mut Editor, _cols: &mut u16, _rows: &mut u16) -> BridgePoll {
         let mut out = BridgePoll::default();
+        // Release payloads sent in the previous push before accepting the
+        // next requests. A client may pipeline another image with its Applied
+        // ack; it must not receive a spurious busy reply for an already freed
+        // transfer slot.
+        for client in &mut self.clients {
+            for id in client.asset_finished.drain(..) {
+                self.assets.cancel(client.id, id);
+                client.asset_targets.remove(&id);
+            }
+        }
         let had_clients = !self.clients.is_empty();
         let mut i = 0;
         while i < self.clients.len() {
@@ -179,10 +189,6 @@ impl SceneBridge {
         let live: HashSet<_> = self.clients.iter().map(|client| client.id).collect();
         self.assets.retain_clients(&live);
         for client in &mut self.clients {
-            for id in client.asset_finished.drain(..) {
-                self.assets.cancel(client.id, id);
-                client.asset_targets.remove(&id);
-            }
             let obsolete: Vec<_> = client.asset_targets.iter().filter(|(_, target)| !target.current(editor)).map(|(id, _)| *id).collect();
             for id in obsolete {
                 self.assets.cancel(client.id, id);
@@ -489,12 +495,13 @@ impl SceneClient {
                     let pane = compose.gather_at(editor, scope.leaf, scope.buffer, region).ok_or("image document is not composing")?;
                     if pane.buffer_revision != scope.revision { return Err("image source changed; request its current annotation".into()); }
                     if pane.asset_authority != request.authority { return Err("image filesystem authority changed".into()); }
+                    if pane.asset_document != request.document { return Err("image document path changed".into()); }
                     let image = pane.images.iter().find(|image| image.start == request.start && image.end == request.end)
                         .ok_or("image annotation is no longer in this source region")?;
                     let window = editor.active_window();
                     let document = window.buffer_state(scope.buffer).and_then(|s| s.buffer.file_path()).ok_or("save the document before loading relative images")?;
                     let path = super::compose_assets::resolve(document, &image.target)?;
-                    Ok((super::compose_assets::Target { scope: *scope, fs: window.authority().filesystem.clone() }, path))
+                    Ok((super::compose_assets::Target { scope: *scope, fs: window.authority().filesystem.clone(), document: document.to_path_buf() }, path))
                 })();
                 let result = resolved.and_then(|(target, path)| {
                     assets.submit(self.id, request.id, target.fs.clone(), path)?;
@@ -528,6 +535,11 @@ impl SceneClient {
                         return Ok(());
                     }
                     if input.position.is_some() {
+                        if let Some(start) = input.attachment_start {
+                            if input.extend || !snapshot.as_ref().is_some_and(|pane| pane.images.iter().any(|image| image.rendered && image.start == start && Some(image.end) == input.position)) {
+                                return Err("image selection does not match its source annotation".into());
+                            }
+                        }
                         accepted = input.pointer(editor);
                         out.mutated |= accepted;
                         if accepted { reply.carets = self.navigation.pointer(editor, &input); }

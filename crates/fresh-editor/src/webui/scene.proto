@@ -327,6 +327,7 @@ message ComposePane {
   uint64 selection_revision = 13;
   bool keyboard = 14;
   uint64 asset_authority = 15;
+  uint64 asset_document = 16;
 }
 
 // kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
@@ -354,6 +355,7 @@ message ComposeImage {
   string alt = 4;
   string title = 5;
   bool block = 6;
+  bool rendered = 7;
 }
 
 message ComposeSelection {
@@ -686,6 +688,7 @@ message ComposeInput {
   uint64 layout_id = 9;
   uint32 affinity = 10;
   optional uint64 region = 11;
+  optional uint64 attachment_start = 12;
 }
 // Type 28: read the image annotation identified by this source range through
 // its document authority. No client-supplied path. Cancellation needs only id.
@@ -696,6 +699,7 @@ message ComposeAssetRequest {
   uint64 end = 4;
   bool cancel = 5;
   uint64 authority = 6;
+  uint64 document = 7;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.

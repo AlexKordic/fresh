@@ -79,7 +79,10 @@ impl crate::app::window::Window {
         }
 
         let buffer_id = self.active_buffer();
-        self.buffers
+        #[cfg(feature = "web")]
+        let graphical_action = action.clone();
+        let events = self
+            .buffers
             .with_buffer_and_split(buffer_id, active_split, |state, vs| {
                 let tab_size = state.buffer_settings.tab_size;
                 let auto_close = state.buffer_settings.auto_close;
@@ -96,7 +99,13 @@ impl crate::app::window::Window {
                     viewport_height,
                 )
             })
-            .expect("active window must have a populated split layout")
+            .expect("active window must have a populated split layout");
+        #[cfg(feature = "web")]
+        let events = events.map(|mut events| {
+            crate::webui::compose_navigation::object_events(self, &graphical_action, &mut events);
+            events
+        });
+        events
     }
 
     /// Handle PageUp/PageDown (and their select variants) by scrolling the

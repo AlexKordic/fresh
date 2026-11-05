@@ -213,7 +213,61 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_navigation_uses_measured_lines_after_resolving_a_key_chord(&root, &work);
     rich_source_regions_belong_to_each_client_and_expire_after_edits(&root,&work);
     rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(&root,&work);
+    rich_image_objects_select_edit_move_delete_and_undo_as_source(&root,&work);
     drop(std::fs::remove_dir_all(&root));
+}
+
+fn rich_image_objects_select_edit_move_delete_and_undo_as_source(root:&std::path::Path,work:&std::path::Path) {
+    let original="# Pictures\r\n\r\nBefore ![inline](x.png) after café.\r\n\r\n![block](x.png)\r\n\r\n![reference][asset]\r\n\r\n[asset]: <a b.png>\r\n\r\n`![code](not.png)`\r\n";
+    let file=work.join("image-edit.md"); std::fs::write(&file,original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed,&json!({})); }
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    for _ in 0..30 { let _=fresh::webui::scene_value(&mut ed,COLS,ROWS); apply_step(&mut ed,&json!({})); std::thread::sleep(Duration::from_millis(5)); }
+    let path=root.join("image-edit.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let hello=pb::ServerHello::decode(&app.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let mut scope=pane_scope(hello.window_id.unwrap(),pane);
+    let compose=pane.compose.as_ref().unwrap();
+    assert_eq!(compose.images.len(),3,"reference images parse, image-looking code does not");
+    assert_eq!(compose.text.matches('\u{fffc}').count(),3,"native objects are source-mapped before cell flattening");
+    if let Some(path)=std::env::var_os("FC_COMPOSE_IMAGE_SCENE_FILE") {
+        let mut fixture=compose.clone(); fixture.asset_authority=1; fixture.asset_document=1;
+        std::fs::write(path,fixture.encode_to_vec()).unwrap();
+    }
+    let image=compose.images[0].clone();
+    let point=|id,count|pb::ComposeInput {id,position:Some(image.end),attachment_start:Some(image.start),click_count:count,..Default::default()};
+    let key=|id,name:&str,shift|pb::ComposeInput {id,kind:17,payload:pb::Key {key:name.into(),shift,..Default::default()}.encode_to_vec(),..Default::default()};
+    let action=|id,name:&str|pb::ComposeInput {id,kind:21,payload:pb::Action {name:name.into(),args_json:String::new()}.encode_to_vec(),..Default::default()};
+    let text=|ed:&fresh::app::Editor|{let buffer=&ed.active_window().active_state().buffer;String::from_utf8(buffer.slice_bytes(0..buffer.len())).unwrap()};
+    let without=original.replacen("![inline](x.png)","",1);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,point(1,1));
+    let cursor=ed.active_window().active_cursors().primary();
+    assert_eq!(cursor.position,image.end as usize); assert_eq!(cursor.anchor,Some(image.start as usize));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,key(2,"Delete",false)); assert_eq!(text(&ed),without);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(3,"undo")); assert_eq!(text(&ed),original);
+    let edited=rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,point(4,2));
+    assert_eq!(ed.active_window().active_cursors().primary().position,image.start as usize+2);
+    let source=edited.panes.iter().find_map(|u|u.pane.as_ref().and_then(|p|p.compose.as_ref())).unwrap();
+    assert!(!source.images[0].rendered,"double-click reveals the exact markup for source editing");
+    let at=|id,position|pb::ComposeInput {id,position:Some(position),..Default::default()};
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(5,image.start));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,key(6,"ArrowRight",false));
+    assert_eq!(ed.active_window().active_cursors().primary().position,image.end as usize);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,key(7,"ArrowLeft",false));
+    assert_eq!(ed.active_window().active_cursors().primary().position,image.start as usize);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,key(8,"ArrowRight",true));
+    let cursor=ed.active_window().active_cursors().primary(); assert_eq!(cursor.anchor,Some(image.start as usize)); assert_eq!(cursor.position,image.end as usize);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(9,image.end));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,key(10,"Backspace",false)); assert_eq!(text(&ed),without);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(11,"undo")); assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,at(12,image.start));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,key(13,"Delete",false)); assert_eq!(text(&ed),without);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(14,"undo")); assert_eq!(text(&ed),original);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(15,"save"));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes(),"native object editing and undo preserve exact CRLF bytes");
 }
 
 fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path::Path,work:&std::path::Path) {
@@ -237,7 +291,7 @@ fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path
     let mut scope=pane_scope(hello.window_id.unwrap(),pane);
     let compose=pane.compose.as_ref().unwrap(); let image=&compose.images[0];
     let request=pb::ComposeAssetRequest {id:1,scope:Some(scope.clone()),start:image.start,end:image.end,
-        authority:compose.asset_authority,..Default::default()};
+        authority:compose.asset_authority,document:compose.asset_document,..Default::default()};
     assert_ne!(request.authority,0);
     app.send(28,request.clone());
     let mut received=Vec::new(); let mut done=false; let mut moved=false;

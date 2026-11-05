@@ -305,20 +305,43 @@ impl ConcealManager {
         marker_list: &MarkerList,
         cursors: &[usize],
     ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
+        self.project_text_with_objects(source, source_start, marker_list, cursors, &[])
+    }
+
+    /// Graphical objects take priority over a cell decoration crossing their
+    /// source range. Such a decoration cannot be cut into meaningful halves;
+    /// retain the original surrounding source and let native text layout wrap
+    /// it, rather than inventing partial replacement mappings. The terminal
+    /// projection continues to use its original decorations unchanged.
+    pub fn project_text_with_objects(
+        &self,
+        source: &str,
+        source_start: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+        objects: &[Range<usize>],
+    ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
         use fresh_core::compose::{Conceal, Projection, ProjectionError};
         let source_end = source_start
             .checked_add(source.len())
             .ok_or(ProjectionError::CoordinateOverflow)?;
         let ranges = self.query_viewport(source_start, source_end, marker_list, cursors);
         let mut covered = None;
-        let conceals: Vec<_> = ranges
+        let mut conceals: Vec<_> = ranges
             .into_iter()
+            .filter(|(range, _)| {
+                !objects
+                    .iter()
+                    .any(|object| range.start < object.end && range.end > object.start)
+            })
             // The grid consumes ranges in source order. A containing range
             // wins until its end; an overlapping range extending past that
             // end emits its replacement once on the still-uncovered suffix.
             .filter_map(|(mut range, replacement)| {
                 if let Some(end) = covered {
-                    if range.end <= end { return None; }
+                    if range.end <= end {
+                        return None;
+                    }
                     range.start = range.start.max(end);
                 }
                 covered = Some(range.end);
@@ -329,6 +352,10 @@ impl ConcealManager {
                 replacement,
             })
             .collect();
+        conceals.extend(objects.iter().cloned().map(|source| Conceal {
+            source,
+            replacement: Some("\u{fffc}"),
+        }));
         Projection::new(source, source_start, &conceals)
     }
 
@@ -482,6 +509,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn graphical_objects_replace_crossing_cell_decorations_without_losing_source() {
+        let source = "before ![x](a.png) after\n";
+        let start = source.find('!').unwrap();
+        let end = source.find(")").unwrap() + 1;
+        let mut markers = MarkerList::new();
+        markers.set_buffer_size(source.len());
+        let mut manager = ConcealManager::new();
+        manager.add(
+            &mut markers,
+            ns(),
+            0..source.len(),
+            Some("cell replacement".into()),
+        );
+        let native = manager
+            .project_text_with_objects(source, 0, &markers, &[], &[start..end])
+            .unwrap();
+        assert_eq!(native.text, "before \u{fffc} after\n");
+        assert_eq!(
+            native.source_position(start, fresh_core::compose::Affinity::Downstream),
+            Some(start)
+        );
+        assert_eq!(
+            native.source_position(start + 3, fresh_core::compose::Affinity::Downstream),
+            Some(end)
+        );
+        assert_eq!(
+            manager.project_text(source, 0, &markers, &[]).unwrap().text,
+            "cell replacement"
+        );
+    }
+
+    #[test]
     fn rich_projection_keeps_the_grid_precedence_for_crossing_and_nested_ranges() {
         let mut markers = MarkerList::new();
         markers.set_buffer_size(9);
@@ -491,8 +550,10 @@ mod tests {
         manager.add(&mut markers, ns(), 3..7, Some("Y".into()));
         let projected = manager.project_text("abcdefghi", 0, &markers, &[]).unwrap();
         assert_eq!(projected.text, "aXYhi");
-        assert!(manager.project_text("cdefghi", 2, &markers, &[]).is_err(),
-            "a requested window must still include the entire first conceal");
+        assert!(
+            manager.project_text("cdefghi", 2, &markers, &[]).is_err(),
+            "a requested window must still include the entire first conceal"
+        );
     }
 
     #[test]

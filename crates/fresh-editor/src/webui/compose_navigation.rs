@@ -425,8 +425,15 @@ impl Session {
             })
             .map(|c| c.layout.clone());
         let memory = std::mem::take(&mut self.memory);
-        editor.active_window_mut().compose_input =
-            Some(InputContext::new(scope.leaf, scope.buffer, layout, memory));
+        let mut context = InputContext::new(scope.leaf, scope.buffer, layout, memory);
+        context.source_revision = scope.revision;
+        context.images = snapshot
+            .images
+            .iter()
+            .filter(|image| image.rendered)
+            .map(|image| image.start..image.end)
+            .collect();
+        editor.active_window_mut().compose_input = Some(context);
         Ok(())
     }
 
@@ -599,6 +606,8 @@ pub(crate) struct InputContext {
     pub deferred: Option<Action>,
     pub need_region: Option<usize>,
     pub need_y: Option<f64>,
+    source_revision: u64,
+    images: Vec<std::ops::Range<usize>>,
     prepared: Option<(Action, Vec<Event>, HashMap<CursorId, Memory>)>,
 }
 
@@ -617,6 +626,8 @@ impl InputContext {
             deferred: None,
             need_region: None,
             need_y: None,
+            source_revision: 0,
+            images: Vec::new(),
             prepared: None,
         }
     }
@@ -750,6 +761,42 @@ impl InputContext {
 /// Run before macro recording or other action side effects. Deferral retains
 /// the resolved Action, so a key chord is not resolved a second time on retry.
 pub(crate) fn prepare_action(editor: &mut Editor, action: &Action) -> bool {
+    if matches!(action, Action::DeleteBackward | Action::DeleteForward) {
+        let window = editor.active_window_mut();
+        if let Some(context) = window.compose_input.as_ref().filter(|context| {
+            context.leaf == window.effective_active_split()
+                && context.buffer == window.active_buffer()
+                && context.source_revision == window.active_state().buffer.version()
+        }) {
+            // Let Fresh's normal deletion path merge selections, record undo,
+            // and handle all cursors. Only promote a rendered object's one
+            // adjacent character to its complete Markdown source range.
+            let selected: Vec<_> = window
+                .active_cursors()
+                .iter()
+                .filter_map(|(id, cursor)| {
+                    if cursor.has_block_selection()
+                        || cursor.anchor.is_some_and(|a| a != cursor.position)
+                    {
+                        return None;
+                    }
+                    let image = context.images.iter().find(|range| match action {
+                        Action::DeleteBackward => cursor.position == range.end,
+                        _ => cursor.position == range.start,
+                    })?;
+                    Some((id, image.clone()))
+                })
+                .collect();
+            for (id, image) in selected {
+                if let Some(cursor) = window.active_cursors_mut().get_mut(id) {
+                    cursor.clear_selection();
+                    cursor.anchor = Some(image.start);
+                    cursor.position = image.end;
+                }
+            }
+        }
+        return false;
+    }
     let Some((motion, select)) = classify(action) else {
         return false;
     };
@@ -775,6 +822,49 @@ pub(crate) fn prepare_action(editor: &mut Editor, action: &Action) -> bool {
     };
     window.compose_input = Some(context);
     deferred
+}
+
+/// Horizontal motions are ordinary Fresh events with one object-aware
+/// boundary adjustment. Other cursors keep their normal grapheme movement.
+pub(crate) fn object_events(window: &Window, action: &Action, events: &mut [Event]) {
+    let right = match action {
+        Action::MoveRight | Action::SelectRight => true,
+        Action::MoveLeft | Action::SelectLeft => false,
+        _ => return,
+    };
+    let Some(context) = window.compose_input.as_ref().filter(|context| {
+        context.leaf == window.effective_active_split()
+            && context.buffer == window.active_buffer()
+            && context.source_revision == window.active_state().buffer.version()
+    }) else {
+        return;
+    };
+    let select = matches!(action, Action::SelectLeft | Action::SelectRight);
+    for event in events {
+        let Event::MoveCursor {
+            cursor_id,
+            new_position: position,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(cursor) = window.active_cursors().get(*cursor_id) else {
+            continue;
+        };
+        if cursor.has_block_selection()
+            || !select && cursor.deselect_on_move && cursor.anchor.is_some_and(|a| a != cursor.position)
+        {
+            continue;
+        }
+        if let Some(image) = context
+            .images
+            .iter()
+            .find(|range| cursor.position == if right { range.start } else { range.end })
+        {
+            *position = if right { image.end } else { image.start };
+        }
+    }
 }
 
 pub(crate) fn action_events(window: &mut Window, action: &Action) -> Option<Vec<Event>> {

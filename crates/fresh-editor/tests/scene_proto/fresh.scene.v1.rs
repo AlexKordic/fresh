@@ -536,6 +536,8 @@ pub struct ComposePane {
     pub keyboard: bool,
     #[prost(uint64, tag = "15")]
     pub asset_authority: u64,
+    #[prost(uint64, tag = "16")]
+    pub asset_document: u64,
 }
 /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -578,6 +580,8 @@ pub struct ComposeImage {
     pub title: ::prost::alloc::string::String,
     #[prost(bool, tag = "6")]
     pub block: bool,
+    #[prost(bool, tag = "7")]
+    pub rendered: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeSelection {
@@ -1155,6 +1159,8 @@ pub struct ComposeInput {
     pub affinity: u32,
     #[prost(uint64, optional, tag = "11")]
     pub region: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "12")]
+    pub attachment_start: ::core::option::Option<u64>,
 }
 /// Type 28: read the image annotation identified by this source range through
 /// its document authority. No client-supplied path. Cancellation needs only id.
@@ -1172,6 +1178,8 @@ pub struct ComposeAssetRequest {
     pub cancel: bool,
     #[prost(uint64, tag = "6")]
     pub authority: u64,
+    #[prost(uint64, tag = "7")]
+    pub document: u64,
 }
 /// Measured geometry belongs to this client. Reused by id until source,
 /// projection, width or fonts change. All coordinates are native points.

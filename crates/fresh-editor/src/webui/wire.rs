@@ -916,7 +916,7 @@ proto! {
         6 segments: repeated ComposeSegment, 7 spans: repeated ComposeSpan,
         8 images: repeated ComposeImage, 9 cursors: repeated ComposeSelection,
         10 focused: bool, 11 top_byte: uint64, 12 document_len: uint64,
-        13 selection_revision: uint64, 14 keyboard: bool, 15 asset_authority: uint64,
+        13 selection_revision: uint64, 14 keyboard: bool, 15 asset_authority: uint64, 16 asset_document: uint64,
     }
     /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
     ComposeSegment {
@@ -928,7 +928,7 @@ proto! {
     ComposeSpan { 1 start: uint64, 2 end: uint64, 3 role: uint32, 4 flags: uint32 }
     ComposeImage {
         1 start: uint64, 2 end: uint64, 3 target: string,
-        4 alt: string, 5 title: string, 6 block: bool,
+        4 alt: string, 5 title: string, 6 block: bool, 7 rendered: bool,
     }
     ComposeSelection { 1 position: uint64, 2 anchor: optional uint64, 3 id: uint64, 4 primary: bool }
     /// A revisioned input was applied exactly once, or requires a fresh layout.
@@ -1206,6 +1206,7 @@ message ComposeInput {
   uint64 layout_id = 9;
   uint32 affinity = 10;
   optional uint64 region = 11;
+  optional uint64 attachment_start = 12;
 }
 // Type 28: read the image annotation identified by this source range through
 // its document authority. No client-supplied path. Cancellation needs only id.
@@ -1216,6 +1217,7 @@ message ComposeAssetRequest {
   uint64 end = 4;
   bool cancel = 5;
   uint64 authority = 6;
+  uint64 document = 7;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.
