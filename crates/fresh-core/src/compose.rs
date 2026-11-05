@@ -104,17 +104,50 @@ impl Projection {
     }
 
     fn replace(&mut self, source: &str, source_start: usize, conceal: &Conceal<'_>) {
-        use similar::{DiffTag, TextDiff};
         let old = &source[conceal.source.start - source_start..conceal.source.end - source_start];
         let new = conceal.replacement.unwrap_or("");
         let display_start = self.text.len();
         self.text.push_str(new);
-        // Retain identical source text inside replacements (notably padded
-        // table cells). A diff timeout only coalesces unmatched content into
-        // an atomic replacement; it cannot invent a source character.
-        let diff = TextDiff::configure()
-            .timeout(std::time::Duration::from_millis(2))
-            .diff_chars(old, new);
+        // Padding/trimming is common, including very large table cells. Map
+        // those directly before considering a character diff.
+        if let Some(at) = new.find(old) {
+            self.segment(
+                conceal.source.start..conceal.source.start,
+                display_start..display_start + at,
+                false,
+            );
+            self.segment(
+                conceal.source.clone(),
+                display_start + at..display_start + at + old.len(),
+                true,
+            );
+            self.segment(
+                conceal.source.end..conceal.source.end,
+                display_start + at + old.len()..display_start + new.len(),
+                false,
+            );
+            return;
+        }
+        if !new.is_empty() {
+            if let Some(at) = old.find(new) {
+                self.segment(
+                    conceal.source.start..conceal.source.start + at,
+                    display_start..display_start,
+                    false,
+                );
+                self.segment(
+                    conceal.source.start + at..conceal.source.start + at + new.len(),
+                    display_start..display_start + new.len(),
+                    true,
+                );
+                self.segment(
+                    conceal.source.start + at + new.len()..conceal.source.end,
+                    display_start + new.len()..display_start + new.len(),
+                    false,
+                );
+                return;
+            }
+        }
         let old_bytes: Vec<_> = old
             .char_indices()
             .map(|(i, _)| i)
@@ -125,30 +158,37 @@ impl Projection {
             .map(|(i, _)| i)
             .chain([new.len()])
             .collect();
+        // Reuse the editor's deterministic, bounded patience/LCS engine, with
+        // Unicode scalars as the token ids. A clock deadline would make the
+        // projection revision vary between rendering and checking an input.
+        let old_tokens: Vec<_> = old.chars().map(u32::from).collect();
+        let new_tokens: Vec<_> = new.chars().map(u32::from).collect();
+        let changes = crate::diff::diff_interned_lines(&old_tokens, &new_tokens);
         let mut from = (0, 0);
-        for op in diff.ops() {
-            if op.tag() != DiffTag::Equal {
-                continue;
-            }
-            let a = op.old_range();
-            let b = op.new_range();
-            let to = (old_bytes[a.start], new_bytes[b.start]);
+        for change in changes {
+            let to = (
+                old_bytes[change.old_start as usize],
+                new_bytes[change.new_start as usize],
+            );
             self.segment(
                 conceal.source.start + from.0..conceal.source.start + to.0,
                 display_start + from.1..display_start + to.1,
-                false,
+                true,
             );
-            from = (old_bytes[a.end], new_bytes[b.end]);
+            from = (
+                old_bytes[(change.old_start + change.old_count) as usize],
+                new_bytes[(change.new_start + change.new_count) as usize],
+            );
             self.segment(
                 conceal.source.start + to.0..conceal.source.start + from.0,
                 display_start + to.1..display_start + from.1,
-                true,
+                false,
             );
         }
         self.segment(
             conceal.source.start + from.0..conceal.source.end,
             display_start + from.1..display_start + new.len(),
-            false,
+            true,
         );
     }
 
@@ -391,6 +431,30 @@ mod tests {
                 Some(source_byte)
             );
         }
+    }
+
+    #[test]
+    fn large_replacements_have_deterministic_bounded_maps_and_padding_stays_editable() {
+        let source = "a".repeat(4096);
+        let replacement = "b".repeat(4096);
+        let conceal = Conceal {
+            source: 0..source.len(),
+            replacement: Some(&replacement),
+        };
+        let first = Projection::new(&source, 0, &[conceal.clone()]).unwrap();
+        assert_eq!(first, Projection::new(&source, 0, &[conceal]).unwrap());
+        assert_eq!(first.segments.len(), 1);
+        let padded = format!("  {source}    ");
+        let p = Projection::new(
+            &source,
+            0,
+            &[Conceal {
+                source: 0..source.len(),
+                replacement: Some(&padded),
+            }],
+        )
+        .unwrap();
+        assert_eq!(p.source_position(2048, Affinity::Downstream), Some(2046));
     }
 
     #[test]
