@@ -65,7 +65,6 @@ pub struct SceneBridge {
     grid: GridHasher,
     /// The last push's scene, encoded once for every client.
     encoded: EncodedScene,
-    rich_encoded: EncodedScene,
     compose: super::compose::ComposeCache,
     /// Allocations of the last push, for the next frame's telemetry.
     last_push_allocs: Option<(u64, u64)>,
@@ -87,6 +86,8 @@ struct SceneClient {
     rich_compose: bool,
     last_input: u64,
     input_reply: Option<super::compose::InputReply>,
+    navigation: super::compose_navigation::Session,
+    rich_encoded: EncodedScene,
     /// What it has of the scene.
     scene: ClientScene,
     /// The last frame sent, and the last it applied.
@@ -123,7 +124,6 @@ impl SceneBridge {
             source: SceneSource::new(editor),
             grid: GridHasher::default(),
             encoded: EncodedScene::default(),
-            rich_encoded: EncodedScene::default(),
             compose: Default::default(),
             last_push_allocs: None,
         })
@@ -212,23 +212,9 @@ impl SceneBridge {
         let grid_started = Instant::now();
         let grid = self.grid.frame(model.buf);
         times.grid_ms = grid_started.elapsed().as_secs_f64() * 1000.0;
-        let rich = self.clients.iter().any(|c| c.greeted && c.rich_compose);
-        if rich && model.aux_modal.is_none() && editor.menu_state().active_menu.is_none() {
-            for pane in &mut model.panes {
-                if let Some(buffer) = pane.buffer {
-                    pane.compose = self.compose.gather(editor,
-                        fresh_core::LeafId(fresh_core::SplitId(pane.leaf)),
-                        crate::model::event::BufferId(buffer));
-                }
-            }
-        }
         let build_ms = started.elapsed().as_secs_f64() * 1000.0;
         let encode_started = Instant::now();
         let (clip_seq, clip_text) = source.clip.current(editor);
-        if rich {
-            self.rich_encoded.encode(&model, wire::Clipboard { seq: clip_seq, text: clip_text });
-            for pane in &mut model.panes { pane.compose = None; }
-        }
         self.encoded.encode(&model, wire::Clipboard { seq: clip_seq, text: clip_text });
         let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let base = Timing {
@@ -247,15 +233,41 @@ impl SceneBridge {
             if !client.greeted {
                 continue;
             }
-            let encoded = if client.rich_compose { &self.rich_encoded } else { &self.encoded };
+            // Text geometry and the requested source region belong to this
+            // client. The common grid and chrome are still rendered once.
+            let mut rich_encoded = std::mem::take(&mut client.rich_encoded);
+            let mut timing = base;
+            if client.rich_compose {
+                let gather_started = Instant::now();
+                if model.aux_modal.is_none() && editor.menu_state().active_menu.is_none() {
+                    for pane in &mut model.panes {
+                        if let Some(buffer) = pane.buffer {
+                            let leaf = fresh_core::LeafId(fresh_core::SplitId(pane.leaf));
+                            let buffer = crate::model::event::BufferId(buffer);
+                            let revision = editor.active_window().buffer_state(buffer).map_or(0, |state| state.buffer.version());
+                            let region = client.navigation.region(model.window_id, leaf, buffer, revision);
+                            pane.compose = self.compose.gather_at(editor, leaf, buffer, region);
+                        }
+                    }
+                }
+                timing.build_ms += gather_started.elapsed().as_secs_f64() * 1000.0;
+                let encode_started = Instant::now();
+                let (seq, text) = source.clip.current(editor);
+                rich_encoded.encode(&model, wire::Clipboard { seq, text });
+                timing.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+                timing.cpu_ms = process_cpu_ms();
+                for pane in &mut model.panes { pane.compose = None; }
+            }
+            let encoded = if client.rich_compose { &rich_encoded } else { &self.encoded };
             if !client.hello_sent {
                 client.send_hello(encoded, &grid);
             } else if client.ready() {
                 client.held = false;
-                client.send_frame(encoded, &grid, base);
+                client.send_frame(encoded, &grid, timing);
             } else {
                 client.held = true;
             }
+            client.rich_encoded = rich_encoded;
         }
         self.last_push_allocs = crate::alloc_stats::since(allocs_before);
         self.clients.iter().any(|c| c.held)
@@ -316,6 +328,8 @@ impl SceneClient {
             rich_compose: false,
             last_input: 0,
             input_reply: None,
+            navigation: Default::default(),
+            rich_encoded: EncodedScene::default(),
             scene: ClientScene::default(),
             seq: 0,
             applied: 0,
@@ -405,20 +419,50 @@ impl SceneClient {
                 if input.id > self.last_input.saturating_add(1) { return Err("rich input request ids must be sequential".into()); }
                 if self.input_reply.is_some() { return Err("rich inputs must wait for their reply".into()); }
                 let mut accepted = input.id <= self.last_input;
-                if !accepted && input.scope.as_ref().is_none_or(|scope| scope.matches(editor, compose)) {
+                let snapshot = input.scope.as_ref().and_then(|scope| {
+                    let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision);
+                    scope.snapshot(editor, compose, region)
+                });
+                let mut reply = super::compose::InputReply { id: input.id, accepted, ..Default::default() };
+                if !accepted && (input.scope.is_none() || snapshot.is_some()) {
+                    if let (Some(scope), Some(region)) = (&input.scope, input.region) {
+                        if region > snapshot.as_ref().unwrap().document_len { return Err("source region is outside the document".into()); }
+                        self.navigation.request_region(scope, region);
+                        reply.needs_layout = true;
+                        self.input_reply = Some(reply);
+                        out.frame_owed = true;
+                        return Ok(());
+                    }
                     if input.position.is_some() {
                         accepted = input.pointer(editor);
                         out.mutated |= accepted;
+                        if accepted { reply.carets = self.navigation.pointer(editor, &input); }
                     } else if (kind::KEY..=kind::KB_EDIT_CLICK).contains(&input.kind) {
-                        if let Some(scope) = &input.scope { editor.focus_split(scope.leaf, scope.buffer); }
-                        self.handle(input.kind, input.payload, editor, out, compose)?;
-                        accepted = true;
+                        if let Some(scope) = &input.scope {
+                            editor.focus_split(scope.leaf, scope.buffer);
+                            self.navigation.begin(editor, &input, snapshot.as_ref().unwrap())?;
+                        } else {
+                            self.navigation.clear();
+                        }
+                        let applied = if let Some(action) = self.navigation.pending_action(input.id) {
+                            out.mutated = true;
+                            editor.handle_action(action).map_err(|e| e.to_string())
+                        } else {
+                            self.handle(input.kind, input.payload, editor, out, compose)
+                        };
+                        // Always remove the per-input geometry, including a
+                        // malformed nested payload or a failed action. An
+                        // error must never leave it attached to terminal input.
+                        reply = self.navigation.finish(editor, &input);
+                        applied?;
+                        accepted = reply.accepted;
                     } else {
                         return Err("unsupported input inside ComposeInput".into());
                     }
                 }
                 if accepted { self.last_input = self.last_input.max(input.id); }
-                self.input_reply = Some(super::compose::InputReply { id: input.id, accepted });
+                reply.accepted = accepted;
+                self.input_reply = Some(reply);
                 out.frame_owed = true;
             }
             kind::KEY => {

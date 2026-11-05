@@ -298,6 +298,9 @@ impl LspCompletionCandidate {
 pub struct Window {
     /// Stable identifier. The base window is always `WindowId(1)`.
     pub id: WindowId,
+    /// Geometry is scoped to one scene input, never a terminal client's input.
+    #[cfg(feature = "web")]
+    pub(crate) compose_input: Option<crate::webui::compose_navigation::InputContext>,
 
     /// The connection this workspace acts through: where it acts, whether it
     /// may (`workspace_trust`), with what env, and what keeps the carrier alive.
@@ -2385,6 +2388,8 @@ impl Window {
         let search_defaults = resources.config.editor.search.clone();
         Self {
             id,
+            #[cfg(feature = "web")]
+            compose_input: None,
             label,
             stable_id: crate::workspace::generate_stable_id(),
             // A window is created because someone is about to work in it,

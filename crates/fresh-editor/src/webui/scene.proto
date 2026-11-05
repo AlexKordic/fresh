@@ -356,6 +356,16 @@ message ComposeSelection {
 message InputReply {
   uint64 id = 1;
   bool accepted = 2;
+  bool needs_layout = 3;
+  optional uint64 need_region = 4;
+  repeated ComposeCaret carets = 5;
+  optional double need_y = 6;
+}
+
+message ComposeCaret {
+  uint64 id = 1;
+  uint64 position = 2;
+  uint32 affinity = 3;
 }
 
 // A line between panes.
@@ -660,6 +670,38 @@ message ComposeInput {
   optional uint64 position = 5;
   bool extend = 6;
   uint32 click_count = 7;
+  ComposeLayout layout = 8;
+  uint64 layout_id = 9;
+  uint32 affinity = 10;
+  optional uint64 region = 11;
+}
+// Measured geometry belongs to this client. Reused by id until source,
+// projection, width or fonts change. All coordinates are native points.
+message ComposeLayout {
+  uint64 id = 1;
+  double page_height = 2;
+  uint64 source_start = 3;
+  uint64 source_end = 4;
+  uint64 document_len = 5;
+  repeated ComposeLine lines = 6;
+  uint64 total_lines = 7;
+  double height = 8;
+  uint64 style_revision = 9;
+}
+message ComposeLine {
+  double y = 1;
+  double height = 2;
+  uint64 source_start = 3;
+  uint64 source_end = 4;
+  repeated ComposeStop stops = 5;
+  ComposeStop start = 6;
+  ComposeStop end = 7;
+  uint64 number = 8;
+}
+message ComposeStop {
+  uint64 source = 1;
+  double x = 2;
+  uint32 affinity = 3;
 }
 // Type 17: a key, as a browser names it (key), the physical key (code), and
 // the modifiers held.

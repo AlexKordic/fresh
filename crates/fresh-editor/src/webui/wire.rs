@@ -756,6 +756,7 @@ impl<'a> Iterator for Reader<'a> {
 use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
 use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection};
 use super::compose::InputReply;
+use super::compose_navigation::CaretState;
 use crate::view::scene::{
     ContextMenuView, EntryDialogView, FileExplorerView, FileRow, KbConfirm, KbEditDialog, KbRow,
     KbSearchView, KeybindingEditorView, MapEntryView, MenuEntry, MenuItemView, PaletteView,
@@ -922,7 +923,12 @@ proto! {
     }
     ComposeSelection { 1 position: uint64, 2 anchor: optional uint64, 3 id: uint64, 4 primary: bool }
     /// A revisioned input was applied exactly once, or requires a fresh layout.
-    InputReply { 1 id: uint64, 2 accepted: bool }
+    InputReply {
+        1 id: uint64, 2 accepted: bool, 3 needs_layout: bool,
+        4 need_region: optional uint64, 5 carets: repeated ComposeCaret,
+        6 need_y: optional double,
+    }
+    CaretState as ComposeCaret { 1 id: uint64, 2 position: uint64, 3 affinity: uint32 }
     /// A line between panes.
     SeparatorModel as Separator { 1 vertical: bool, 2 x: uint32, 3 y: uint32, 4 len: uint32 }
     /// The colors chrome is drawn with, 0xRRGGBB, each left out for the default.
@@ -1186,6 +1192,38 @@ message ComposeInput {
   optional uint64 position = 5;
   bool extend = 6;
   uint32 click_count = 7;
+  ComposeLayout layout = 8;
+  uint64 layout_id = 9;
+  uint32 affinity = 10;
+  optional uint64 region = 11;
+}
+// Measured geometry belongs to this client. Reused by id until source,
+// projection, width or fonts change. All coordinates are native points.
+message ComposeLayout {
+  uint64 id = 1;
+  double page_height = 2;
+  uint64 source_start = 3;
+  uint64 source_end = 4;
+  uint64 document_len = 5;
+  repeated ComposeLine lines = 6;
+  uint64 total_lines = 7;
+  double height = 8;
+  uint64 style_revision = 9;
+}
+message ComposeLine {
+  double y = 1;
+  double height = 2;
+  uint64 source_start = 3;
+  uint64 source_end = 4;
+  repeated ComposeStop stops = 5;
+  ComposeStop start = 6;
+  ComposeStop end = 7;
+  uint64 number = 8;
+}
+message ComposeStop {
+  uint64 source = 1;
+  double x = 2;
+  uint32 affinity = 3;
 }
 // Type 17: a key, as a browser names it (key), the physical key (code), and
 // the modifiers held.

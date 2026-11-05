@@ -573,12 +573,29 @@ pub struct ComposeSelection {
     pub primary: bool,
 }
 /// A revisioned input was applied exactly once, or requires a fresh layout.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InputReply {
     #[prost(uint64, tag = "1")]
     pub id: u64,
     #[prost(bool, tag = "2")]
     pub accepted: bool,
+    #[prost(bool, tag = "3")]
+    pub needs_layout: bool,
+    #[prost(uint64, optional, tag = "4")]
+    pub need_region: ::core::option::Option<u64>,
+    #[prost(message, repeated, tag = "5")]
+    pub carets: ::prost::alloc::vec::Vec<ComposeCaret>,
+    #[prost(double, optional, tag = "6")]
+    pub need_y: ::core::option::Option<f64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeCaret {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(uint64, tag = "2")]
+    pub position: u64,
+    #[prost(uint32, tag = "3")]
+    pub affinity: u32,
 }
 /// A line between panes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1094,7 +1111,7 @@ pub struct ComposeScope {
 /// Type 27: serialized input for a rich client. kind/payload carry an existing
 /// input message unchanged. A pointer instead supplies a source position.
 /// Fresh acknowledges even a no-op. Rejected input is retried after the frame.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComposeInput {
     #[prost(uint64, tag = "1")]
     pub id: u64,
@@ -1110,6 +1127,65 @@ pub struct ComposeInput {
     pub extend: bool,
     #[prost(uint32, tag = "7")]
     pub click_count: u32,
+    #[prost(message, optional, tag = "8")]
+    pub layout: ::core::option::Option<ComposeLayout>,
+    #[prost(uint64, tag = "9")]
+    pub layout_id: u64,
+    #[prost(uint32, tag = "10")]
+    pub affinity: u32,
+    #[prost(uint64, optional, tag = "11")]
+    pub region: ::core::option::Option<u64>,
+}
+/// Measured geometry belongs to this client. Reused by id until source,
+/// projection, width or fonts change. All coordinates are native points.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeLayout {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(double, tag = "2")]
+    pub page_height: f64,
+    #[prost(uint64, tag = "3")]
+    pub source_start: u64,
+    #[prost(uint64, tag = "4")]
+    pub source_end: u64,
+    #[prost(uint64, tag = "5")]
+    pub document_len: u64,
+    #[prost(message, repeated, tag = "6")]
+    pub lines: ::prost::alloc::vec::Vec<ComposeLine>,
+    #[prost(uint64, tag = "7")]
+    pub total_lines: u64,
+    #[prost(double, tag = "8")]
+    pub height: f64,
+    #[prost(uint64, tag = "9")]
+    pub style_revision: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeLine {
+    #[prost(double, tag = "1")]
+    pub y: f64,
+    #[prost(double, tag = "2")]
+    pub height: f64,
+    #[prost(uint64, tag = "3")]
+    pub source_start: u64,
+    #[prost(uint64, tag = "4")]
+    pub source_end: u64,
+    #[prost(message, repeated, tag = "5")]
+    pub stops: ::prost::alloc::vec::Vec<ComposeStop>,
+    #[prost(message, optional, tag = "6")]
+    pub start: ::core::option::Option<ComposeStop>,
+    #[prost(message, optional, tag = "7")]
+    pub end: ::core::option::Option<ComposeStop>,
+    #[prost(uint64, tag = "8")]
+    pub number: u64,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ComposeStop {
+    #[prost(uint64, tag = "1")]
+    pub source: u64,
+    #[prost(double, tag = "2")]
+    pub x: f64,
+    #[prost(uint32, tag = "3")]
+    pub affinity: u32,
 }
 /// Type 17: a key, as a browser names it (key), the physical key (code), and
 /// the modifiers held.

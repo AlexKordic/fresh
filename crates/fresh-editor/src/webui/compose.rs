@@ -17,10 +17,14 @@ const SOURCE_LIMIT: usize = 2 << 20;
 const WINDOW_BYTES: usize = 64 << 10;
 const CACHE_LIMIT: usize = 8;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Default)]
 pub(crate) struct InputReply {
     pub id: u64,
     pub accepted: bool,
+    pub needs_layout: bool,
+    pub need_region: Option<usize>,
+    pub need_y: Option<f64>,
+    pub carets: Vec<super::compose_navigation::CaretState>,
 }
 
 pub(crate) struct Input<'a> {
@@ -31,8 +35,13 @@ pub(crate) struct Input<'a> {
     pub position: Option<usize>,
     pub extend: bool,
     pub count: u32,
+    pub layout: Option<&'a [u8]>,
+    pub layout_id: u64,
+    pub affinity: super::compose_navigation::Affinity,
+    pub region: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Scope {
     pub window: u64,
     pub leaf: LeafId,
@@ -67,15 +76,20 @@ impl Scope {
         Ok(scope)
     }
 
-    pub fn matches(&self, editor: &mut Editor, cache: &mut ComposeCache) -> bool {
+    pub fn snapshot(
+        &self,
+        editor: &mut Editor,
+        cache: &mut ComposeCache,
+        region: Option<usize>,
+    ) -> Option<ComposePane> {
         if editor.active_window().id.0 != self.window
             || editor.active_window().pane_buffer(self.leaf) != Some(self.buffer)
         {
-            return false;
+            return None;
         }
         cache
-            .gather(editor, self.leaf, self.buffer)
-            .is_some_and(|pane| {
+            .gather_at(editor, self.leaf, self.buffer, region)
+            .filter(|pane| {
                 pane.buffer_revision == self.revision
                     && pane.projection_revision == self.projection
                     && pane.selection_revision == self.selection
@@ -94,6 +108,10 @@ impl<'a> Input<'a> {
             position: None,
             extend: false,
             count: 1,
+            layout: None,
+            layout_id: 0,
+            affinity: super::compose_navigation::Affinity::Downstream,
+            region: None,
         };
         for field in Reader::new(bytes) {
             match field? {
@@ -104,6 +122,12 @@ impl<'a> Input<'a> {
                 (5, value) => input.position = Some(value.uint() as usize),
                 (6, value) => input.extend = value.flag(),
                 (7, value) => input.count = value.uint() as u32,
+                (8, Field::Bytes(bytes)) => input.layout = Some(bytes),
+                (9, value) => input.layout_id = value.uint(),
+                (10, value) if value.uint() == 1 => {
+                    input.affinity = super::compose_navigation::Affinity::Upstream
+                }
+                (11, value) => input.region = Some(value.uint() as usize),
                 _ => {}
             }
         }
@@ -297,11 +321,12 @@ pub(crate) struct ComposeCache {
 }
 
 impl ComposeCache {
-    pub fn gather(
+    pub fn gather_at(
         &mut self,
         editor: &mut Editor,
         leaf: LeafId,
         buffer: BufferId,
+        region: Option<usize>,
     ) -> Option<ComposePane> {
         use crate::input::keybindings::KeyContext;
         let context = editor.get_key_context();
@@ -365,7 +390,9 @@ impl ComposeCache {
         }
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
-        let mut start = top_byte.min(doc.text.len());
+        let mut start = region
+            .map_or(top_byte, |anchor| anchor.saturating_sub(WINDOW_BYTES / 3))
+            .min(doc.text.len());
         while !doc.text.is_char_boundary(start) {
             start -= 1;
         }

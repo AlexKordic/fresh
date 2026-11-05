@@ -73,6 +73,10 @@ impl Editor {
     /// Handle an action (for normal mode and command execution).
     /// Used by the app module internally and by the GUI module for native menu dispatch.
     pub(crate) fn handle_action(&mut self, action: Action) -> AnyhowResult<()> {
+        #[cfg(feature = "web")]
+        if crate::webui::compose_navigation::prepare_action(self, &action) {
+            return Ok(());
+        }
         self.mark_plugin_snapshot_dirty();
         use crate::input::keybindings::Action;
 

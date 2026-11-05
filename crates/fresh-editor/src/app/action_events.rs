@@ -48,6 +48,11 @@ impl crate::app::window::Window {
             }
         }
 
+        #[cfg(feature = "web")]
+        if let Some(events) = crate::webui::compose_navigation::action_events(self, &action) {
+            return Some(events);
+        }
+
         // Always try visual line movement first — it uses the cached layout to
         // move through soft-wrapped rows.  Returns None when the layout can't
         // resolve the movement, falling through to logical movement below.

@@ -112,6 +112,7 @@ use crate::view::scene::Rgb;
 
 mod wire;
 mod compose;
+pub(crate) mod compose_navigation;
 #[cfg(unix)]
 mod scene_bridge;
 #[cfg(unix)]
