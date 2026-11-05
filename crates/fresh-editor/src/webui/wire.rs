@@ -41,6 +41,7 @@ pub(crate) mod kind {
     pub const APPLIED: u64 = 26;
     pub const COMPOSE_INPUT: u64 = 27;
     pub const COMPOSE_ASSET: u64 = 28;
+    pub const COMPOSE_VIEWPORT_REQUEST: u64 = 29;
 }
 
 /// The protocol version a client's hello must name.
@@ -759,6 +760,7 @@ impl<'a> Iterator for Reader<'a> {
 use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
 use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection};
 use super::compose_assets::Chunk;
+use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewportReply};
 use super::compose::InputReply;
 use super::compose_navigation::CaretState;
 use crate::view::scene::{
@@ -788,6 +790,9 @@ pub(crate) struct Timing {
 }
 
 proto! {
+    /// A source marker and a caret-fragment offset in native points, per client.
+    ComposeViewport { 1 position: uint64, 2 affinity: uint32, 3 offset: double, 4 sequence: uint64, 5 epoch: uint64 }
+    ComposeViewportReply { 1 id: uint64, 2 accepted: bool }
     /// A bounded binary image payload, multiplexed with normal input/scene frames.
     Chunk as ComposeAssetChunk {
         1 id: uint64, 2 offset: uint64, 3 total: uint64, 4 data: bytes,
@@ -917,6 +922,7 @@ proto! {
         8 images: repeated ComposeImage, 9 cursors: repeated ComposeSelection,
         10 focused: bool, 11 top_byte: uint64, 12 document_len: uint64,
         13 selection_revision: uint64, 14 keyboard: bool, 15 asset_authority: uint64, 16 asset_document: uint64,
+        17 viewport: maybe ComposeViewport,
     }
     /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
     ComposeSegment {
@@ -935,7 +941,7 @@ proto! {
     InputReply {
         1 id: uint64, 2 accepted: bool, 3 needs_layout: bool,
         4 need_region: optional uint64, 5 carets: repeated ComposeCaret,
-        6 need_y: optional double,
+        6 need_y: optional double, 7 compose: maybe ComposePane,
     }
     CaretState as ComposeCaret { 1 id: uint64, 2 position: uint64, 3 affinity: uint32 }
     /// A line between panes.
@@ -1165,6 +1171,7 @@ message Frame {
   Timing timing = 23;
   InputReply input_reply = 24;
   repeated ComposeAssetChunk compose_assets = 25;
+  ComposeViewportReply viewport_reply = 26;
 }
 // Type 1: the answer to a ClientHello, with the whole scene.
 message ServerHello {
@@ -1218,6 +1225,16 @@ message ComposeAssetRequest {
   bool cancel = 5;
   uint64 authority = 6;
   uint64 document = 7;
+}
+// Type 29: coalesced pixel scrolling. The source marker is remapped from the
+// scope's buffer revision. offset is relative to the native content top.
+message ComposeViewportRequest {
+  uint64 id = 1;
+  ComposeScope scope = 2;
+  uint64 position = 3;
+  uint32 affinity = 4;
+  double offset = 5;
+  uint64 epoch = 6;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.

@@ -13,6 +13,7 @@ pub(crate) struct Target {
     pub scope: super::compose::Scope,
     pub fs: Arc<dyn FileSystem + Send + Sync>,
     pub document: PathBuf,
+    pub instance: usize,
 }
 
 impl Target {
@@ -26,6 +27,7 @@ impl Target {
                     && window.buffer_state(self.scope.buffer).is_some_and(|state| {
                         state.buffer.version() == self.scope.revision
                             && state.buffer.file_path() == Some(self.document.as_path())
+                            && state.marker_list.instance_id() == self.instance
                     })
             })
     }

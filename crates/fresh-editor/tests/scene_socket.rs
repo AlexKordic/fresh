@@ -44,13 +44,15 @@ fn varint(stream: &mut UnixStream) -> Option<u64> {
 /// The test's end of the socket.
 struct App {
     stream: UnixStream,
+    window: u64,
+    panes: Vec<pb::Pane>,
 }
 
 impl App {
     fn connect(path: &std::path::Path) -> Self {
         let stream = UnixStream::connect(path).expect("connect");
         stream.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        Self { stream }
+        Self { stream, window:0, panes:Vec::new() }
     }
 
     fn send(&mut self, kind: u64, message: impl Message) {
@@ -69,13 +71,30 @@ impl App {
         let len = varint(&mut self.stream)? as usize;
         let mut payload = vec![0; len];
         self.stream.read_exact(&mut payload).ok()?;
+        if kind==1 {
+            if let Ok(hello)=pb::ServerHello::decode(&payload[..]) { if let Some(frame)=hello.scene { self.observe(&frame); } }
+        }
         Some((kind, payload))
     }
 
     fn frame(&mut self) -> Option<pb::Frame> {
         let (kind, payload) = self.receive()?;
         assert_eq!(kind, 2, "a Frame");
-        Some(pb::Frame::decode(&payload[..]).expect("decode a Frame"))
+        let frame=pb::Frame::decode(&payload[..]).expect("decode a Frame");
+        self.observe(&frame);
+        Some(frame)
+    }
+
+    fn observe(&mut self,frame:&pb::Frame) {
+        if let Some(window)=frame.window_id {self.window=window;}
+        if let Some(count)=frame.pane_len {self.panes.resize(count as usize,pb::Pane::default());}
+        for update in &frame.panes {
+            if let Some(pane)=&update.pane {
+                let index=update.index as usize;
+                if self.panes.len()<=index {self.panes.resize(index+1,pb::Pane::default());}
+                self.panes[index]=pane.clone();
+            }
+        }
     }
 }
 
@@ -212,6 +231,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_compose_edits_keep_source_and_retry_obsolete_input(&root, &work);
     rich_navigation_uses_measured_lines_after_resolving_a_key_chord(&root, &work);
     rich_source_regions_belong_to_each_client_and_expire_after_edits(&root,&work);
+    rich_viewports_are_independent_and_rebase_queued_scrolls(&root, &work);
     rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(&root,&work);
     rich_image_objects_select_edit_move_delete_and_undo_as_source(&root,&work);
     drop(std::fs::remove_dir_all(&root));
@@ -370,7 +390,8 @@ fn rich_source_regions_belong_to_each_client_and_expire_after_edits(root: &std::
         moved=rich_step(&mut bridge,&mut ed,&mut a,&mut scope_a,request.clone());
     }
     assert!(moved.input_reply.as_ref().is_some_and(|r|!r.accepted&&r.needs_layout));
-    assert!(first(&moved).compose.unwrap().source_start>100_000);
+    assert!(moved.input_reply.as_ref().unwrap().compose.as_ref().unwrap().source_start>100_000);
+    assert_eq!(a.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().source_start,0,"geometry requests do not replace the visible viewport");
     for _ in 0..100 {
         if projected(&ed)==original[probe+2..probe_end-2] { break; }
         apply_step(&mut ed,&json!({}));
@@ -391,6 +412,110 @@ fn rich_source_regions_belong_to_each_client_and_expire_after_edits(root: &std::
     assert_eq!(fresh.source_start,0,"a stale byte hint expires after a source edit");
     assert_eq!(fresh.cursors.iter().find(|c|c.primary).unwrap().position,1);
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+}
+
+fn viewport_step(
+    bridge: &mut SceneBridge,
+    ed: &mut fresh::app::Editor,
+    app: &mut App,
+    request: pb::ComposeViewportRequest,
+) -> pb::Frame {
+    let id = request.id;
+    app.send(29, request);
+    settle_bridge(bridge, ed);
+    for _ in 0..12 {
+        let frame = app.frame().expect("viewport reply frame");
+        app.send(26, pb::Applied { seq: frame.seq });
+        if frame.viewport_reply.as_ref().is_some_and(|reply| reply.id == id) {
+            return frame;
+        }
+        settle_bridge(bridge, ed);
+    }
+    panic!("viewport reply was not delivered");
+}
+
+fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Path, work: &std::path::Path) {
+    let original = "# Scrolling\n\n".to_string()
+        + &(0..4000).map(|i| format!("Paragraph {i} with **emphasis** and enough text for distant viewports.\n\n")).collect::<String>();
+    let file = work.join("viewports.md");
+    std::fs::write(&file, &original).unwrap();
+    let mut ed = build_editor(COLS, ROWS, &[file.clone()], true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed, &json!({})); }
+    apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));
+    for _ in 0..50 {
+        apply_step(&mut ed, &json!({}));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let path = root.join("viewports.sock");
+    let mut bridge = SceneBridge::bind(&path, &ed).unwrap();
+    let mut a = App::connect(&path);
+    let mut b = App::connect(&path);
+    for app in [&mut a, &mut b] {
+        app.send(16, pb::ClientHello { version: 1, rich_compose: true, ..Default::default() });
+    }
+    settle_bridge(&mut bridge, &mut ed);
+    a.receive().unwrap(); b.receive().unwrap();
+    let active = |app: &App| app.panes.iter().find(|pane| pane.compose.is_some()).unwrap().clone();
+    let initial_a = active(&a);
+    let scope_a = pane_scope(a.window, &initial_a);
+    let mut scope_b = pane_scope(b.window, &active(&b));
+    let epoch = initial_a.compose.unwrap().viewport.unwrap().epoch;
+    let request = pb::ComposeViewportRequest {
+        id: 1, scope: Some(scope_a.clone()), position: 100_000, offset: -7.5, epoch,
+        ..Default::default()
+    };
+    let frame = viewport_step(&mut bridge, &mut ed, &mut a, request.clone());
+    assert!(frame.viewport_reply.unwrap().accepted);
+    let pane = active(&a);
+    let shown = pane.compose.unwrap();
+    assert!(shown.source_start > 0 && shown.source_start <= request.position && shown.source_end >= request.position);
+    assert_eq!(shown.viewport.as_ref().unwrap().position, 100_000);
+    assert_eq!(shown.viewport.as_ref().unwrap().offset, -7.5);
+    assert_eq!(shown.cursors.iter().find(|c| c.primary).unwrap().position, 0);
+    assert_eq!(active(&b).compose.unwrap().viewport.unwrap().position, 0);
+    assert_eq!(ed.active_window().focused_view().viewport.top_byte(), 0, "a graphical scroll cannot move the terminal");
+
+    // A scroll captured before another client inserts a multibyte prefix is
+    // still meaningful: its source marker and its queued byte coordinate
+    // must use the same left-gravity edit mapping.
+    let typed = rich_accepted(&mut bridge, &mut ed, &mut b, &mut scope_b, pb::ComposeInput {
+        id: 1, kind: 20, payload: pb::Paste { text: "é".into() }.encode_to_vec(), ..Default::default()
+    });
+    assert!(typed.input_reply.unwrap().accepted);
+    assert_eq!(active(&b).compose.unwrap().viewport.unwrap().position, 0, "inserting exactly at the top does not hide the inserted text");
+    let mut queued = request.clone(); queued.id = 2; queued.position += 128;
+    let frame = viewport_step(&mut bridge, &mut ed, &mut a, queued.clone());
+    assert!(frame.viewport_reply.unwrap().accepted);
+    let current = active(&a);
+    let rebased = current.compose.as_ref().unwrap().viewport.as_ref().unwrap();
+    assert_eq!(rebased.position, 100_130);
+    assert_eq!(rebased.offset, -7.5);
+    assert_eq!(rebased.sequence, 2);
+    assert_eq!(ed.active_window().focused_view().viewport.top_byte(), 0);
+    assert_eq!(current.compose.as_ref().unwrap().cursors.iter().find(|c| c.primary).unwrap().position, 2);
+
+    // A duplicate is acknowledged without reapplying a different payload.
+    queued.position = 3; queued.offset = -99.0;
+    assert!(viewport_step(&mut bridge, &mut ed, &mut a, queued).viewport_reply.unwrap().accepted);
+    assert_eq!(active(&a).compose.unwrap().viewport.unwrap(), *rebased);
+
+    let mut invalid = request;
+    invalid.scope = Some(pane_scope(a.window, &current));
+    invalid.id = 3; invalid.epoch += 1;
+    assert!(!viewport_step(&mut bridge, &mut ed, &mut a, invalid.clone()).viewport_reply.unwrap().accepted);
+    invalid.id = 4; invalid.epoch = epoch; invalid.position = 1;
+    assert!(!viewport_step(&mut bridge, &mut ed, &mut a, invalid.clone()).viewport_reply.unwrap().accepted,
+        "an interior UTF-8 byte cannot become a source anchor");
+    invalid.id = 5; invalid.position = 10; invalid.scope.as_mut().unwrap().buffer_revision += 1;
+    assert!(!viewport_step(&mut bridge, &mut ed, &mut a, invalid).viewport_reply.unwrap().accepted,
+        "a future source revision cannot become a source anchor");
+    assert_eq!(active(&a).compose.unwrap().viewport.unwrap(), *rebased);
+    assert_eq!(std::fs::read(&file).unwrap(), original.as_bytes(), "scrolling and dirty edits do not save implicitly");
+    drop(a);
+    settle_bridge(&mut bridge, &mut ed);
+    rich_accepted(&mut bridge, &mut ed, &mut b, &mut scope_b, pb::ComposeInput {
+        id: 2, kind: 17, payload: pb::Key { key: "Escape".into(), ..Default::default() }.encode_to_vec(), ..Default::default()
+    });
 }
 
 fn rich_accepted(bridge:&mut SceneBridge,ed:&mut fresh::app::Editor,app:&mut App,
@@ -420,6 +545,14 @@ fn rich_step(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor, app: &mut Ap
         for update in &frame.panes {
             if let Some(pane) = &update.pane {
                 if pane.leaf == scope.leaf && pane.compose.is_some() { *scope = pane_scope(scope.window_id, pane); }
+            }
+        }
+        if let Some(compose)=frame.input_reply.as_ref().and_then(|r|r.compose.as_ref()) {
+            scope.buffer_revision=compose.buffer_revision; scope.projection_revision=compose.projection_revision;
+            scope.selection_revision=compose.selection_revision;
+        } else if frame.input_reply.as_ref().is_some_and(|reply|reply.accepted) {
+            if let Some(pane)=app.panes.iter().find(|pane|pane.leaf==scope.leaf&&pane.compose.is_some()) {
+                *scope=pane_scope(app.window,pane);
             }
         }
         app.send(26,pb::Applied { seq:frame.seq });

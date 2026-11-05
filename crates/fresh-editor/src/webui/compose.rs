@@ -26,6 +26,7 @@ pub(crate) struct InputReply {
     pub need_region: Option<usize>,
     pub need_y: Option<f64>,
     pub carets: Vec<super::compose_navigation::CaretState>,
+    pub compose: Option<ComposePane>,
 }
 
 pub(crate) struct Input<'a> {
@@ -252,10 +253,12 @@ pub(crate) struct ComposePane {
     pub document_len: usize,
     pub asset_authority: u64,
     pub asset_document: u64,
+    pub viewport: Option<super::compose_viewport::Value>,
 }
 
 struct Document {
     revision: u64,
+    epoch: usize,
     text: String,
     spans: Vec<ComposeSpan>,
     images: Vec<ComposeImage>,
@@ -264,7 +267,7 @@ struct Document {
 }
 
 impl Document {
-    fn parse(text: String, revision: u64, used: u64) -> Self {
+    fn parse(text: String, revision: u64, used: u64, epoch: usize) -> Self {
         let mut spans = Vec::new();
         let mut images = Vec::new();
         let mut image_stack: Vec<ComposeImage> = Vec::new();
@@ -311,7 +314,9 @@ impl Document {
                     if let Some(image) = image_stack.pop() {
                         if let Some(parent) = image_stack.last_mut() {
                             parent.alt.push_str(&image.alt);
-                        } else { images.push(image); }
+                        } else {
+                            images.push(image);
+                        }
                     }
                 }
                 _ => {}
@@ -327,6 +332,7 @@ impl Document {
         }
         Self {
             revision,
+            epoch,
             text,
             spans,
             images,
@@ -416,13 +422,14 @@ impl ComposeCache {
         state.buffer.file_path().hash(&mut document_hash);
         buffer.0.hash(&mut document_hash);
         asset_authority.hash(&mut document_hash);
+        state.marker_list.instance_id().hash(&mut document_hash);
         let asset_document = document_hash.finish();
         let key = (window_id, buffer.0);
         self.clock += 1;
         if !self
             .documents
             .get(&key)
-            .is_some_and(|d| d.revision == revision)
+            .is_some_and(|d| d.revision == revision && d.epoch == state.marker_list.instance_id())
         {
             let bytes = state
                 .buffer
@@ -439,8 +446,10 @@ impl ComposeCache {
                     self.documents.remove(&oldest);
                 }
             }
-            self.documents
-                .insert(key, Document::parse(text, revision, self.clock));
+            self.documents.insert(
+                key,
+                Document::parse(text, revision, self.clock, state.marker_list.instance_id()),
+            );
         }
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
@@ -537,6 +546,7 @@ impl ComposePane {
             .collect();
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         p.source.hash(&mut hash);
+        doc.epoch.hash(&mut hash);
         p.text.hash(&mut hash);
         spans.hash(&mut hash);
         images.hash(&mut hash);
@@ -583,6 +593,7 @@ impl ComposePane {
             document_len: doc.text.len(),
             asset_authority: 0,
             asset_document: 0,
+            viewport: None,
         }
     }
 }
@@ -593,7 +604,7 @@ mod tests {
 
     #[test]
     fn nested_image_alt_stays_one_attachment() {
-        let doc = Document::parse("![outer ![inner](inner.png)](outer.png)\n".into(), 0, 0);
+        let doc = Document::parse("![outer ![inner](inner.png)](outer.png)\n".into(), 0, 0, 1);
         assert_eq!(doc.images.len(), 1);
         assert_eq!(doc.images[0].target, "outer.png");
         assert_eq!(doc.images[0].alt, "outer inner");
@@ -602,7 +613,7 @@ mod tests {
     #[test]
     fn semantic_ranges_include_setext_headings_and_real_image_destinations() {
         let text = "Title\n=====\n\n![an *image*][pic]\n\n[pic]: <images/a b.png> \"caption\"\n\n```md\n![fake](x.png)\n```\n";
-        let doc = Document::parse(text.to_string(), 0, 0);
+        let doc = Document::parse(text.to_string(), 0, 0, 1);
         assert!(doc.spans.iter().any(|s| s.role == 1 && s.start == 0));
         assert_eq!(doc.images.len(), 1);
         let image = &doc.images[0];

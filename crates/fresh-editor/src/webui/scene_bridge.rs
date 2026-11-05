@@ -25,6 +25,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_SCENE_CLIENT: AtomicU64 = AtomicU64::new(1);
 
 /// The socket's buffers each way: macOS gives a Unix socket 8 KiB, a
 /// fraction of one frame.
@@ -68,7 +71,7 @@ pub struct SceneBridge {
     encoded: EncodedScene,
     compose: super::compose::ComposeCache,
     assets: super::compose_assets::Service,
-    next_client: u64,
+    viewport_clients: HashSet<u64>,
     /// Allocations of the last push, for the next frame's telemetry.
     last_push_allocs: Option<(u64, u64)>,
 }
@@ -90,12 +93,15 @@ struct SceneClient {
     rich_compose: bool,
     last_input: u64,
     input_reply: Option<super::compose::InputReply>,
+    input_scope: Option<super::compose::Scope>,
     navigation: super::compose_navigation::Session,
     rich_encoded: EncodedScene,
     asset_transfers: VecDeque<super::compose_assets::Transfer>,
     asset_finished: Vec<u64>,
     last_asset: u64,
     asset_targets: HashMap<u64, super::compose_assets::Target>,
+    viewport_reply: Option<super::compose_viewport::Reply>,
+    last_viewport_reply: Option<super::compose_viewport::Reply>,
     /// What it has of the scene.
     scene: ClientScene,
     /// The last frame sent, and the last it applied.
@@ -134,7 +140,7 @@ impl SceneBridge {
             encoded: EncodedScene::default(),
             compose: Default::default(),
             assets: Default::default(),
-            next_client: 1,
+            viewport_clients: HashSet::new(),
             last_push_allocs: None,
         })
     }
@@ -188,6 +194,10 @@ impl SceneBridge {
         }
         let live: HashSet<_> = self.clients.iter().map(|client| client.id).collect();
         self.assets.retain_clients(&live);
+        if live != self.viewport_clients {
+            super::compose_viewport::retain(editor, &live);
+            self.viewport_clients = live;
+        }
         for client in &mut self.clients {
             let obsolete: Vec<_> = client.asset_targets.iter().filter(|(_, target)| !target.current(editor)).map(|(id, _)| *id).collect();
             for id in obsolete {
@@ -210,8 +220,7 @@ impl SceneBridge {
                         continue;
                     }
                     tune(&stream);
-                    self.clients.push(SceneClient::new(self.next_client, stream));
-                    self.next_client += 1;
+                    self.clients.push(SceneClient::new(NEXT_SCENE_CLIENT.fetch_add(1, Ordering::Relaxed), stream));
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -238,6 +247,7 @@ impl SceneBridge {
     /// while an app is owed a frame it was held back from (it is behind);
     /// while none can take one, nothing is built.
     pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> bool {
+        super::compose_viewport::retain(editor, &self.clients.iter().map(|client| client.id).collect());
         let wants_hello = self.clients.iter().any(|c| c.greeted && !c.hello_sent);
         if !wants_hello && !self.clients.iter().any(|c| c.hello_sent && c.ready()) {
             for client in self.clients.iter_mut().filter(|c| c.hello_sent) {
@@ -286,14 +296,30 @@ impl SceneBridge {
                         if let Some(buffer) = pane.buffer {
                             let leaf = fresh_core::LeafId(fresh_core::SplitId(pane.leaf));
                             let buffer = crate::model::event::BufferId(buffer);
-                            let revision = editor.active_window().buffer_state(buffer).map_or(0, |state| state.buffer.version());
-                            let region = client.navigation.region(model.window_id, leaf, buffer, revision);
+                            let viewport = super::compose_viewport::snapshot(editor, client.id, leaf, buffer);
+                            let region = viewport.map(|v| v.position);
                             pane.compose = self.compose.gather_at(editor, leaf, buffer, region);
+                            if let Some(compose) = &mut pane.compose { compose.viewport = viewport; }
                             if let Some(compose) = &pane.compose {
                                 compose_regions.push(crate::app::window::ComposeRegion {
                                     leaf, buffer, revision: compose.buffer_revision,
                                     source: compose.source_start..compose.source_end,
                                 });
+                            }
+                        }
+                    }
+                }
+                // A deferred motion can need source far from what this client
+                // is reading. Supply it in the reply for geometry, without
+                // replacing the visible viewport merely to measure a command.
+                if let (Some(reply), Some(scope)) = (&mut client.input_reply, client.input_scope) {
+                    if scope.window == model.window_id {
+                        let revision = editor.active_window().buffer_state(scope.buffer).map_or(0, |state| state.buffer.version());
+                        if let Some(region) = client.navigation.region(scope.window, scope.leaf, scope.buffer, revision) {
+                            reply.compose = self.compose.gather_at(editor, scope.leaf, scope.buffer, Some(region));
+                            if let Some(compose) = &reply.compose {
+                                compose_regions.push(crate::app::window::ComposeRegion { leaf: scope.leaf, buffer: scope.buffer,
+                                    revision: compose.buffer_revision, source: compose.source_start..compose.source_end });
                             }
                         }
                     }
@@ -384,12 +410,15 @@ impl SceneClient {
             rich_compose: false,
             last_input: 0,
             input_reply: None,
+            input_scope: None,
             navigation: Default::default(),
             rich_encoded: EncodedScene::default(),
             asset_transfers: VecDeque::new(),
             asset_finished: Vec::new(),
             last_asset: 0,
             asset_targets: HashMap::new(),
+            viewport_reply: None,
+            last_viewport_reply: None,
             scene: ClientScene::default(),
             seq: 0,
             applied: 0,
@@ -474,6 +503,20 @@ impl SceneClient {
             return Ok(());
         }
         match k {
+            kind::COMPOSE_VIEWPORT_REQUEST => {
+                if !self.rich_compose || !self.hello_sent { return Err("viewport requests require a rich scene hello".into()); }
+                if self.viewport_reply.is_some() { return Err("viewport requests must wait for their reply".into()); }
+                let request = super::compose_viewport::Request::parse(payload)?;
+                let reply = if let Some(previous) = self.last_viewport_reply.filter(|reply| reply.id == request.id) {
+                    previous
+                } else {
+                    if self.last_viewport_reply.is_some_and(|reply| reply.id > request.id) { return Err("viewport request ids must increase".into()); }
+                    super::compose_viewport::Reply { id: request.id, accepted: super::compose_viewport::update(editor, self.id, &request) }
+                };
+                self.last_viewport_reply = Some(reply);
+                self.viewport_reply = Some(reply);
+                out.frame_owed = true;
+            }
             kind::COMPOSE_ASSET => {
                 if !self.rich_compose { return Err("image requests require rich_compose in hello".into()); }
                 let request = super::compose_assets::Request::parse(payload).map_err(w)?;
@@ -491,7 +534,8 @@ impl SceneClient {
                     if scope.window != editor.active_window().id.0 || editor.active_window().pane_buffer(scope.leaf) != Some(scope.buffer) {
                         return Err("image document is no longer displayed".to_string());
                     }
-                    let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision);
+                    let viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
+                    let region = viewport.map(|v| v.position);
                     let pane = compose.gather_at(editor, scope.leaf, scope.buffer, region).ok_or("image document is not composing")?;
                     if pane.buffer_revision != scope.revision { return Err("image source changed; request its current annotation".into()); }
                     if pane.asset_authority != request.authority { return Err("image filesystem authority changed".into()); }
@@ -501,7 +545,7 @@ impl SceneClient {
                     let window = editor.active_window();
                     let document = window.buffer_state(scope.buffer).and_then(|s| s.buffer.file_path()).ok_or("save the document before loading relative images")?;
                     let path = super::compose_assets::resolve(document, &image.target)?;
-                    Ok((super::compose_assets::Target { scope: *scope, fs: window.authority().filesystem.clone(), document: document.to_path_buf() }, path))
+                    Ok((super::compose_assets::Target { scope: *scope, fs: window.authority().filesystem.clone(), document: document.to_path_buf(), instance: window.buffer_state(scope.buffer).unwrap().marker_list.instance_id() }, path))
                 })();
                 let result = resolved.and_then(|(target, path)| {
                     assets.submit(self.id, request.id, target.fs.clone(), path)?;
@@ -516,12 +560,14 @@ impl SceneClient {
             kind::COMPOSE_INPUT => {
                 if !self.rich_compose { return Err("rich input requires rich_compose in hello".into()); }
                 let input = super::compose::Input::parse(payload).map_err(w)?;
+                self.input_scope = input.scope;
                 if input.id == 0 { return Err("rich input has no request id".into()); }
                 if input.id > self.last_input.saturating_add(1) { return Err("rich input request ids must be sequential".into()); }
                 if self.input_reply.is_some() { return Err("rich inputs must wait for their reply".into()); }
                 let mut accepted = input.id <= self.last_input;
                 let snapshot = input.scope.as_ref().and_then(|scope| {
-                    let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision);
+                    let viewport = (scope.window == editor.active_window().id.0).then(|| super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer)).flatten();
+                    let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision).or(viewport.map(|v| v.position));
                     scope.snapshot(editor, compose, region)
                 });
                 let mut reply = super::compose::InputReply { id: input.id, accepted, ..Default::default() };
@@ -712,7 +758,7 @@ impl SceneClient {
         let started = Instant::now();
         self.body.clear();
         let changed = self.scene.write_frame(&mut self.body, self.seq + 1, scene, Some(grid), None);
-        if !changed && self.input_reply.is_none() && self.asset_transfers.is_empty() {
+        if !changed && self.input_reply.is_none() && self.viewport_reply.is_none() && self.asset_transfers.is_empty() {
             return;
         }
         if let Some(transfer) = self.asset_transfers.front_mut() {
@@ -725,7 +771,9 @@ impl SceneClient {
         }
         if let Some(reply) = self.input_reply.take() {
             wire::field::msg(&mut self.body, 24, &reply);
+            self.input_scope = None;
         }
+        if let Some(reply) = self.viewport_reply.take() { wire::field::msg(&mut self.body, 26, &reply); }
         if self.telemetry {
             // Timing goes last, so it can say how long writing this frame took.
             let timing = Timing {

@@ -480,6 +480,7 @@ impl Session {
         }
         self.pending = None;
         if let Some(state) = window.buffer_state(scope.buffer) {
+            self.regions.remove(&Identity(scope.window, scope.leaf, scope.buffer));
             let revision = state.buffer.version();
             let cursors = window
                 .buffers

@@ -8,6 +8,20 @@ package fresh.scene.v1;
 // and Key would clash with names the app already has.
 option swift_prefix = "Wire";
 
+// A source marker and a caret-fragment offset in native points, per client.
+message ComposeViewport {
+  uint64 position = 1;
+  uint32 affinity = 2;
+  double offset = 3;
+  uint64 sequence = 4;
+  uint64 epoch = 5;
+}
+
+message ComposeViewportReply {
+  uint64 id = 1;
+  bool accepted = 2;
+}
+
 // A bounded binary image payload, multiplexed with normal input/scene frames.
 message ComposeAssetChunk {
   uint64 id = 1;
@@ -328,6 +342,7 @@ message ComposePane {
   bool keyboard = 14;
   uint64 asset_authority = 15;
   uint64 asset_document = 16;
+  ComposeViewport viewport = 17;
 }
 
 // kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
@@ -373,6 +388,7 @@ message InputReply {
   optional uint64 need_region = 4;
   repeated ComposeCaret carets = 5;
   optional double need_y = 6;
+  ComposePane compose = 7;
 }
 
 message ComposeCaret {
@@ -647,6 +663,7 @@ message Frame {
   Timing timing = 23;
   InputReply input_reply = 24;
   repeated ComposeAssetChunk compose_assets = 25;
+  ComposeViewportReply viewport_reply = 26;
 }
 // Type 1: the answer to a ClientHello, with the whole scene.
 message ServerHello {
@@ -700,6 +717,16 @@ message ComposeAssetRequest {
   bool cancel = 5;
   uint64 authority = 6;
   uint64 document = 7;
+}
+// Type 29: coalesced pixel scrolling. The source marker is remapped from the
+// scope's buffer revision. offset is relative to the native content top.
+message ComposeViewportRequest {
+  uint64 id = 1;
+  ComposeScope scope = 2;
+  uint64 position = 3;
+  uint32 affinity = 4;
+  double offset = 5;
+  uint64 epoch = 6;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.
