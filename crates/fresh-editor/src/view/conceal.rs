@@ -382,11 +382,15 @@ impl ConcealManager {
         let mut conceals: Vec<_> = ranges
             .into_iter()
             .filter(|(range, _)| {
-                !overrides
-                    .iter()
-                    .map(|c| &c.source)
-                    .chain(revealed)
-                    .any(|object| range.start < object.end && range.end > object.start)
+                // Deleting a decoration's source can collapse both markers
+                // before its plugin rebuild arrives. It no longer conceals
+                // any source and must not become an invalid native insertion.
+                !range.is_empty()
+                    && !overrides
+                        .iter()
+                        .map(|c| &c.source)
+                        .chain(revealed)
+                        .any(|object| range.start < object.end && range.end > object.start)
             })
             // The grid consumes ranges in source order. A containing range
             // wins until its end; an overlapping range extending past that
@@ -558,6 +562,21 @@ impl Default for ConcealManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsed_conceals_do_not_invalidate_or_insert_text_into_native_projection() {
+        let mut markers = MarkerList::new();
+        markers.set_buffer_size(5);
+        let mut manager = ConcealManager::new();
+        manager.add(&mut markers, ns(), 1..3, Some("ghost".into()));
+        markers.adjust_for_delete(1, 2);
+        let projection = manager.project_text("ayz", 0, &markers, &[]).unwrap();
+        assert_eq!(projection.text, "ayz");
+        assert!(projection
+            .segments
+            .iter()
+            .all(|s| s.kind == fresh_core::compose::SegmentKind::Copy));
+    }
 
     #[test]
     fn editing_graphical_object_reveals_nested_markup_and_crossing_replacements() {
