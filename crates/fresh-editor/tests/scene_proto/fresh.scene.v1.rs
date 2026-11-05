@@ -601,6 +601,8 @@ pub struct ComposeSpan {
     pub role: u32,
     #[prost(uint32, tag = "4")]
     pub flags: u32,
+    #[prost(uint64, optional, tag = "5")]
+    pub content_start: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeImage {

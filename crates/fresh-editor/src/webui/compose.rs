@@ -341,6 +341,9 @@ pub(crate) struct ComposeSpan {
     pub role: u32,
     /// Bold 1, italic 2, underline 4, strikethrough 8, link 16.
     pub flags: u32,
+    /// First content on an item's opening line, after its list/task marker.
+    /// Other spans and empty items omit this source-byte anchor.
+    pub content_start: Option<usize>,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -403,7 +406,38 @@ impl Document {
         let mut images = Vec::new();
         let mut image_stack: Vec<ComposeImage> = Vec::new();
         let mut paragraphs = Vec::new();
+        let mut items: Vec<(usize, usize)> = Vec::new();
         for (event, range) in Parser::new_ext(&text, Options::all()).into_offset_iter() {
+            // Use the parser's item ownership and inline ranges. Tight lists
+            // have no Paragraph event; task markers precede their body. An
+            // empty item whose first child is on another line has no prefix
+            // anchor, rather than a multiline "marker" guessed from text.
+            if !matches!(
+                &event,
+                Event::End(_)
+                    | Event::TaskListMarker(_)
+                    | Event::SoftBreak
+                    | Event::HardBreak
+                    | Event::Start(
+                        Tag::Item
+                            | Tag::List(_)
+                            | Tag::Paragraph
+                            | Tag::BlockQuote(_)
+                            | Tag::Heading { .. }
+                            | Tag::CodeBlock(_)
+                    )
+            ) {
+                if let Some(&(index, line_end)) = items.last() {
+                    let span: &mut ComposeSpan = &mut spans[index];
+                    if span.content_start.is_none() && range.start < line_end {
+                        span.content_start = Some(range.start);
+                    }
+                }
+            }
+            let new_item = matches!(&event, Event::Start(Tag::Item));
+            if matches!(&event, Event::End(TagEnd::Item)) {
+                items.pop();
+            }
             let mut role = 0;
             let mut flags = 0;
             match event {
@@ -465,7 +499,14 @@ impl Document {
                     end: range.end,
                     role,
                     flags,
+                    content_start: None,
                 });
+                if new_item {
+                    let line_end = text[range.start..]
+                        .find('\n')
+                        .map_or(text.len(), |n| range.start + n);
+                    items.push((spans.len() - 1, line_end));
+                }
             }
         }
         Self {
@@ -889,6 +930,37 @@ mod tests {
             .iter()
             .any(|span| span.flags & 8 != 0 && &text[span.start..span.end] == "~~strike~~"));
         assert_eq!(doc.text.as_bytes(), text.as_bytes());
+    }
+
+    #[test]
+    fn parsed_list_bodies_cover_tight_loose_tasks_nested_quotes_and_empty_items() {
+        for (text, bodies) in [
+            (
+                "- alpha\r\n  - **café**\r\n\r\n  last\r\n",
+                vec!["alpha", "**café**"],
+            ),
+            ("> 12. [ ] task **bold**\n>     more\n", vec!["task"]),
+            ("1) first\n2) next\n", vec!["first", "next"]),
+            ("- > quoted words\n  > more\n", vec!["quoted"]),
+            ("-\n  - child\n", vec!["child"]),
+            ("- \n\n```md\n- fake\n```\n", vec![]),
+            ("- ![pic](x.png)\n", vec!["![pic]"]),
+        ] {
+            let doc = Document::parse(text.into(), 0, 0, 1);
+            let positions: Vec<_> = doc.spans.iter().filter_map(|s| s.content_start).collect();
+            assert_eq!(positions.len(), bodies.len(), "{text:?}");
+            for (position, body) in positions.iter().zip(bodies) {
+                assert!(
+                    text[*position..].starts_with(body),
+                    "{text:?}: {position} should start {body:?}"
+                );
+            }
+            assert!(doc
+                .spans
+                .iter()
+                .all(|s| s.content_start.is_none() || s.role == 13));
+            assert_eq!(doc.text, text);
+        }
     }
 
     #[test]

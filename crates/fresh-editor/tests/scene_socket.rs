@@ -261,6 +261,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(&root,&work);
     rich_image_objects_select_edit_move_delete_and_undo_as_source(&root,&work);
     rich_image_source_previews_reveal_nested_and_reference_markup(&root,&work);
+    rich_list_markers_are_source_anchors_not_cell_widths(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
 }
@@ -295,6 +296,42 @@ fn scoped_compose_commands_follow_their_window_and_buffer_lifetime(root: &std::p
         command: Box::new(PluginCommand::ClearConcealNamespace { buffer_id: id,
             namespace: fresh_core::overlay::OverlayNamespace::from_string("scope-test".into()) }) }).unwrap();
     assert_eq!(shown(&editor, "**alpha**\n"), "alpha**\n", "a different buffer lifetime cannot clear current source decorations");
+}
+
+fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,work:&std::path::Path) {
+    let original="# Lists and images\r\n\r\n12. Parent with enough proportional words to wrap across the available measure while keeping the marker separate from the text.\r\n    - [ ] Child with café 👩🏽‍💻, **bold**, `code` and ![tiny](x.png), followed by more words that wrap under the task body rather than its marker.\r\n    - Child two with more words that wrap across a narrow page and stay aligned with the first letter of its own text.\r\n\r\n> - Quoted item with a [link](https://example.test) and enough words to wrap across the page without losing source positions.\r\n\r\n1) An item with a parenthesis marker and enough words to exercise the same measured continuation geometry as other lists.\r\n\r\nSetext heading\r\n--------------\r\n";
+    let file=work.join("lists.md"); std::fs::write(&file,original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed,&json!({})); }
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("lists.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let hello=ready_scene(&mut bridge,&mut ed,&mut app);
+    let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let compose=pane.compose.as_ref().unwrap();
+    let bodies:Vec<_>=compose.spans.iter().filter_map(|s|s.content_start).map(|p|original[p as usize..].split_whitespace().next().unwrap()).collect();
+    assert_eq!(bodies,["Parent","Child","Child","Quoted","An"]);
+    assert_eq!(compose.images.len(),1);
+    if let Some(path)=std::env::var_os("FC_COMPOSE_LIST_SCENE_FILE") {
+        let mut fixture=compose.clone(); fixture.asset_authority=1; fixture.asset_document=1;
+        std::fs::write(path,fixture.encode_to_vec()).unwrap();
+    }
+    let first=compose.spans.iter().find(|s|s.role==13).unwrap();
+    let marker=first.start; let body=first.content_start.unwrap();
+    let mut scope=pane_scope(hello.window_id.unwrap(),pane);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some(marker),..Default::default()});
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:2,kind:20,
+        payload:pb::Paste {text:"1".into()}.encode_to_vec(),..Default::default()});
+    let current=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert_eq!(current.spans.iter().find(|s|s.role==13).unwrap().content_start,Some(body+1),
+        "editing an ordered marker moves its body source anchor");
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:3,kind:21,
+        payload:pb::Action {name:"undo".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+    let current=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert_eq!(current.spans.iter().find(|s|s.role==13).unwrap().content_start,Some(body));
+    apply_step(&mut ed,&json!({"action":"save"}));
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
 }
 
 fn rich_image_objects_select_edit_move_delete_and_undo_as_source(root:&std::path::Path,work:&std::path::Path) {
