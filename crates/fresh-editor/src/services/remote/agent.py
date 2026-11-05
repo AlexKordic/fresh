@@ -166,6 +166,16 @@ def cmd_stat(id, p):
         r={
             "size": st.st_size,
             "mtime": int(st.st_mtime),
+            # Only POSIX ctime describes content/identity changes. Older and
+            # non-POSIX agents omit the stamp so clients verify content.
+            "change_stamp": {
+                "device": st.st_dev,
+                "inode": st.st_ino,
+                "mtime_seconds": st.st_mtime_ns // 1000000000,
+                "mtime_nanos": st.st_mtime_ns % 1000000000,
+                "ctime_seconds": st.st_ctime_ns // 1000000000,
+                "ctime_nanos": st.st_ctime_ns % 1000000000,
+            } if os.name == "posix" else None,
             "mode": st.st_mode,
             "uid": st.st_uid,
             "writable": os.access(path, os.W_OK),
@@ -361,16 +371,21 @@ def cmd_count_lf(id, p):
 def cmd_digest(id, p):
     """Size and SHA-256 of a file, streamed, so the file stays on this host."""
     path = validate_path(p["path"])
+    maximum = p.get("max_bytes")
+    if maximum is not None and (not isinstance(maximum, int) or maximum < 0):
+        raise ValueError("Invalid digest byte limit")
 
     h = hashlib.sha256()
     size = 0
     with open(path, "rb") as f:
         while True:
-            chunk = f.read(CHUNK)
+            chunk = f.read(CHUNK if maximum is None else min(CHUNK, maximum - size + 1))
             if not chunk:
                 break
             h.update(chunk)
             size += len(chunk)
+            if maximum is not None and size > maximum:
+                raise ValueError("File exceeds the digest byte limit")
     send(id, r={"size": size, "sha256": h.hexdigest()})
 
 

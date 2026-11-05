@@ -94,12 +94,41 @@ pub struct RemoteDirEntry {
     pub writable: Option<bool>,
 }
 
+/// POSIX file identity and nanosecond change times, captured in one stat.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteChangeStamp {
+    pub device: u64,
+    pub inode: u64,
+    pub mtime_seconds: i64,
+    pub mtime_nanos: i64,
+    pub ctime_seconds: i64,
+    pub ctime_nanos: i64,
+}
+
+impl RemoteChangeStamp {
+    pub fn bytes(&self) -> Vec<u8> {
+        [
+            self.device.to_le_bytes(),
+            self.inode.to_le_bytes(),
+            self.mtime_seconds.to_le_bytes(),
+            self.mtime_nanos.to_le_bytes(),
+            self.ctime_seconds.to_le_bytes(),
+            self.ctime_nanos.to_le_bytes(),
+        ]
+        .concat()
+    }
+}
+
 /// File metadata returned by `stat` command
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct RemoteMetadata {
     pub size: u64,
     pub mtime: i64,
+    /// Old or non-POSIX agents omit this; conditional readers then compare
+    /// content rather than trusting the legacy whole-second timestamp.
+    #[serde(default)]
+    pub change_stamp: Option<RemoteChangeStamp>,
     pub mode: u32,
     /// Effective write access of the remote login, never the local UID.
     #[serde(default)]

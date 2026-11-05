@@ -373,6 +373,7 @@ fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path
     assert_ne!(request.authority,0);
     app.send(28,request.clone());
     let mut received=Vec::new(); let mut done=false; let mut moved=false;
+    let mut version=Vec::new(); let mut digest=Vec::new();
     for _ in 0..30 {
         settle_bridge(&mut bridge,&mut ed);
         let Some(frame)=app.frame() else { continue; };
@@ -384,6 +385,7 @@ fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path
             assert_eq!(chunk.id,1); assert!(chunk.error.is_empty(),"{}",chunk.error);
             assert_eq!(chunk.offset,received.len() as u64); assert_eq!(chunk.total,bytes.len() as u64);
             assert!(chunk.data.len()<=128<<10);
+            if chunk.done { version=chunk.version.clone(); digest=chunk.digest.clone(); }
             received.extend(chunk.data); done=chunk.done;
             if !moved {
                 app.send(17,pb::Key {key:"ArrowRight".into(),..Default::default()});
@@ -393,10 +395,52 @@ fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path
         if done { break; }
     }
     assert!(done); assert_eq!(received,bytes);
+    assert_eq!(version.len(),32); assert_eq!(digest.len(),32);
     assert_eq!(ed.active_window().active_cursors().primary().position,1,"normal input ran between asset chunks");
+    let mut check=request.clone(); check.id=2; check.scope=Some(scope.clone());
+    check.known_version=version; check.known_digest=digest.clone();
+    app.send(28,check.clone());
+    let mut checked=false;
+    for _ in 0..30 {
+        settle_bridge(&mut bridge,&mut ed);
+        let Some(frame)=app.frame() else { continue; };
+        app.send(26,pb::Applied {seq:frame.seq});
+        for chunk in frame.compose_assets {
+            if chunk.id==2 {
+                assert!(chunk.unchanged && chunk.done && chunk.error.is_empty());
+                assert!(chunk.data.is_empty()); assert_eq!(chunk.total,0); assert_eq!(chunk.digest,digest);
+                checked=true;
+            }
+        }
+        if checked { break; }
+    }
+    assert!(checked,"a conditional check returns no image payload");
+    let image_path=work.join("asset x.png");
+    let modified=std::fs::metadata(&image_path).unwrap().modified().unwrap();
+    let mut changed=bytes.clone(); *changed.last_mut().unwrap()^=1;
+    std::fs::write(&image_path,&changed).unwrap();
+    std::fs::File::options().write(true).open(&image_path).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+    check.id=3; app.send(28,check);
+    let mut replaced=Vec::new(); let mut replacement_done=false;
+    for _ in 0..30 {
+        settle_bridge(&mut bridge,&mut ed);
+        let Some(frame)=app.frame() else { continue; };
+        app.send(26,pb::Applied {seq:frame.seq});
+        for chunk in frame.compose_assets {
+            if chunk.id==3 {
+                assert!(!chunk.unchanged && chunk.error.is_empty(),"{}",chunk.error);
+                assert_eq!(chunk.offset,replaced.len() as u64);
+                replaced.extend(chunk.data);
+                if chunk.done { assert_ne!(chunk.digest,digest); replacement_done=true; }
+            }
+        }
+        if replacement_done { break; }
+    }
+    assert!(replacement_done); assert_eq!(replaced,changed,"image changes load without editing the Markdown buffer");
     // Source edits between submission and delivery cancel the old request;
     // the new frame must terminate its stream with an error, not old bytes.
-    let mut obsolete=request.clone(); obsolete.id=2; obsolete.scope=Some(scope.clone());
+    let mut obsolete=request.clone(); obsolete.id=4; obsolete.scope=Some(scope.clone());
     app.send(28,obsolete);
     app.send(17,pb::Key {key:"X".into(),..Default::default()});
     let mut rejected=false;
@@ -405,7 +449,7 @@ fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path
         let Some(frame)=app.frame() else { continue; };
         app.send(26,pb::Applied {seq:frame.seq});
         for chunk in frame.compose_assets {
-            if chunk.id==2 {
+            if chunk.id==4 {
                 assert!(chunk.done); assert!(chunk.data.is_empty());
                 assert!(chunk.error.contains("changed"),"{}",chunk.error);
                 rejected=true;

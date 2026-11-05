@@ -565,6 +565,19 @@ pub trait FileSystem: Send + Sync {
         ContentDigest::of_reader(self.open_file(path)?)
     }
 
+    /// Hash a resource of at most `maximum` bytes, rejecting oversized input.
+    /// Remote backends hash on the host rather than downloading unchanged data.
+    fn content_digest_bounded(&self, path: &Path, maximum: u64) -> io::Result<ContentDigest> {
+        let digest = ContentDigest::of_reader(self.open_file(path)?.take(maximum.saturating_add(1)))?;
+        if digest.size > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resource exceeds the digest byte limit",
+            ));
+        }
+        Ok(digest)
+    }
+
     /// Write data to file atomically (temp file + rename).
     ///
     /// The original's permissions are carried over, and — where the backend
@@ -695,6 +708,14 @@ pub trait FileSystem: Send + Sync {
 
     /// Get file/directory metadata
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata>;
+
+    /// Metadata plus an opaque change stamp from the same stat operation.
+    /// A stamp includes identity and change time, not just mtime. Filesystems
+    /// without that information return None. Consumers still periodically
+    /// verify content because filesystems can cache or round timestamps.
+    fn metadata_with_version(&self, path: &Path) -> io::Result<(FileMetadata, Option<Vec<u8>>)> {
+        self.metadata(path).map(|metadata| (metadata, None))
+    }
 
     /// Get symlink metadata (doesn't follow symlinks)
     fn symlink_metadata(&self, path: &Path) -> io::Result<FileMetadata>;
@@ -2063,6 +2084,25 @@ impl FileSystem for StdFileSystem {
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
         let meta = std::fs::metadata(path)?;
         Ok(Self::build_metadata(path, &meta))
+    }
+
+    fn metadata_with_version(&self, path: &Path) -> io::Result<(FileMetadata, Option<Vec<u8>>)> {
+        let meta = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        let version = {
+            use std::os::unix::fs::MetadataExt;
+            let mut bytes = Vec::with_capacity(48);
+            bytes.extend_from_slice(&meta.dev().to_le_bytes());
+            bytes.extend_from_slice(&meta.ino().to_le_bytes());
+            bytes.extend_from_slice(&meta.mtime().to_le_bytes());
+            bytes.extend_from_slice(&meta.mtime_nsec().to_le_bytes());
+            bytes.extend_from_slice(&meta.ctime().to_le_bytes());
+            bytes.extend_from_slice(&meta.ctime_nsec().to_le_bytes());
+            Some(bytes)
+        };
+        #[cfg(not(unix))]
+        let version = None;
+        Ok((Self::build_metadata(path, &meta), version))
     }
 
     fn symlink_metadata(&self, path: &Path) -> io::Result<FileMetadata> {

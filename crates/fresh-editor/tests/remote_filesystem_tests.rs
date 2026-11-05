@@ -349,15 +349,22 @@ fn test_content_digest_is_computed_by_the_agent() {
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 
+    assert_eq!(
+        fs.content_digest_bounded(&test_path, content.len() as u64).unwrap(),
+        ContentDigest::of(&content)
+    );
+    assert!(fs.content_digest_bounded(&test_path, 1).is_err());
+
     let sent = String::from_utf8(sent.lock().unwrap().clone()).unwrap();
-    let methods: Vec<String> = sent
+    let requests: Vec<serde_json::Value> = sent
         .lines()
-        .map(|line| {
-            let request: serde_json::Value = serde_json::from_str(line).unwrap();
-            request["m"].as_str().unwrap().to_string()
-        })
+        .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(methods, ["digest", "digest"]);
+    let methods: Vec<_> = requests.iter().map(|request| request["m"].as_str().unwrap()).collect();
+    assert_eq!(methods, ["digest", "digest", "digest", "digest"], "verification never downloads image data");
+    assert!(requests[0]["p"].get("max_bytes").is_none());
+    assert_eq!(requests[2]["p"]["max_bytes"], content.len() as u64);
+    assert_eq!(requests[3]["p"]["max_bytes"], 1);
 }
 
 #[test]

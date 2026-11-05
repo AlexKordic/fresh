@@ -4,6 +4,7 @@
 
 use super::wire::{Field, Reader, WireError};
 use crate::model::filesystem::FileSystem;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +38,12 @@ pub(crate) const MAX_BYTES: usize = 16 << 20;
 pub(crate) const CHUNK_BYTES: usize = 128 << 10;
 const MAX_REQUESTS: usize = 4;
 
+#[derive(Default, Clone)]
+pub(crate) struct Conditional {
+    pub version: Vec<u8>,
+    pub digest: Vec<u8>,
+}
+
 pub(crate) struct Request {
     pub id: u64,
     pub scope: Option<super::compose::Scope>,
@@ -45,6 +52,7 @@ pub(crate) struct Request {
     pub cancel: bool,
     pub authority: u64,
     pub document: u64,
+    pub conditional: Conditional,
 }
 
 impl Request {
@@ -57,6 +65,7 @@ impl Request {
             cancel: false,
             authority: 0,
             document: 0,
+            conditional: Conditional::default(),
         };
         for field in Reader::new(bytes) {
             match field? {
@@ -69,6 +78,16 @@ impl Request {
                 (5, v) => request.cancel = v.flag(),
                 (6, v) => request.authority = v.uint(),
                 (7, v) => request.document = v.uint(),
+                (tag @ (8 | 9), Field::Bytes(bytes)) => {
+                    if !bytes.is_empty() && bytes.len() != 32 {
+                        return Err(WireError::InvalidField("image validator length"));
+                    }
+                    if tag == 8 {
+                        request.conditional.version = bytes.to_vec();
+                    } else {
+                        request.conditional.digest = bytes.to_vec();
+                    }
+                }
                 _ => {}
             }
         }
@@ -85,6 +104,10 @@ pub(crate) struct Chunk {
     pub data: Vec<u8>,
     pub error: String,
     pub done: bool,
+    pub version: Vec<u8>,
+    pub digest: Vec<u8>,
+    pub unchanged: bool,
+    pub retryable: bool,
 }
 
 pub(crate) struct Transfer {
@@ -92,6 +115,10 @@ pub(crate) struct Transfer {
     bytes: Vec<u8>,
     offset: usize,
     error: String,
+    version: Vec<u8>,
+    digest: Vec<u8>,
+    unchanged: bool,
+    retryable: bool,
 }
 
 impl Transfer {
@@ -101,6 +128,17 @@ impl Transfer {
             bytes: Vec::new(),
             offset: 0,
             error: error.into(),
+            version: Vec::new(),
+            digest: Vec::new(),
+            unchanged: false,
+            retryable: false,
+        }
+    }
+
+    pub fn retryable_failure(id: u64, error: impl Into<String>) -> Self {
+        Self {
+            retryable: true,
+            ..Self::failure(id, error)
         }
     }
 
@@ -113,6 +151,18 @@ impl Transfer {
             data: self.bytes[self.offset..end].to_vec(),
             error: std::mem::take(&mut self.error),
             done: end == self.bytes.len(),
+            version: if end == self.bytes.len() {
+                self.version.clone()
+            } else {
+                Vec::new()
+            },
+            digest: if end == self.bytes.len() {
+                self.digest.clone()
+            } else {
+                Vec::new()
+            },
+            unchanged: self.unchanged,
+            retryable: self.retryable,
         };
         self.offset = end;
         chunk
@@ -124,6 +174,7 @@ struct Job {
     fs: Arc<dyn FileSystem + Send + Sync>,
     path: PathBuf,
     cancel: Arc<AtomicBool>,
+    conditional: Conditional,
 }
 
 struct Workers {
@@ -149,15 +200,26 @@ impl Workers {
                     if job.cancel.load(Ordering::Acquire) {
                         continue;
                     }
-                    let transfer = match load(job.fs.as_ref(), &job.path, &job.cancel) {
-                        Ok(bytes) => Transfer {
-                            id: job.key.1,
-                            bytes,
-                            offset: 0,
-                            error: String::new(),
-                        },
-                        Err(error) => Transfer::failure(job.key.1, error),
-                    };
+                    let transfer =
+                        match load(job.fs.as_ref(), &job.path, &job.cancel, &job.conditional) {
+                            Ok(loaded) => Transfer {
+                                id: job.key.1,
+                                bytes: loaded.bytes,
+                                offset: 0,
+                                error: String::new(),
+                                version: loaded.version,
+                                digest: loaded.digest,
+                                unchanged: loaded.unchanged,
+                                retryable: false,
+                            },
+                            Err(error) => {
+                                if error.retryable {
+                                    Transfer::retryable_failure(job.key.1, error.message)
+                                } else {
+                                    Transfer::failure(job.key.1, error.message)
+                                }
+                            }
+                        };
                     if !job.cancel.load(Ordering::Acquire)
                         && complete.send((job.key, transfer)).is_err()
                     {
@@ -186,6 +248,7 @@ impl Service {
         id: u64,
         fs: Arc<dyn FileSystem + Send + Sync>,
         path: PathBuf,
+        conditional: Conditional,
     ) -> Result<(), String> {
         let key = (client, id);
         if self.requests.contains_key(&key) {
@@ -207,6 +270,7 @@ impl Service {
                 fs,
                 path,
                 cancel: cancel.clone(),
+                conditional,
             })
             .map_err(|_| "image loading queue is busy; retry shortly".to_string())?;
         self.requests.insert(key, cancel);
@@ -250,45 +314,163 @@ impl Drop for Service {
     }
 }
 
+#[derive(Debug)]
+struct Loaded {
+    bytes: Vec<u8>,
+    version: Vec<u8>,
+    digest: Vec<u8>,
+    unchanged: bool,
+}
+
+#[derive(Debug)]
+struct Failure {
+    message: String,
+    retryable: bool,
+}
+
+impl Failure {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+    fn io(error: std::io::Error) -> Self {
+        let retryable = !matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::IsADirectory
+                | std::io::ErrorKind::NotADirectory
+        );
+        Self {
+            message: format!("Image unavailable: {error}"),
+            retryable,
+        }
+    }
+}
+
+fn version(
+    fs: &(dyn FileSystem + Send + Sync),
+    path: &Path,
+    size: u64,
+    stamp: &Option<Vec<u8>>,
+) -> Vec<u8> {
+    let Some(stamp) = stamp else {
+        return Vec::new();
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"Fresh Compose image version\0");
+    hash.update((fs as *const _ as *const () as usize).to_le_bytes());
+    let path = path.as_os_str().as_encoded_bytes();
+    hash.update(path.len().to_le_bytes());
+    hash.update(path);
+    hash.update(size.to_le_bytes());
+    hash.update(stamp);
+    hash.finalize().to_vec()
+}
+
 fn load(
     fs: &(dyn FileSystem + Send + Sync),
     path: &Path,
     cancel: &AtomicBool,
-) -> Result<Vec<u8>, String> {
-    let before = fs
-        .metadata(path)
-        .map_err(|e| format!("Image unavailable: {e}"))?;
+    conditional: &Conditional,
+) -> Result<Loaded, Failure> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(Failure::retryable("Image request cancelled"));
+    }
+    let (before, before_stamp) = fs.metadata_with_version(path).map_err(Failure::io)?;
     if before.size > MAX_BYTES as u64 {
-        return Err("Image exceeds the 16 MiB compressed limit".into());
+        return Err(Failure::permanent(
+            "Image exceeds the 16 MiB compressed limit",
+        ));
+    }
+    let version = version(fs, path, before.size, &before_stamp);
+    if !version.is_empty() && version == conditional.version && conditional.digest.len() == 32 {
+        return Ok(Loaded {
+            bytes: Vec::new(),
+            version,
+            digest: conditional.digest.clone(),
+            unchanged: true,
+        });
     }
     if cancel.load(Ordering::Acquire) {
-        return Err("Image request cancelled".into());
+        return Err(Failure::retryable("Image request cancelled"));
+    }
+    // Hash on the authority when a stat shortcut cannot establish freshness.
+    // RemoteFileSystem does this on the host, so an unchanged image never
+    // needs to cross SSH merely to refresh its validator.
+    if conditional.digest.len() == 32 {
+        let digest = fs
+            .content_digest_bounded(path, MAX_BYTES as u64)
+            .map_err(Failure::io)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(Failure::retryable("Image request cancelled"));
+        }
+        let (checked, checked_stamp) = fs.metadata_with_version(path).map_err(Failure::io)?;
+        if checked.size != before.size
+            || checked.modified != before.modified
+            || checked_stamp != before_stamp
+            || digest.size != before.size
+        {
+            return Err(Failure::retryable(
+                "Image changed while hashing; retry the load",
+            ));
+        }
+        if digest.sha256.as_slice() == conditional.digest {
+            return Ok(Loaded {
+                bytes: Vec::new(),
+                version,
+                digest: conditional.digest.clone(),
+                unchanged: true,
+            });
+        }
     }
     // Cap the READ itself at the size already checked above: read_range is an
     // exact read, not a read-until-EOF. A replacement cannot increase this
     // allocation; the metadata/length check below detects a changed resource.
     let bytes = fs
         .read_range(path, 0, before.size as usize)
-        .map_err(|e| format!("Image unavailable: {e}"))?;
+        .map_err(Failure::io)?;
     if bytes.len() > MAX_BYTES {
-        return Err("Image exceeds the 16 MiB compressed limit".into());
+        return Err(Failure::permanent(
+            "Image exceeds the 16 MiB compressed limit",
+        ));
     }
     if cancel.load(Ordering::Acquire) {
-        return Err("Image request cancelled".into());
+        return Err(Failure::retryable("Image request cancelled"));
     }
-    let after = fs
-        .metadata(path)
-        .map_err(|e| format!("Image unavailable: {e}"))?;
+    let (after, after_stamp) = fs.metadata_with_version(path).map_err(Failure::io)?;
     if before.size != after.size
         || before.modified != after.modified
+        || before_stamp != after_stamp
         || bytes.len() as u64 != after.size
     {
-        return Err("Image changed while reading; retry the load".into());
+        return Err(Failure::retryable(
+            "Image changed while reading; retry the load",
+        ));
     }
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") && !bytes.starts_with(b"\xff\xd8\xff") {
-        return Err("Image format is unsupported; use PNG or JPEG".into());
+        return Err(Failure::permanent(
+            "Image format is unsupported; use PNG or JPEG",
+        ));
     }
-    Ok(bytes)
+    let digest = Sha256::digest(&bytes).to_vec();
+    let unchanged = digest == conditional.digest;
+    Ok(Loaded {
+        bytes: if unchanged { Vec::new() } else { bytes },
+        version,
+        digest,
+        unchanged,
+    })
 }
 
 /// Markdown destinations are URIs; decode their path without treating `+` as
@@ -362,6 +544,10 @@ mod tests {
             bytes: bytes.clone(),
             offset: 0,
             error: String::new(),
+            version: vec![1; 32],
+            digest: vec![2; 32],
+            unchanged: false,
+            retryable: false,
         };
         let mut received = Vec::new();
         loop {
@@ -387,9 +573,13 @@ mod tests {
         let fs = Arc::new(crate::model::filesystem::StdFileSystem);
         let mut service = Service::default();
         for id in 1..=4 {
-            service.submit(1, id, fs.clone(), path.clone()).unwrap();
+            service
+                .submit(1, id, fs.clone(), path.clone(), Conditional::default())
+                .unwrap();
         }
-        assert!(service.submit(1, 5, fs.clone(), path.clone()).is_err());
+        assert!(service
+            .submit(1, 5, fs.clone(), path.clone(), Conditional::default())
+            .is_err());
         let mut received = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while received.len() < 4 && std::time::Instant::now() < deadline {
@@ -403,11 +593,15 @@ mod tests {
             assert_eq!(chunk.data, bytes);
         }
         assert!(
-            service.submit(1, 5, fs.clone(), path.clone()).is_err(),
+            service
+                .submit(1, 5, fs.clone(), path.clone(), Conditional::default())
+                .is_err(),
             "delivery still holds the memory slot"
         );
         service.cancel(1, 1);
-        service.submit(1, 5, fs.clone(), path.clone()).unwrap();
+        service
+            .submit(1, 5, fs.clone(), path.clone(), Conditional::default())
+            .unwrap();
         service.retain_clients(&HashSet::new());
         assert!(service.requests.is_empty());
         let oversized = root.path().join("oversized.png");
@@ -415,15 +609,153 @@ mod tests {
             .unwrap()
             .set_len(MAX_BYTES as u64 + 1)
             .unwrap();
-        assert!(load(fs.as_ref(), &oversized, &AtomicBool::new(false))
-            .unwrap_err()
-            .contains("16 MiB"));
-        assert!(load(fs.as_ref(), &path, &AtomicBool::new(true))
-            .unwrap_err()
-            .contains("cancelled"));
+        assert!(load(
+            fs.as_ref(),
+            &oversized,
+            &AtomicBool::new(false),
+            &Conditional::default()
+        )
+        .unwrap_err()
+        .message
+        .contains("16 MiB"));
+        assert!(load(
+            fs.as_ref(),
+            &path,
+            &AtomicBool::new(true),
+            &Conditional::default()
+        )
+        .unwrap_err()
+        .message
+        .contains("cancelled"));
         std::fs::write(&path, b"not an image").unwrap();
-        assert!(load(fs.as_ref(), &path, &AtomicBool::new(false))
-            .unwrap_err()
-            .contains("unsupported"));
+        assert!(load(
+            fs.as_ref(),
+            &path,
+            &AtomicBool::new(false),
+            &Conditional::default()
+        )
+        .unwrap_err()
+        .message
+        .contains("unsupported"));
+    }
+
+    #[test]
+    fn conditional_images_skip_unchanged_payloads_and_detect_replacement_with_preserved_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("image.png");
+        let original = b"\x89PNG\r\n\x1a\nold";
+        std::fs::write(&path, original).unwrap();
+        let fs = crate::model::filesystem::StdFileSystem;
+        let cancel = AtomicBool::new(false);
+        let initial = load(&fs, &path, &cancel, &Conditional::default()).unwrap();
+        assert_eq!(initial.bytes, original);
+        assert!(fs.content_digest_bounded(&path, 2).is_err());
+        assert_eq!(initial.digest.len(), 32);
+        let conditional = Conditional {
+            version: initial.version.clone(),
+            digest: initial.digest.clone(),
+        };
+        let unchanged = load(&fs, &path, &cancel, &conditional).unwrap();
+        assert!(unchanged.unchanged && unchanged.bytes.is_empty());
+        // Explicit revalidation and filesystems without a reliable stamp use
+        // the digest, rather than sending the same compressed payload again.
+        let hashed = load(
+            &fs,
+            &path,
+            &cancel,
+            &Conditional {
+                version: Vec::new(),
+                ..conditional.clone()
+            },
+        )
+        .unwrap();
+        assert!(hashed.unchanged && hashed.bytes.is_empty());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let replacement = root.path().join("replacement.png");
+        std::fs::write(&replacement, b"\x89PNG\r\n\x1a\nnew").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        let updated = load(&fs, &path, &cancel, &conditional).unwrap();
+        assert!(!updated.unchanged);
+        assert_ne!(updated.digest, initial.digest);
+        assert_eq!(updated.bytes, b"\x89PNG\r\n\x1a\nnew");
+        #[cfg(unix)]
+        assert_ne!(updated.version, initial.version);
+        std::fs::remove_file(&path).unwrap();
+        let missing = load(&fs, &path, &cancel, &conditional).unwrap_err();
+        assert!(!missing.retryable && missing.message.contains("unavailable"));
+    }
+
+    #[test]
+    fn remote_agent_supplies_change_stamps_and_hashes_conditional_images_on_its_authority() {
+        use crate::services::remote::{spawn_local_agent, RemoteFileSystem};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let channel = runtime
+            .block_on(spawn_local_agent())
+            .expect("start the production Python agent");
+        let fs = RemoteFileSystem::new(channel, "compose-local-agent-fixture".into());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("asset.png");
+        let bytes = b"\x89PNG\r\n\x1a\nold";
+        std::fs::write(&path, bytes).unwrap();
+        let (_, stamp) = fs.metadata_with_version(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(stamp.as_ref().unwrap().len(), 48);
+        let cancel = AtomicBool::new(false);
+        let initial = load(&fs, &path, &cancel, &Conditional::default()).unwrap();
+        let conditional = Conditional {
+            version: initial.version.clone(),
+            digest: initial.digest.clone(),
+        };
+        let unchanged = load(&fs, &path, &cancel, &conditional).unwrap();
+        assert!(unchanged.unchanged && unchanged.bytes.is_empty());
+        let verified = load(
+            &fs,
+            &path,
+            &cancel,
+            &Conditional {
+                version: Vec::new(),
+                ..conditional.clone()
+            },
+        )
+        .unwrap();
+        assert!(verified.unchanged && verified.bytes.is_empty());
+        assert_eq!(
+            fs.content_digest_bounded(&path, bytes.len() as u64)
+                .unwrap()
+                .sha256
+                .as_slice(),
+            initial.digest
+        );
+        assert!(
+            fs.content_digest_bounded(&path, 1).is_err(),
+            "the agent must bound even a growing digest read"
+        );
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let replacement = root.path().join("new.png");
+        std::fs::write(&replacement, b"\x89PNG\r\n\x1a\nnew").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        let replaced = load(&fs, &path, &cancel, &conditional).unwrap();
+        assert!(!replaced.unchanged);
+        assert_eq!(replaced.bytes, b"\x89PNG\r\n\x1a\nnew");
+        assert_ne!(replaced.digest, initial.digest);
+        // A stat after the rejected bounded hash proves the protocol remains
+        // usable: the error cannot poison the shared remote channel.
+        assert_eq!(fs.metadata(&path).unwrap().size, bytes.len() as u64);
     }
 }

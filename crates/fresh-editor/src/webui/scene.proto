@@ -30,6 +30,10 @@ message ComposeAssetChunk {
   bytes data = 4;
   string error = 5;
   bool done = 6;
+  bytes version = 7;
+  bytes digest = 8;
+  bool unchanged = 9;
+  bool retryable = 10;
 }
 
 // A rectangle of cells.
@@ -729,6 +733,8 @@ message ComposeAssetRequest {
   bool cancel = 5;
   uint64 authority = 6;
   uint64 document = 7;
+  bytes known_version = 8;
+  bytes known_digest = 9;
 }
 // Type 29: coalesced pixel scrolling. The source marker is remapped from the
 // scope's buffer revision. offset is relative to the native content top.

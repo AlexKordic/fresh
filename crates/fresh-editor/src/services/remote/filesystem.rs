@@ -153,6 +153,24 @@ impl RemoteFileSystem {
         }
     }
 
+    fn fetch_digest(&self, path: &Path, maximum: Option<u64>) -> io::Result<ContentDigest> {
+        let mut params = digest_params(&path.to_string_lossy());
+        if let Some(maximum) = maximum {
+            params["max_bytes"] = maximum.into();
+        }
+        let result = self.channel.request_blocking("digest", params).map_err(Self::to_io_error)?;
+        let invalid = |what: &str| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("{what} in digest response"))
+        };
+        let size = result.get("size").and_then(|v| v.as_u64()).ok_or_else(|| invalid("missing size"))?;
+        if maximum.is_some_and(|maximum| size > maximum) {
+            return Err(invalid("byte limit exceeded"));
+        }
+        let hex = result.get("sha256").and_then(|v| v.as_str()).ok_or_else(|| invalid("missing sha256"))?;
+        let sha256 = parse_sha256_hex(hex).ok_or_else(|| invalid("malformed sha256"))?;
+        Ok(ContentDigest { size, sha256 })
+    }
+
     /// Convert remote metadata to FileMetadata
     fn convert_metadata(rm: &RemoteMetadata, name: &str) -> FileMetadata {
         let modified = if rm.mtime > 0 {
@@ -328,28 +346,11 @@ impl FileSystem for RemoteFileSystem {
     }
 
     fn content_digest(&self, path: &Path) -> io::Result<ContentDigest> {
-        let path_str = path.to_string_lossy();
-        let result = self
-            .channel
-            .request_blocking("digest", digest_params(&path_str))
-            .map_err(Self::to_io_error)?;
+        self.fetch_digest(path, None)
+    }
 
-        let invalid = |what: &str| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{what} in digest response"),
-            )
-        };
-        let size = result
-            .get("size")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| invalid("missing size"))?;
-        let hex = result
-            .get("sha256")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| invalid("missing sha256"))?;
-        let sha256 = parse_sha256_hex(hex).ok_or_else(|| invalid("malformed sha256"))?;
-        Ok(ContentDigest { size, sha256 })
+    fn content_digest_bounded(&self, path: &Path, maximum: u64) -> io::Result<ContentDigest> {
+        self.fetch_digest(path, Some(maximum))
     }
 
     fn write_file(&self, path: &Path, data: &[u8]) -> io::Result<()> {
@@ -482,6 +483,10 @@ impl FileSystem for RemoteFileSystem {
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
+        self.metadata_with_version(path).map(|(metadata, _)| metadata)
+    }
+
+    fn metadata_with_version(&self, path: &Path) -> io::Result<(FileMetadata, Option<Vec<u8>>)> {
         let path_str = path.to_string_lossy();
         let result = self
             .channel
@@ -495,7 +500,7 @@ impl FileSystem for RemoteFileSystem {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        Ok(Self::convert_metadata(&rm, &name))
+        Ok((Self::convert_metadata(&rm, &name), rm.change_stamp.as_ref().map(|stamp| stamp.bytes())))
     }
 
     fn symlink_metadata(&self, path: &Path) -> io::Result<FileMetadata> {
@@ -1040,6 +1045,7 @@ mod tests {
         let rm = RemoteMetadata {
             size: 1234,
             mtime: 1700000000,
+            change_stamp: None,
             mode: 0o644,
             writable: Some(true),
             uid: 1000,

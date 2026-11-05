@@ -87,6 +87,8 @@ pub(crate) enum WireError {
     WireType(u8),
     /// A string field that isn't UTF-8.
     Utf8,
+    /// A field's value violates its message contract.
+    InvalidField(&'static str),
 }
 
 impl fmt::Display for WireError {
@@ -97,6 +99,7 @@ impl fmt::Display for WireError {
             WireError::TooLong(n) => write!(f, "payload of {n} bytes, more than {MAX_PAYLOAD}"),
             WireError::Truncated => write!(f, "field runs past the end of its message"),
             WireError::WireType(t) => write!(f, "unknown wire type {t}"),
+            WireError::InvalidField(name) => write!(f, "invalid {name}"),
             WireError::Utf8 => write!(f, "string field is not UTF-8"),
         }
     }
@@ -796,7 +799,8 @@ proto! {
     /// A bounded binary image payload, multiplexed with normal input/scene frames.
     Chunk as ComposeAssetChunk {
         1 id: uint64, 2 offset: uint64, 3 total: uint64, 4 data: bytes,
-        5 error: string, 6 done: bool,
+        5 error: string, 6 done: bool, 7 version: bytes, 8 digest: bytes,
+        9 unchanged: bool, 10 retryable: bool,
     }
     /// A rectangle of cells.
     RectView as Rect { 1 x: uint32, 2 y: uint32, 3 w: uint32, 4 h: uint32 }
@@ -1234,6 +1238,8 @@ message ComposeAssetRequest {
   bool cancel = 5;
   uint64 authority = 6;
   uint64 document = 7;
+  bytes known_version = 8;
+  bytes known_digest = 9;
 }
 // Type 29: coalesced pixel scrolling. The source marker is remapped from the
 // scope's buffer revision. offset is relative to the native content top.

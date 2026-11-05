@@ -592,13 +592,15 @@ impl SceneClient {
                     let path = super::compose_assets::resolve(document, &image.target)?;
                     Ok((super::compose_assets::Target { scope: *scope, fs: window.authority().filesystem.clone(), document: document.to_path_buf(), instance: window.buffer_state(scope.buffer).unwrap().marker_list.instance_id() }, path))
                 })();
-                let result = resolved.and_then(|(target, path)| {
-                    assets.submit(self.id, request.id, target.fs.clone(), path)?;
+                let result = resolved.map_err(|error| (error, false)).and_then(|(target, path)| {
+                    assets.submit(self.id, request.id, target.fs.clone(), path, request.conditional)
+                        .map_err(|error| (error, true))?;
                     self.asset_targets.insert(request.id, target);
                     Ok(())
                 });
-                if let Err(error) = result {
-                    self.asset_transfers.push_back(super::compose_assets::Transfer::failure(request.id, error));
+                if let Err((error, retryable)) = result {
+                    self.asset_transfers.push_back(if retryable { super::compose_assets::Transfer::retryable_failure(request.id, error) }
+                        else { super::compose_assets::Transfer::failure(request.id, error) });
                     out.frame_owed = true;
                 }
             }

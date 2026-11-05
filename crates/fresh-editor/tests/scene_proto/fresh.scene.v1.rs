@@ -36,6 +36,14 @@ pub struct ComposeAssetChunk {
     pub error: ::prost::alloc::string::String,
     #[prost(bool, tag = "6")]
     pub done: bool,
+    #[prost(bytes = "vec", tag = "7")]
+    pub version: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "8")]
+    pub digest: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bool, tag = "9")]
+    pub unchanged: bool,
+    #[prost(bool, tag = "10")]
+    pub retryable: bool,
 }
 /// A rectangle of cells.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1210,7 +1218,7 @@ pub struct ComposeInput {
 }
 /// Type 28: read the image annotation identified by this source range through
 /// its document authority. No client-supplied path. Cancellation needs only id.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeAssetRequest {
     #[prost(uint64, tag = "1")]
     pub id: u64,
@@ -1226,6 +1234,10 @@ pub struct ComposeAssetRequest {
     pub authority: u64,
     #[prost(uint64, tag = "7")]
     pub document: u64,
+    #[prost(bytes = "vec", tag = "8")]
+    pub known_version: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "9")]
+    pub known_digest: ::prost::alloc::vec::Vec<u8>,
 }
 /// Type 29: coalesced pixel scrolling. The source marker is remapped from the
 /// scope's buffer revision. offset is relative to the native content top.
