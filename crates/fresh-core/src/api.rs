@@ -3766,6 +3766,17 @@ pub struct ReplaceRegex {
     pub whole_words: bool,
 }
 
+/// Host-only correlation for a Compose decoration batch. JavaScript hook
+/// payloads omit this token; only the runtime can acknowledge that batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinesBatch {
+    pub window_id: u64,
+    pub buffer_id: BufferId,
+    pub buffer_epoch: usize,
+    pub revision: u64,
+    pub id: u64,
+}
+
 /// Plugin command - allows plugins to send commands to the editor
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -4556,6 +4567,15 @@ pub enum PluginCommand {
     /// Used by the render loop to wait deterministically for plugin responses
     /// (e.g., conceal commands from `lines_changed`) instead of polling.
     HookCompleted { hook_name: String },
+
+    /// Internal completion of the synchronous Compose line handler. The
+    /// editor applies this only after the preceding decoration commands.
+    #[ts(skip)]
+    ComposeLinesCompleted { batch: LinesBatch, success: bool },
+    /// Source decorations produced by a tracked hook belong to that window
+    /// and buffer lifetime, even if focus changes before they are applied.
+    #[ts(skip)]
+    ScopedCompose { batch: LinesBatch, command: Box<PluginCommand> },
 
     /// Set a line indicator in the gutter's indicator column
     /// Used for git gutter, breakpoints, bookmarks, etc.

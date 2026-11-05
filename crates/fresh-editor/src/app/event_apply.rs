@@ -59,6 +59,14 @@ impl Editor {
         removed: usize,
         inserted: usize,
     ) {
+        #[cfg(feature = "web")]
+        {
+            let window = self.active_window_mut();
+            if let Some(state) = window.buffer_state(buffer_id) {
+                let (epoch, revision) = (state.marker_list.instance_id(), state.buffer.version());
+                window.compose_readiness.adjust(buffer_id, epoch, revision, position, removed, inserted);
+            }
+        }
         let Some(seen) = self
             .active_window_mut()
             .seen_byte_ranges
@@ -776,6 +784,7 @@ impl Editor {
                     crate::services::plugins::hooks::HookArgs::AfterInsert {
                         buffer_id,
                         window_id: self.active_window.0,
+                        compose_scope: self.compose_hook_scope(buffer_id),
                         position: *position,
                         text: text.clone(),
                         // Byte range of the affected area
@@ -808,6 +817,7 @@ impl Editor {
                     crate::services::plugins::hooks::HookArgs::AfterDelete {
                         buffer_id,
                         window_id: self.active_window.0,
+                        compose_scope: self.compose_hook_scope(buffer_id),
                         start: range.start,
                         end: range.end,
                         deleted_text: deleted_text.clone(),

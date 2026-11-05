@@ -458,6 +458,8 @@ impl Editor {
         self.detach_buffer_from_all_windows(id);
         self.active_window_mut().event_logs.remove(&id);
         self.active_window_mut().seen_byte_ranges.remove(&id);
+        #[cfg(feature = "web")]
+        self.active_window_mut().compose_readiness.remove(id);
         self.active_window_mut().buffer_metadata.remove(&id);
         self.active_window_mut().status_bar_values.remove(&id);
         if let Some((request_id, _, _)) = self

@@ -94,6 +94,7 @@ struct SceneClient {
     last_input: u64,
     last_input_reply: Option<super::compose::InputReply>,
     pending_input_target: Option<super::compose::InputTarget>,
+    last_measurement: Option<(u64, u64, u64, u64, bool)>,
     input_reply: Option<super::compose::InputReply>,
     input_scope: Option<super::compose::Scope>,
     navigation: super::compose_navigation::Session,
@@ -171,6 +172,11 @@ impl SceneBridge {
     /// `_rows` are there for the browser bridge's HTTP `/resize`.
     pub fn poll(&mut self, editor: &mut Editor, _cols: &mut u16, _rows: &mut u16) -> BridgePoll {
         let mut out = BridgePoll::default();
+        let active = editor.active_session_id();
+        for (&id, window) in &mut editor.windows {
+            if id != active { window.compose_readiness.retain_demands(&[]); }
+            out.frame_owed |= window.compose_readiness.expire(Instant::now());
+        }
         // Release payloads sent in the previous push before accepting the
         // next requests. A client may pipeline another image with its Applied
         // ack; it must not receive a spurious busy reply for an already freed
@@ -245,7 +251,7 @@ impl SceneBridge {
             out.mutated = true;
         }
         if !self.clients.iter().any(|client| client.greeted && client.rich_compose) {
-            for window in editor.windows.values_mut() { window.compose_regions.clear(); }
+            for window in editor.windows.values_mut() { window.compose_regions.clear(); window.compose_readiness.clear(); }
         }
         out
     }
@@ -320,14 +326,25 @@ impl SceneBridge {
                 // A deferred motion can need source far from what this client
                 // is reading. Supply it in the reply for geometry, without
                 // replacing the visible viewport merely to measure a command.
-                if let (Some(reply), Some(scope)) = (&mut client.input_reply, client.input_scope) {
+                if let Some(scope) = client.input_scope.or(client.pending_input_target.map(|target| target.scope)) {
                     if scope.window == model.window_id {
                         let revision = editor.active_window().buffer_state(scope.buffer).map_or(0, |state| state.buffer.version());
                         if let Some(region) = client.navigation.region(scope.window, scope.leaf, scope.buffer, revision) {
-                            reply.compose = self.compose.gather_at(editor, scope.leaf, scope.buffer, Some(region));
-                            if let Some(compose) = &reply.compose {
+                            let measurement = self.compose.gather_at(editor, scope.leaf, scope.buffer, Some(region));
+                            if let Some(compose) = &measurement {
                                 compose_regions.push(crate::app::window::ComposeRegion { leaf: scope.leaf, buffer: scope.buffer,
                                     revision: compose.buffer_revision, source: compose.source_start..compose.source_end });
+                                if let Some(target) = client.pending_input_target {
+                                    let ready = compose.ready != Some(false);
+                                    let fingerprint = (target.id, compose.buffer_revision, compose.projection_revision, compose.selection_revision, ready);
+                                    if client.input_reply.is_none() && ready && client.last_measurement != Some(fingerprint) {
+                                        client.input_reply = Some(super::compose::InputReply { id: target.id, needs_layout: true, ..Default::default() });
+                                    }
+                                    if let Some(reply) = client.input_reply.as_mut().filter(|reply| !reply.accepted && !reply.cancelled) {
+                                        reply.compose = measurement;
+                                        client.last_measurement = Some(fingerprint);
+                                    }
+                                }
                             }
                         }
                     }
@@ -354,6 +371,7 @@ impl SceneBridge {
         compose_regions.sort_by_key(|r| (r.buffer.0, r.leaf.0.0, r.source.start, r.source.end));
         compose_regions.dedup();
         let window = editor.active_window_mut();
+        window.compose_readiness.retain_demands(&compose_regions);
         if window.compose_regions != compose_regions {
             window.compose_regions = compose_regions;
             editor.request_plugin_render();
@@ -419,6 +437,7 @@ impl SceneClient {
             last_input: 0,
             last_input_reply: None,
             pending_input_target: None,
+            last_measurement: None,
             input_reply: None,
             input_scope: None,
             navigation: Default::default(),
@@ -485,6 +504,7 @@ impl SceneClient {
             self.last_input = self.last_input.max(reply.id);
             self.last_input_reply = Some(reply.clone());
             self.pending_input_target = None;
+            self.last_measurement = None;
         }
         self.input_reply = Some(reply);
     }
@@ -592,7 +612,7 @@ impl SceneClient {
                     // A terminal cancellation can race a legal retry of the
                     // earlier needs-layout reply. Keep the terminal outcome;
                     // do not drop the connection or run the action again.
-                    if reply.id == input.id && (reply.accepted || reply.cancelled) {
+                    if reply.id == input.id {
                         out.frame_owed = true;
                         return Ok(());
                     }
@@ -641,11 +661,17 @@ impl SceneClient {
                     return Ok(());
                 }
                 let mut accepted = false;
-                let snapshot = input.scope.as_ref().and_then(|scope| {
+                let current = input.scope.as_ref().and_then(|scope| {
                     let viewport = (scope.window == editor.active_window().id.0).then(|| super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer)).flatten();
                     let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision).or(viewport.map(|v| v.position));
-                    scope.snapshot(editor, compose, region)
+                    compose.gather_at(editor, scope.leaf, scope.buffer, region)
                 });
+                if current.as_ref().is_some_and(|pane| pane.ready == Some(false)) {
+                    self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                    out.frame_owed = true;
+                    return Ok(());
+                }
+                let snapshot = current.filter(|pane| input.scope.as_ref().is_some_and(|scope| scope.matches(editor, pane)));
                 if snapshot.is_none() && input.scope.is_some_and(|scope| compose.gather_at(editor, scope.leaf, scope.buffer, None).is_none()) {
                     self.cancel_input(input.id, "Rich Compose is no longer available in this view. Retry your action.");
                     out.frame_owed = true;

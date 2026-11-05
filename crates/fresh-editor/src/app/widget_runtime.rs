@@ -2797,6 +2797,8 @@ impl Editor {
         // on the next render. This is useful when a plugin is enabled and needs to
         // process lines that were already marked as seen.
         self.active_window_mut().seen_byte_ranges.remove(&buffer_id);
+        #[cfg(feature = "web")]
+        self.active_window_mut().compose_readiness.invalidate(buffer_id);
         // Request a render so the lines_changed hook fires
         #[cfg(feature = "plugins")]
         {

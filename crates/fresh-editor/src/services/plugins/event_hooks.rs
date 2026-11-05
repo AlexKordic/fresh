@@ -46,6 +46,7 @@ impl EventHooks for Event {
                 text,
                 cursor_id: _,
             } => Some(HookArgs::AfterInsert {
+                compose_scope: None,
                 buffer_id,
                 window_id,
                 position: *position,
@@ -62,6 +63,7 @@ impl EventHooks for Event {
                 deleted_text,
                 ..
             } => Some(HookArgs::AfterDelete {
+                compose_scope: None,
                 buffer_id,
                 window_id,
                 start: range.start,

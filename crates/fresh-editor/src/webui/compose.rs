@@ -120,24 +120,13 @@ impl Scope {
         Ok(scope)
     }
 
-    pub fn snapshot(
-        &self,
-        editor: &mut Editor,
-        cache: &mut ComposeCache,
-        region: Option<usize>,
-    ) -> Option<ComposePane> {
-        if editor.active_window().id.0 != self.window
-            || editor.active_window().pane_buffer(self.leaf) != Some(self.buffer)
-        {
-            return None;
-        }
-        cache
-            .gather_at(editor, self.leaf, self.buffer, region)
-            .filter(|pane| {
-                pane.buffer_revision == self.revision
-                    && pane.projection_revision == self.projection
-                    && pane.selection_revision == self.selection
-            })
+    pub fn matches(&self, editor: &Editor, pane: &ComposePane) -> bool {
+        editor.active_window().id.0 == self.window
+            && editor.active_window().pane_buffer(self.leaf) == Some(self.buffer)
+            && pane.buffer_revision == self.revision
+            && pane.projection_revision == self.projection
+            && pane.selection_revision == self.selection
+            && pane.ready != Some(false)
     }
 }
 
@@ -391,6 +380,8 @@ pub(crate) struct ComposePane {
     pub asset_authority: u64,
     pub asset_document: u64,
     pub viewport: Option<super::compose_viewport::Value>,
+    pub ready: Option<bool>,
+    pub error: String,
 }
 
 struct Document {
@@ -544,7 +535,32 @@ impl ComposeCache {
             self.documents.retain(|(window, _), _| *window != window_id);
         }
         let asset_authority = self.authorities[&window_id].1;
-        let state = editor.active_window_mut().buffers.get_mut(&buffer)?;
+        let readiness_enabled = editor.compose_plugins_active();
+        let (epoch, current_revision, length) = {
+            let state = editor.active_window().buffer_state(buffer)?;
+            (
+                state.marker_list.instance_id(),
+                state.buffer.version(),
+                state.buffer.len(),
+            )
+        };
+        if length > SOURCE_LIMIT {
+            editor.active_window_mut().compose_readiness.remove(buffer);
+            return None;
+        }
+        if readiness_enabled {
+            let window = editor.active_window_mut();
+            if window
+                .compose_readiness
+                .track(buffer, epoch, current_revision)
+            {
+                window.seen_byte_ranges.remove(&buffer);
+                editor.request_plugin_render();
+            }
+        }
+        let window = editor.active_window_mut();
+        let readiness = &mut window.compose_readiness;
+        let state = window.buffers.get_mut(&buffer)?;
         // The initial scene is bounded. A document above this limit continues
         // through the existing grid Compose path until paged parsing is added.
         if state.buffer.len() > SOURCE_LIMIT {
@@ -608,7 +624,18 @@ impl ComposeCache {
         }
         // Conceal replacements must travel whole. Extend the requested slice
         // rather than clipping a range into an invalid source map.
+        use crate::app::compose_readiness::Status;
+        let mut status = |start, end| {
+            if readiness_enabled {
+                readiness.demand(buffer, start..end)
+            } else {
+                Status::Ready
+            }
+        };
         for _ in 0..4 {
+            if status(start, end) != Status::Ready {
+                break;
+            }
             let ranges =
                 state
                     .conceals
@@ -635,16 +662,37 @@ impl ComposeCache {
             })
             .map(|image| image.start..image.end)
             .collect();
-        let projection = state
-            .conceals
-            .project_text_with_objects(raw, start, &state.marker_list, &cursor_positions, &objects)
-            .ok()?;
+        let status = status(start, end);
+        let projection = if status == Status::Ready {
+            state
+                .conceals
+                .project_text_with_objects(
+                    raw,
+                    start,
+                    &state.marker_list,
+                    &cursor_positions,
+                    &objects,
+                )
+                .ok()?
+        } else {
+            // Never publish a partially applied replacement/conceal map.
+            Projection::new(raw, start, &[]).ok()?
+        };
         let mut pane = ComposePane::from_projection(
             projection, doc, revision, cursors, focused, top_byte, &context,
         );
         pane.keyboard = owns_keyboard && focused;
         pane.asset_authority = asset_authority;
         pane.asset_document = asset_document;
+        pane.ready = Some(status != Status::Pending);
+        if status != Status::Ready {
+            for image in &mut pane.images {
+                image.rendered = false;
+            }
+        }
+        if status == Status::Failed {
+            pane.error = "Formatting is unavailable. The Markdown source remains editable.".into();
+        }
         Some(pane)
     }
 }
@@ -727,6 +775,8 @@ impl ComposePane {
             asset_authority: 0,
             asset_document: 0,
             viewport: None,
+            ready: Some(true),
+            error: String::new(),
         }
     }
 }

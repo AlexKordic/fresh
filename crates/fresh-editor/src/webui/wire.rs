@@ -922,7 +922,7 @@ proto! {
         8 images: repeated ComposeImage, 9 cursors: repeated ComposeSelection,
         10 focused: bool, 11 top_byte: uint64, 12 document_len: uint64,
         13 selection_revision: uint64, 14 keyboard: bool, 15 asset_authority: uint64, 16 asset_document: uint64,
-        17 viewport: maybe ComposeViewport,
+        17 viewport: maybe ComposeViewport, 18 ready: optional bool, 19 error: string,
     }
     /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
     ComposeSegment {

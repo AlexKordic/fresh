@@ -1155,7 +1155,7 @@ async fn run_hook_internal_rc(
     hook_name: &str,
     args: &HookArgs,
     target: Option<&str>,
-) -> Result<()> {
+) -> Result<Option<bool>> {
     // Convert HookArgs to serde_json::Value using hook_args_to_json which produces flat JSON
     // (not enum-tagged JSON from serde's default Serialize)
     let json_start = std::time::Instant::now();
@@ -1168,9 +1168,15 @@ async fn run_hook_internal_rc(
 
     // Emit to TypeScript handlers
     let emit_start = std::time::Instant::now();
-    runtime
+    let compose_batch = match args {
+        HookArgs::LinesChanged { compose_batch, .. } => compose_batch.as_ref(),
+        HookArgs::AfterInsert { compose_scope, .. }
+        | HookArgs::AfterDelete { compose_scope, .. } => compose_scope.as_ref(),
+        _ => None,
+    };
+    let completed = runtime
         .borrow_mut()
-        .emit_to(hook_name, &json_data, target)
+        .emit_tracked(hook_name, &json_data, target, compose_batch)
         .await?;
     tracing::trace!(
         hook = hook_name,
@@ -1178,7 +1184,7 @@ async fn run_hook_internal_rc(
         "emit completed"
     );
 
-    Ok(())
+    Ok(completed)
 }
 
 /// Handle a single request in the plugin thread
@@ -1271,14 +1277,30 @@ async fn handle_request(
             } else {
                 tracing::trace!(hook = %hook_name, "RunHook request received");
             }
-            if let Err(e) =
-                run_hook_internal_rc(Rc::clone(&runtime), &hook_name, &args, target.as_deref())
-                    .await
+            let completion = match run_hook_internal_rc(
+                Rc::clone(&runtime),
+                &hook_name,
+                &args,
+                target.as_deref(),
+            )
+            .await
             {
-                let error_msg = format!("Plugin error in '{}': {}", hook_name, e);
-                tracing::error!("{}", error_msg);
-                // Surface the error to the UI
-                runtime.borrow_mut().send_status(error_msg);
+                Ok(completion) => completion,
+                Err(e) => {
+                    let error_msg = format!("Plugin error in '{}': {}", hook_name, e);
+                    tracing::error!("{}", error_msg);
+                    runtime.borrow_mut().send_status(error_msg);
+                    None
+                }
+            };
+            if let HookArgs::LinesChanged {
+                compose_batch: Some(batch),
+                ..
+            } = &args
+            {
+                runtime
+                    .borrow()
+                    .send_compose_lines_completed(batch.clone(), completion == Some(true));
             }
             // Send sentinel so the main thread can wait deterministically
             // for all commands from this hook to be available.

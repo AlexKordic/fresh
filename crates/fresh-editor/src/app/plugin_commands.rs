@@ -2132,6 +2132,8 @@ impl Editor {
     /// race where render marks lines as "seen" before the plugin has initialized.
     pub(super) fn handle_refresh_all_lines(&mut self) {
         self.active_window_mut().seen_byte_ranges.clear();
+        #[cfg(feature = "web")]
+        self.active_window_mut().compose_readiness.invalidate_all();
         #[cfg(feature = "plugins")]
         {
             self.plugin_render_requested = true;

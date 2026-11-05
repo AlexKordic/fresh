@@ -79,6 +79,8 @@ pub enum HookArgs {
     AfterInsert {
         buffer_id: BufferId,
         window_id: u64,
+        #[serde(skip)]
+        compose_scope: Option<crate::api::LinesBatch>,
         position: usize,
         text: String,
         /// Byte position where the affected range starts
@@ -105,6 +107,8 @@ pub enum HookArgs {
     AfterDelete {
         buffer_id: BufferId,
         window_id: u64,
+        #[serde(skip)]
+        compose_scope: Option<crate::api::LinesBatch>,
         start: usize,
         end: usize,
         deleted_text: String,
@@ -265,6 +269,9 @@ pub enum HookArgs {
         /// from the same live state, in the same frame, as `lines`, so it
         /// cannot disagree with them.
         is_composing_in_any_split: bool,
+        /// Host-only correlation. It is never exposed to JavaScript handlers.
+        #[serde(skip)]
+        compose_batch: Option<crate::api::LinesBatch>,
     },
 
     /// Prompt input changed (user typed/edited)
@@ -840,6 +847,17 @@ pub fn hook_args_to_json(args: &HookArgs) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_batch_correlation_is_not_exposed_to_javascript() {
+        let value = hook_args_to_json(&HookArgs::LinesChanged {
+            buffer_id: crate::BufferId(3), lines: vec![], epoch: 7, is_composing_in_any_split: true,
+            compose_batch: Some(crate::api::LinesBatch { window_id: 11, buffer_id: crate::BufferId(3), buffer_epoch: 17, revision: 7, id: 19 }),
+        }).unwrap();
+        assert_eq!(value["buffer_id"], 3);
+        assert_eq!(value["epoch"], 7);
+        assert!(value.get("compose_batch").is_none());
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 

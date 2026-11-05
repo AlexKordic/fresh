@@ -221,6 +221,25 @@ impl crate::view::shell::fold::ProvenanceSink for FoldProvenance {
 }
 
 impl Editor {
+    #[cfg(feature = "web")]
+    pub(crate) fn compose_plugins_active(&self) -> bool {
+        self.plugin_manager.try_read().map(|manager| manager.is_active()).unwrap_or(true)
+    }
+
+    pub(crate) fn compose_hook_scope(&self, buffer_id: crate::model::event::BufferId) -> Option<fresh_core::api::LinesBatch> {
+        #[cfg(feature = "web")]
+        {
+            let window = self.active_window();
+            if window.compose_readiness.is_tracked(buffer_id) {
+                let state = window.buffer_state(buffer_id)?;
+                return Some(fresh_core::api::LinesBatch { window_id: window.id.0, buffer_id,
+                    buffer_epoch: state.marker_list.instance_id(), revision: state.buffer.version(), id: 0 });
+            }
+        }
+        let _ = buffer_id;
+        None
+    }
+
     /// Ask for another frame because plugin work was deferred out of this one.
     /// The drawing itself never blocks on the plugin lock — every hook site
     /// inside the draw uses `try_read` and skips on contention — so anything
@@ -541,7 +560,20 @@ impl Editor {
                 // field on Window, not part of WindowBuffers) so the closure
                 // below can update it alongside the buffer + view-state
                 // mutations.
+                #[cfg(feature = "web")]
+                {
+                    if __win.compose_readiness.is_tracked(buffer_id) {
+                        if let Some(state) = __win.buffer_state(buffer_id) {
+                            let (epoch, revision) = (state.marker_list.instance_id(), state.buffer.version());
+                            if __win.compose_readiness.track(buffer_id, epoch, revision) {
+                                __win.seen_byte_ranges.remove(&buffer_id);
+                            }
+                        }
+                    }
+                }
                 let seen_ranges_for_win = &mut __win.seen_byte_ranges;
+                #[cfg(feature = "web")]
+                let compose_readiness = &mut __win.compose_readiness;
                 let plugin_manager = &self.plugin_manager;
                 let estimated_line_length = self.config.editor.estimated_line_length;
                 let mut hooks_deferred = false;
@@ -838,6 +870,10 @@ impl Editor {
                                     }
                                 }
                             }
+                            #[cfg(feature = "web")]
+                            let compose_batch = compose_readiness.begin(__active_id.0, buffer_id, &fresh_ranges);
+                            #[cfg(not(feature = "web"))]
+                            let compose_batch = None;
                             pm_guard.run_hook(
                                 "lines_changed",
                                 crate::services::plugins::hooks::HookArgs::LinesChanged {
@@ -845,6 +881,7 @@ impl Editor {
                                     lines: new_lines,
                                     epoch: state.buffer.version(),
                                     is_composing_in_any_split: composing_in_any_split,
+                                    compose_batch,
                                 },
                             );
                             for range in fresh_ranges {

@@ -316,6 +316,8 @@ pub struct Window {
     pub(crate) compose_regions: Vec<ComposeRegion>,
     #[cfg(feature = "web")]
     pub(crate) compose_viewports: crate::webui::compose_viewport::Registry,
+    #[cfg(feature = "web")]
+    pub(crate) compose_readiness: crate::app::compose_readiness::Registry,
 
     /// The connection this workspace acts through: where it acts, whether it
     /// may (`workspace_trust`), with what env, and what keeps the carrier alive.
@@ -2409,6 +2411,8 @@ impl Window {
             compose_regions: Vec::new(),
             #[cfg(feature = "web")]
             compose_viewports: Default::default(),
+            #[cfg(feature = "web")]
+            compose_readiness: Default::default(),
             label,
             stable_id: crate::workspace::generate_stable_id(),
             // A window is created because someone is about to work in it,

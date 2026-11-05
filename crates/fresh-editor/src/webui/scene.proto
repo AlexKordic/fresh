@@ -343,6 +343,8 @@ message ComposePane {
   uint64 asset_authority = 15;
   uint64 asset_document = 16;
   ComposeViewport viewport = 17;
+  optional bool ready = 18;
+  string error = 19;
 }
 
 // kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.

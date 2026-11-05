@@ -249,26 +249,40 @@ fn json_to_js_value<'js>(
 
 /// Call a JS handler function directly with structured data, bypassing JSON
 /// string serialization and JS-side `JSON.parse()` + source re-parsing.
-fn call_handler(ctx: &rquickjs::Ctx<'_>, handler_name: &str, event_data: &serde_json::Value) {
+fn call_handler(
+    ctx: &rquickjs::Ctx<'_>,
+    handler_name: &str,
+    event_data: &serde_json::Value,
+) -> bool {
     let js_data = match json_to_js_value(ctx, event_data) {
         Ok(v) => v,
         Err(e) => {
             log_js_error(ctx, e, &format!("handler {} data conversion", handler_name));
-            return;
+            return false;
         }
     };
 
     let globals = ctx.globals();
     let Ok(func) = globals.get::<_, rquickjs::Function>(handler_name) else {
-        return;
+        return false;
     };
 
-    match func.call::<_, rquickjs::Value>((js_data,)) {
-        Ok(result) => attach_promise_catch(ctx, &globals, handler_name, result),
-        Err(e) => log_js_error(ctx, e, &format!("handler {}", handler_name)),
-    }
+    let synchronous = match func.call::<_, rquickjs::Value>((js_data,)) {
+        Ok(result) => {
+            let synchronous = !result
+                .as_object()
+                .is_some_and(|obj| obj.get::<_, rquickjs::Function>("then").is_ok());
+            attach_promise_catch(ctx, &globals, handler_name, result);
+            synchronous
+        }
+        Err(e) => {
+            log_js_error(ctx, e, &format!("handler {}", handler_name));
+            false
+        }
+    };
 
     run_pending_jobs_checked(ctx, &format!("emit handler {}", handler_name));
+    synchronous
 }
 
 /// If `result` is a thenable (Promise), attach `.catch()` to surface async rejections.
@@ -929,6 +943,8 @@ pub struct JsEditorApi {
     #[qjs(skip_trace)]
     current_hook_epoch: Rc<std::cell::Cell<Option<(u32, u64)>>>,
     #[qjs(skip_trace)]
+    current_compose_batch: Rc<RefCell<Option<fresh_core::api::LinesBatch>>>,
+    #[qjs(skip_trace)]
     async_resource_owners: AsyncResourceOwners,
     /// Tracks command name → owning plugin name (first-writer-wins collision detection)
     #[qjs(skip_trace)]
@@ -1174,6 +1190,52 @@ impl JsEditorApi {
             .get()
             .filter(|(b, _)| *b == buffer_id)
             .map(|(_, epoch)| epoch)
+    }
+
+    fn send_decoration(
+        &self,
+        command: PluginCommand,
+    ) -> Result<(), mpsc::SendError<PluginCommand>> {
+        let buffer = match &command {
+            PluginCommand::AddConceal { buffer_id, .. }
+            | PluginCommand::ClearConcealNamespace { buffer_id, .. }
+            | PluginCommand::ClearConcealsInRange { buffer_id, .. }
+            | PluginCommand::ClearConcealsInRangeForNamespace { buffer_id, .. }
+            | PluginCommand::AddSoftBreak { buffer_id, .. }
+            | PluginCommand::ClearSoftBreakNamespace { buffer_id, .. }
+            | PluginCommand::ClearSoftBreaksInRange { buffer_id, .. }
+            | PluginCommand::AddVirtualText { buffer_id, .. }
+            | PluginCommand::AddVirtualTextStyled { buffer_id, .. }
+            | PluginCommand::ClearVirtualTexts { buffer_id, .. }
+            | PluginCommand::ClearVirtualLinesInRange { buffer_id, .. }
+            | PluginCommand::ClearVirtualTextsInRange { buffer_id, .. }
+            | PluginCommand::AddVirtualLine { buffer_id, .. }
+            | PluginCommand::RefreshLines { buffer_id, .. }
+            | PluginCommand::AddOverlay { buffer_id, .. }
+            | PluginCommand::ClearAllOverlays { buffer_id, .. }
+            | PluginCommand::ClearNamespace { buffer_id, .. }
+            | PluginCommand::ClearOverlaysInRange { buffer_id, .. }
+            | PluginCommand::ClearOverlaysInRangeForNamespace { buffer_id, .. }
+            | PluginCommand::RemoveOverlay { buffer_id, .. }
+            | PluginCommand::RemoveVirtualText { buffer_id, .. }
+            | PluginCommand::RemoveVirtualTextsByPrefix { buffer_id, .. }
+            | PluginCommand::ClearVirtualTextNamespace { buffer_id, .. } => Some(*buffer_id),
+            _ => None,
+        };
+        let command = if let Some(batch) = self
+            .current_compose_batch
+            .borrow()
+            .clone()
+            .filter(|batch| Some(batch.buffer_id) == buffer)
+        {
+            PluginCommand::ScopedCompose {
+                batch,
+                command: Box::new(command),
+            }
+        } else {
+            command
+        };
+        self.command_sender.send(command)
     }
 
     /// Look up the current value of one of this plugin's settings
@@ -4573,7 +4635,7 @@ impl JsEditorApi {
             .overlay_namespaces
             .push((BufferId(buffer_id as usize), namespace.clone()));
 
-        let _ = self.command_sender.send(PluginCommand::AddOverlay {
+        let _ = self.send_decoration(PluginCommand::AddOverlay {
             buffer_id: BufferId(buffer_id as usize),
             namespace: Some(OverlayNamespace::from_string(namespace)),
             range: (start as usize)..(end as usize),
@@ -4650,32 +4712,29 @@ impl JsEditorApi {
 
     /// Clear all overlays in a namespace
     pub fn clear_namespace(&self, buffer_id: u32, namespace: String) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearNamespace {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace: OverlayNamespace::from_string(namespace),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearNamespace {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace: OverlayNamespace::from_string(namespace),
+        })
+        .is_ok()
     }
 
     /// Clear all overlays from a buffer
     pub fn clear_all_overlays(&self, buffer_id: u32) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearAllOverlays {
-                buffer_id: BufferId(buffer_id as usize),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearAllOverlays {
+            buffer_id: BufferId(buffer_id as usize),
+        })
+        .is_ok()
     }
 
     /// Clear all overlays that overlap with a byte range
     pub fn clear_overlays_in_range(&self, buffer_id: u32, start: u32, end: u32) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearOverlaysInRange {
-                buffer_id: BufferId(buffer_id as usize),
-                start: start as usize,
-                end: end as usize,
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearOverlaysInRange {
+            buffer_id: BufferId(buffer_id as usize),
+            start: start as usize,
+            end: end as usize,
+        })
+        .is_ok()
     }
 
     /// Clear overlays in a namespace that overlap with a byte range
@@ -4686,25 +4745,23 @@ impl JsEditorApi {
         start: u32,
         end: u32,
     ) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearOverlaysInRangeForNamespace {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace: OverlayNamespace::from_string(namespace),
-                start: start as usize,
-                end: end as usize,
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearOverlaysInRangeForNamespace {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace: OverlayNamespace::from_string(namespace),
+            start: start as usize,
+            end: end as usize,
+        })
+        .is_ok()
     }
 
     /// Remove an overlay by its handle
     pub fn remove_overlay(&self, buffer_id: u32, handle: String) -> bool {
         use fresh_core::overlay::OverlayHandle;
-        self.command_sender
-            .send(PluginCommand::RemoveOverlay {
-                buffer_id: BufferId(buffer_id as usize),
-                handle: OverlayHandle(handle),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::RemoveOverlay {
+            buffer_id: BufferId(buffer_id as usize),
+            handle: OverlayHandle(handle),
+        })
+        .is_ok()
     }
 
     // === Conceal Ranges ===
@@ -4738,39 +4795,36 @@ impl JsEditorApi {
             .overlay_namespaces
             .push((BufferId(buffer_id as usize), namespace.clone()));
 
-        self.command_sender
-            .send(PluginCommand::AddConceal {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace: OverlayNamespace::from_string(namespace),
-                start: start as usize,
-                end: end as usize,
-                replacement,
-                epoch: self.hook_epoch_for(buffer_id),
-                activation: Self::parse_activation(activation.0, scope_start.0, scope_end.0),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::AddConceal {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace: OverlayNamespace::from_string(namespace),
+            start: start as usize,
+            end: end as usize,
+            replacement,
+            epoch: self.hook_epoch_for(buffer_id),
+            activation: Self::parse_activation(activation.0, scope_start.0, scope_end.0),
+        })
+        .is_ok()
     }
 
     /// Clear all conceal ranges in a namespace
     pub fn clear_conceal_namespace(&self, buffer_id: u32, namespace: String) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearConcealNamespace {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace: OverlayNamespace::from_string(namespace),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearConcealNamespace {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace: OverlayNamespace::from_string(namespace),
+        })
+        .is_ok()
     }
 
     /// Clear all conceal ranges that overlap with a byte range
     pub fn clear_conceals_in_range(&self, buffer_id: u32, start: u32, end: u32) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearConcealsInRange {
-                buffer_id: BufferId(buffer_id as usize),
-                start: start as usize,
-                end: end as usize,
-                epoch: self.hook_epoch_for(buffer_id),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearConcealsInRange {
+            buffer_id: BufferId(buffer_id as usize),
+            start: start as usize,
+            end: end as usize,
+            epoch: self.hook_epoch_for(buffer_id),
+        })
+        .is_ok()
     }
 
     // === Text measurement ===
@@ -4803,15 +4857,14 @@ impl JsEditorApi {
         start: u32,
         end: u32,
     ) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearConcealsInRangeForNamespace {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace: OverlayNamespace::from_string(namespace),
-                start: start as usize,
-                end: end as usize,
-                epoch: self.hook_epoch_for(buffer_id),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearConcealsInRangeForNamespace {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace: OverlayNamespace::from_string(namespace),
+            start: start as usize,
+            end: end as usize,
+            epoch: self.hook_epoch_for(buffer_id),
+        })
+        .is_ok()
     }
 
     // === Folds ===
@@ -4928,47 +4981,44 @@ impl JsEditorApi {
             .overlay_namespaces
             .push((BufferId(buffer_id as usize), namespace.clone()));
 
-        self.command_sender
-            .send(PluginCommand::AddSoftBreak {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace: OverlayNamespace::from_string(namespace),
-                position: position as usize,
-                indent: indent as u16,
-                epoch: self.hook_epoch_for(buffer_id),
-                // `Opt<Option<T>>` rather than `Opt<T>`: `Opt` alone only
-                // covers a *missing* argument, so a caller that wants a later
-                // parameter (a `prefix` with no activation, say) and passes
-                // `undefined` for these would hit a conversion error.
-                activation: Self::parse_activation(
-                    activation.0.flatten(),
-                    scope_start.0.flatten(),
-                    scope_end.0.flatten(),
-                ),
-                prefix: prefix.0.flatten().and_then(Self::parse_soft_break_prefix),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::AddSoftBreak {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace: OverlayNamespace::from_string(namespace),
+            position: position as usize,
+            indent: indent as u16,
+            epoch: self.hook_epoch_for(buffer_id),
+            // `Opt<Option<T>>` rather than `Opt<T>`: `Opt` alone only
+            // covers a *missing* argument, so a caller that wants a later
+            // parameter (a `prefix` with no activation, say) and passes
+            // `undefined` for these would hit a conversion error.
+            activation: Self::parse_activation(
+                activation.0.flatten(),
+                scope_start.0.flatten(),
+                scope_end.0.flatten(),
+            ),
+            prefix: prefix.0.flatten().and_then(Self::parse_soft_break_prefix),
+        })
+        .is_ok()
     }
 
     /// Clear all soft breaks in a namespace
     pub fn clear_soft_break_namespace(&self, buffer_id: u32, namespace: String) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearSoftBreakNamespace {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace: OverlayNamespace::from_string(namespace),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearSoftBreakNamespace {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace: OverlayNamespace::from_string(namespace),
+        })
+        .is_ok()
     }
 
     /// Clear all soft breaks that fall within a byte range
     pub fn clear_soft_breaks_in_range(&self, buffer_id: u32, start: u32, end: u32) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearSoftBreaksInRange {
-                buffer_id: BufferId(buffer_id as usize),
-                start: start as usize,
-                end: end as usize,
-                epoch: self.hook_epoch_for(buffer_id),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearSoftBreaksInRange {
+            buffer_id: BufferId(buffer_id as usize),
+            start: start as usize,
+            end: end as usize,
+            epoch: self.hook_epoch_for(buffer_id),
+        })
+        .is_ok()
     }
 
     /// Set layout hints (compose width, column guides) for a buffer/split
@@ -5145,28 +5195,26 @@ impl JsEditorApi {
             .virtual_text_ids
             .push((BufferId(buffer_id as usize), virtual_text_id.clone()));
 
-        self.command_sender
-            .send(PluginCommand::AddVirtualText {
-                buffer_id: BufferId(buffer_id as usize),
-                virtual_text_id,
-                position: position as usize,
-                text,
-                color: (r, g, b),
-                use_bg,
-                before,
-                epoch: self.hook_epoch_for(buffer_id),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::AddVirtualText {
+            buffer_id: BufferId(buffer_id as usize),
+            virtual_text_id,
+            position: position as usize,
+            text,
+            color: (r, g, b),
+            use_bg,
+            before,
+            epoch: self.hook_epoch_for(buffer_id),
+        })
+        .is_ok()
     }
 
     /// Remove a virtual text by ID
     pub fn remove_virtual_text(&self, buffer_id: u32, virtual_text_id: String) -> bool {
-        self.command_sender
-            .send(PluginCommand::RemoveVirtualText {
-                buffer_id: BufferId(buffer_id as usize),
-                virtual_text_id,
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::RemoveVirtualText {
+            buffer_id: BufferId(buffer_id as usize),
+            virtual_text_id,
+        })
+        .is_ok()
     }
 
     /// Add styled virtual text — richer form of `addVirtualText` whose
@@ -5226,51 +5274,46 @@ impl JsEditorApi {
             .virtual_text_ids
             .push((BufferId(buffer_id as usize), virtual_text_id.clone()));
 
-        let _ = self
-            .command_sender
-            .send(PluginCommand::AddVirtualTextStyled {
-                buffer_id: BufferId(buffer_id as usize),
-                virtual_text_id,
-                position: position as usize,
-                text,
-                fg,
-                bg,
-                bold,
-                italic,
-                before,
-                epoch: self.hook_epoch_for(buffer_id),
-                pad_to_column,
-            });
+        let _ = self.send_decoration(PluginCommand::AddVirtualTextStyled {
+            buffer_id: BufferId(buffer_id as usize),
+            virtual_text_id,
+            position: position as usize,
+            text,
+            fg,
+            bg,
+            bold,
+            italic,
+            before,
+            epoch: self.hook_epoch_for(buffer_id),
+            pad_to_column,
+        });
         Ok(true)
     }
 
     /// Remove virtual texts whose ID starts with the given prefix
     pub fn remove_virtual_texts_by_prefix(&self, buffer_id: u32, prefix: String) -> bool {
-        self.command_sender
-            .send(PluginCommand::RemoveVirtualTextsByPrefix {
-                buffer_id: BufferId(buffer_id as usize),
-                prefix,
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::RemoveVirtualTextsByPrefix {
+            buffer_id: BufferId(buffer_id as usize),
+            prefix,
+        })
+        .is_ok()
     }
 
     /// Clear all virtual texts from a buffer
     pub fn clear_virtual_texts(&self, buffer_id: u32) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearVirtualTexts {
-                buffer_id: BufferId(buffer_id as usize),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearVirtualTexts {
+            buffer_id: BufferId(buffer_id as usize),
+        })
+        .is_ok()
     }
 
     /// Clear all virtual texts in a namespace
     pub fn clear_virtual_text_namespace(&self, buffer_id: u32, namespace: String) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearVirtualTextNamespace {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace,
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearVirtualTextNamespace {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace,
+        })
+        .is_ok()
     }
 
     /// Clear virtual lines in a namespace whose anchor byte falls in
@@ -5283,15 +5326,14 @@ impl JsEditorApi {
         start: u32,
         end: u32,
     ) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearVirtualLinesInRange {
-                buffer_id: BufferId(buffer_id as usize),
-                namespace,
-                start: start as usize,
-                end: end as usize,
-                epoch: self.hook_epoch_for(buffer_id),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearVirtualLinesInRange {
+            buffer_id: BufferId(buffer_id as usize),
+            namespace,
+            start: start as usize,
+            end: end as usize,
+            epoch: self.hook_epoch_for(buffer_id),
+        })
+        .is_ok()
     }
 
     /// Clear *inline* virtual texts whose id starts with `idPrefix` and whose
@@ -5305,15 +5347,14 @@ impl JsEditorApi {
         start: u32,
         end: u32,
     ) -> bool {
-        self.command_sender
-            .send(PluginCommand::ClearVirtualTextsInRange {
-                buffer_id: BufferId(buffer_id as usize),
-                id_prefix,
-                start: start as usize,
-                end: end as usize,
-                epoch: self.hook_epoch_for(buffer_id),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::ClearVirtualTextsInRange {
+            buffer_id: BufferId(buffer_id as usize),
+            id_prefix,
+            start: start as usize,
+            end: end as usize,
+            epoch: self.hook_epoch_for(buffer_id),
+        })
+        .is_ok()
     }
 
     /// Add a virtual line (full line above/below a position)
@@ -5396,8 +5437,7 @@ impl JsEditorApi {
             .push((BufferId(buffer_id as usize), namespace.clone()));
 
         Ok(self
-            .command_sender
-            .send(PluginCommand::AddVirtualLine {
+            .send_decoration(PluginCommand::AddVirtualLine {
                 buffer_id: BufferId(buffer_id as usize),
                 position: position as usize,
                 text,
@@ -9007,11 +9047,10 @@ impl JsEditorApi {
 
     /// Force refresh of line display
     pub fn refresh_lines(&self, buffer_id: u32) -> bool {
-        self.command_sender
-            .send(PluginCommand::RefreshLines {
-                buffer_id: BufferId(buffer_id as usize),
-            })
-            .is_ok()
+        self.send_decoration(PluginCommand::RefreshLines {
+            buffer_id: BufferId(buffer_id as usize),
+        })
+        .is_ok()
     }
 
     /// Get the current locale
@@ -9214,6 +9253,7 @@ pub struct QuickJsBackend {
     /// `JsEditorApi`). Shared with every `JsEditorApi` handle so command senders
     /// can stamp it.
     current_hook_epoch: Rc<std::cell::Cell<Option<(u32, u64)>>>,
+    current_compose_batch: Rc<RefCell<Option<fresh_core::api::LinesBatch>>>,
     /// Shared map of request_id → plugin_name for async resource creations.
     /// Used by PluginThreadHandle to track buffer/terminal IDs when responses arrive.
     async_resource_owners: AsyncResourceOwners,
@@ -9828,6 +9868,7 @@ impl QuickJsBackend {
             services,
             plugin_tracked_state,
             current_hook_epoch: Rc::new(std::cell::Cell::new(None)),
+            current_compose_batch: Rc::new(RefCell::new(None)),
             async_resource_owners,
             registered_command_names,
             registered_grammar_languages,
@@ -9859,6 +9900,7 @@ impl QuickJsBackend {
             services: self.services.clone(),
             plugin_tracked_state: Rc::clone(&self.plugin_tracked_state),
             current_hook_epoch: Rc::clone(&self.current_hook_epoch),
+            current_compose_batch: Rc::clone(&self.current_compose_batch),
             async_resource_owners: Arc::clone(&self.async_resource_owners),
             registered_command_names: Rc::clone(&self.registered_command_names),
             registered_grammar_languages: Rc::clone(&self.registered_grammar_languages),
@@ -10316,6 +10358,20 @@ impl QuickJsBackend {
         event_data: &serde_json::Value,
         target: Option<&str>,
     ) -> Result<bool> {
+        self.emit_tracked(event_name, event_data, target, None)
+            .await?;
+        Ok(true)
+    }
+
+    /// Whether Compose's line handlers finished synchronously and without an
+    /// exception. Other hook consumers keep their existing async semantics.
+    pub async fn emit_tracked(
+        &mut self,
+        event_name: &str,
+        event_data: &serde_json::Value,
+        target: Option<&str>,
+        compose_batch: Option<&fresh_core::api::LinesBatch>,
+    ) -> Result<Option<bool>> {
         tracing::trace!("emit: event '{}' with data: {:?}", event_name, event_data);
 
         self.services
@@ -10329,11 +10385,13 @@ impl QuickJsBackend {
         // present; an event without an `epoch` (or `buffer_id`) clears it to
         // `None`, which is correct: its commands carry no stale coordinate.
         let prev_epoch = self.current_hook_epoch.get();
+        let previous_batch = self.current_compose_batch.replace(compose_batch.cloned());
         let hook_epoch = event_data
             .get("epoch")
             .and_then(|v| v.as_u64())
             .zip(event_data.get("buffer_id").and_then(|v| v.as_u64()))
-            .map(|(epoch, buffer_id)| (buffer_id as u32, epoch));
+            .map(|(epoch, buffer_id)| (buffer_id as u32, epoch))
+            .or_else(|| compose_batch.map(|batch| (batch.buffer_id.0 as u32, batch.revision)));
         self.current_hook_epoch.set(hook_epoch);
 
         let handlers = self
@@ -10359,6 +10417,7 @@ impl QuickJsBackend {
                 .clone();
             (buffer_id.map(|id| BufferId(id as usize)), composing, scopes)
         });
+        let mut compose_completed: Option<bool> = None;
         if let Some(handler_pairs) = handlers {
             let plugin_contexts = self.plugin_contexts.borrow();
             for handler in &handler_pairs {
@@ -10373,15 +10432,18 @@ impl QuickJsBackend {
                 let Some(context) = plugin_contexts.get(&handler.plugin_name) else {
                     continue;
                 };
-                context.with(|ctx| {
-                    call_handler(&ctx, &handler.handler_name, event_data);
-                });
+                let synchronous =
+                    context.with(|ctx| call_handler(&ctx, &handler.handler_name, event_data));
+                if event_name == "lines_changed" && handler.plugin_name == "markdown_compose" {
+                    compose_completed = Some(compose_completed.unwrap_or(true) && synchronous);
+                }
             }
         }
 
         self.current_hook_epoch.set(prev_epoch);
+        self.current_compose_batch.replace(previous_batch);
         self.services.clear_js_execution_state();
-        Ok(true)
+        Ok(compose_completed)
     }
 
     /// Check if any handlers are registered for an event
@@ -10737,6 +10799,12 @@ impl QuickJsBackend {
             .send(PluginCommand::HookCompleted { hook_name });
     }
 
+    pub fn send_compose_lines_completed(&self, batch: fresh_core::api::LinesBatch, success: bool) {
+        let _ = self
+            .command_sender
+            .send(PluginCommand::ComposeLinesCompleted { batch, success });
+    }
+
     /// Resolve a pending async callback with a result (called from Rust when async op completes)
     ///
     /// Takes a JSON string which is parsed and converted to a proper JS value.
@@ -10924,6 +10992,123 @@ mod tests {
         let services = Arc::new(TestServiceBridge::new());
         let backend = QuickJsBackend::with_state(state_snapshot, tx, services).unwrap();
         (backend, rx)
+    }
+
+    #[tokio::test]
+    async fn compose_batches_scope_source_commands_and_reset_the_hook_context() {
+        let (mut backend, rx) = create_test_backend();
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            editor.on("lines_changed", (data) => {
+                editor.addConceal(3, "md", 0, 2, null);
+                editor.clearConcealsInRange(3, 4, 6);
+                editor.addConceal(4, "other", 0, 2, null);
+            });
+        "#,
+                "markdown_compose.js",
+            )
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        let batch = fresh_core::api::LinesBatch {
+            window_id: 11,
+            buffer_id: BufferId(3),
+            buffer_epoch: 17,
+            revision: 7,
+            id: 19,
+        };
+        let outcome = backend
+            .emit_tracked(
+                "lines_changed",
+                &serde_json::json!({
+                    "buffer_id":3,"epoch":7,"is_composing_in_any_split":true,"lines":[]
+                }),
+                None,
+                Some(&batch),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, Some(true));
+        for _ in 0..2 {
+            match rx.try_recv().unwrap() {
+                PluginCommand::ScopedCompose { batch, command } => {
+                    assert_eq!(
+                        (batch.window_id, batch.buffer_epoch, batch.revision),
+                        (11, 17, 7)
+                    );
+                    match *command {
+                        PluginCommand::AddConceal { epoch, .. }
+                        | PluginCommand::ClearConcealsInRange { epoch, .. } => {
+                            assert_eq!(epoch, Some(7))
+                        }
+                        command => panic!("unexpected command {command:?}"),
+                    }
+                }
+                command => panic!("unscoped source command {command:?}"),
+            }
+        }
+        assert!(
+            matches!(
+                rx.try_recv().unwrap(),
+                PluginCommand::AddConceal {
+                    buffer_id: BufferId(4),
+                    epoch: None,
+                    ..
+                }
+            ),
+            "the hook's scope cannot be stamped onto another buffer"
+        );
+        backend.send_compose_lines_completed(batch, true);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginCommand::ComposeLinesCompleted { success: true, .. }
+        ));
+        backend
+            .execute_js(
+                "getEditor().addConceal(3, 'md', 6, 8, null);",
+                "markdown_compose.js",
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                rx.try_recv().unwrap(),
+                PluginCommand::AddConceal { epoch: None, .. }
+            ),
+            "ordinary plugin calls cannot inherit a finished hook's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_completion_refuses_exceptions_and_async_handlers() {
+        for handler in [
+            "() => { throw new Error('test formatter failure'); }",
+            "async () => {}",
+        ] {
+            let (mut backend, rx) = create_test_backend();
+            backend
+                .execute_js(
+                    &format!("getEditor().on('lines_changed', {handler});"),
+                    "markdown_compose.js",
+                )
+                .unwrap();
+            while rx.try_recv().is_ok() {}
+            assert_eq!(backend.emit_tracked("lines_changed", &serde_json::json!({"buffer_id":3,"epoch":7,"is_composing_in_any_split":true}), None, None).await.unwrap(), Some(false));
+        }
+        let (mut backend, _) = create_test_backend();
+        assert_eq!(
+            backend
+                .emit_tracked(
+                    "lines_changed",
+                    &serde_json::json!({"buffer_id":3}),
+                    None,
+                    None
+                )
+                .await
+                .unwrap(),
+            None,
+            "a missing formatter cannot acknowledge successful formatting"
+        );
     }
 
     struct TestServiceBridge {

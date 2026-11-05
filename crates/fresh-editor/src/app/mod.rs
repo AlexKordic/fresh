@@ -18,6 +18,8 @@ pub(crate) mod click_geometry;
 mod click_handlers;
 mod clipboard;
 mod composite_buffer_actions;
+#[cfg(feature = "web")]
+pub(crate) mod compose_readiness;
 pub mod confirm_dialog;
 mod dabbrev_actions;
 mod diagnostic_jumps;

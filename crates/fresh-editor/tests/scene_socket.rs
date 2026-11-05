@@ -46,13 +46,14 @@ struct App {
     stream: UnixStream,
     window: u64,
     panes: Vec<pb::Pane>,
+    sequence: u64,
 }
 
 impl App {
     fn connect(path: &std::path::Path) -> Self {
         let stream = UnixStream::connect(path).expect("connect");
         stream.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        Self { stream, window:0, panes:Vec::new() }
+        Self { stream, window:0, panes:Vec::new(), sequence:0 }
     }
 
     fn send(&mut self, kind: u64, message: impl Message) {
@@ -86,10 +87,16 @@ impl App {
     }
 
     fn observe(&mut self,frame:&pb::Frame) {
+        self.sequence = frame.seq;
         if let Some(window)=frame.window_id {self.window=window;}
         if let Some(count)=frame.pane_len {self.panes.resize(count as usize,pb::Pane::default());}
         for update in &frame.panes {
             if let Some(pane)=&update.pane {
+                if let Some(compose) = pane.compose.as_ref().filter(|c|c.ready == Some(false)) {
+                    assert!(compose.segments.iter().all(|s|s.kind == 0), "pending formatting cannot expose partial conceal/replacement maps");
+                    assert!(compose.images.iter().all(|image|!image.rendered));
+                    assert_eq!(compose.source_end-compose.source_start, compose.text.len() as u64);
+                }
                 let index=update.index as usize;
                 if self.panes.len()<=index {self.panes.resize(index+1,pb::Pane::default());}
                 self.panes[index]=pane.clone();
@@ -102,11 +109,28 @@ impl App {
 fn pass(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor) {
     let (mut cols, mut rows) = (COLS, ROWS);
     let poll = bridge.poll(ed, &mut cols, &mut rows);
-    if poll.mutated || poll.frame_owed || poll.resize_dirty {
-        apply_step(ed, &json!({}));
+    let changed = fresh::app::editor_tick(ed, || Ok(())).unwrap();
+    if poll.mutated || poll.frame_owed || poll.resize_dirty || changed {
         bridge.push_scene(ed, COLS, ROWS);
     }
     bridge.maintain();
+}
+
+fn ready_scene(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor, app: &mut App) -> pb::Frame {
+    let hello = pb::ServerHello::decode(&app.receive().expect("rich hello").1[..]).unwrap().scene.unwrap();
+    app.send(26, pb::Applied { seq: hello.seq });
+    app.stream.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.panes.iter().any(|pane| pane.compose.as_ref().is_some_and(|c|c.ready == Some(false))) {
+        assert!(std::time::Instant::now() < deadline, "Compose formatting did not complete");
+        pass(bridge, ed);
+        if let Some(frame) = app.frame() { app.send(26, pb::Applied { seq: frame.seq }); }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    app.stream.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    assert!(app.panes.iter().filter_map(|pane|pane.compose.as_ref()).all(|c|c.error.is_empty()), "formatting must succeed, not fall back after a timeout");
+    pb::Frame { seq: app.sequence, window_id: Some(app.window), pane_len: Some(app.panes.len() as u32),
+        panes: app.panes.iter().enumerate().map(|(index,pane)|pb::PaneUpdate {index:index as u32,pane:Some(pane.clone())}).collect(), ..Default::default() }
 }
 
 /// Passes until the client's bytes have been read.
@@ -235,7 +259,40 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_input_intents_rebase_and_cancel_when_the_view_changes(&root, &work);
     rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(&root,&work);
     rich_image_objects_select_edit_move_delete_and_undo_as_source(&root,&work);
+    scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
+}
+
+fn scoped_compose_commands_follow_their_window_and_buffer_lifetime(root: &std::path::Path) {
+    use fresh_core::api::{LinesBatch, PluginCommand};
+    let mut editor = build_editor(COLS, ROWS, &[], false).unwrap();
+    apply_step(&mut editor, &json!({"type":"**alpha**\n"}));
+    let original = editor.active_session_id();
+    let id = editor.active_window().active_buffer();
+    let state = editor.active_window().active_state();
+    let batch = LinesBatch { window_id: original.0, buffer_id: id, buffer_epoch: state.marker_list.instance_id(), revision: state.buffer.version(), id: 1 };
+    let other_root = root.join("other-window");
+    std::fs::create_dir_all(&other_root).unwrap();
+    let other = editor.create_window_at(other_root, "Other".into());
+    editor.set_active_window(other);
+    apply_step(&mut editor, &json!({"type":"other\n"}));
+    let command = || PluginCommand::AddConceal { buffer_id: id,
+        namespace: fresh_core::overlay::OverlayNamespace::from_string("scope-test".into()), start: 0, end: 2,
+        replacement: None, epoch: Some(batch.revision), activation: None };
+    editor.handle_plugin_command(PluginCommand::ScopedCompose { batch: batch.clone(), command: Box::new(command()) }).unwrap();
+    assert_eq!(editor.active_session_id(), other, "applying a background decoration cannot steal workspace focus");
+    let shown = |editor: &fresh::app::Editor, source: &str| {
+        let state = editor.active_window().active_state();
+        state.conceals.project_text(source, 0, &state.marker_list, &[]).unwrap().text
+    };
+    assert_eq!(shown(&editor, "other\n"), "other\n");
+    editor.set_active_window(original);
+    assert_eq!(shown(&editor, "**alpha**\n"), "alpha**\n", "the decoration reaches its original window");
+    let mut replaced = batch.clone(); replaced.buffer_epoch += 1;
+    editor.handle_plugin_command(PluginCommand::ScopedCompose { batch: replaced,
+        command: Box::new(PluginCommand::ClearConcealNamespace { buffer_id: id,
+            namespace: fresh_core::overlay::OverlayNamespace::from_string("scope-test".into()) }) }).unwrap();
+    assert_eq!(shown(&editor, "**alpha**\n"), "alpha**\n", "a different buffer lifetime cannot clear current source decorations");
 }
 
 fn rich_image_objects_select_edit_move_delete_and_undo_as_source(root:&std::path::Path,work:&std::path::Path) {
@@ -248,7 +305,7 @@ fn rich_image_objects_select_edit_move_delete_and_undo_as_source(root:&std::path
     let path=root.join("image-edit.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
     let mut app=App::connect(&path);
     app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
-    let hello=pb::ServerHello::decode(&app.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let hello = ready_scene(&mut bridge, &mut ed, &mut app);
     let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
     let mut scope=pane_scope(hello.window_id.unwrap(),pane);
     let compose=pane.compose.as_ref().unwrap();
@@ -307,7 +364,7 @@ fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path
     let mut app=App::connect(&path);
     app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()});
     settle_bridge(&mut bridge,&mut ed);
-    let hello=pb::ServerHello::decode(&app.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let hello = ready_scene(&mut bridge, &mut ed, &mut app);
     let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
     let mut scope=pane_scope(hello.window_id.unwrap(),pane);
     let compose=pane.compose.as_ref().unwrap(); let image=&compose.images[0];
@@ -370,8 +427,8 @@ fn rich_source_regions_belong_to_each_client_and_expire_after_edits(root: &std::
     let mut a=App::connect(&path); let mut b=App::connect(&path);
     for app in [&mut a,&mut b] { app.send(16,pb::ClientHello { version:1,rich_compose:true,..Default::default() }); }
     settle_bridge(&mut bridge,&mut ed);
-    let hello_a=pb::ServerHello::decode(&a.receive().unwrap().1[..]).unwrap().scene.unwrap();
-    let hello_b=pb::ServerHello::decode(&b.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let hello_a = ready_scene(&mut bridge, &mut ed, &mut a);
+    let hello_b = ready_scene(&mut bridge, &mut ed, &mut b);
     let first=|frame:&pb::Frame| frame.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap().clone();
     let mut scope_a=pane_scope(hello_a.window_id.unwrap(),&first(&hello_a));
     let mut scope_b=pane_scope(hello_b.window_id.unwrap(),&first(&hello_b));
@@ -455,7 +512,7 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
         app.send(16, pb::ClientHello { version: 1, rich_compose: true, ..Default::default() });
     }
     settle_bridge(&mut bridge, &mut ed);
-    a.receive().unwrap(); b.receive().unwrap();
+    ready_scene(&mut bridge, &mut ed, &mut a); ready_scene(&mut bridge, &mut ed, &mut b);
     let active = |app: &App| app.panes.iter().find(|pane| pane.compose.is_some()).unwrap().clone();
     let initial_a = active(&a);
     let scope_a = pane_scope(a.window, &initial_a);
@@ -588,7 +645,7 @@ fn rich_input_intents_rebase_and_cancel_when_the_view_changes(root: &std::path::
     let mut app = App::connect(&path);
     app.send(16, pb::ClientHello { version: 1, rich_compose: true, ..Default::default() });
     settle_bridge(&mut bridge, &mut ed);
-    app.receive().unwrap();
+    ready_scene(&mut bridge, &mut ed, &mut app);
     let initial = app.panes.iter().find(|pane| pane.compose.is_some()).unwrap().clone();
     let mut scope = pane_scope(app.window, &initial);
     let captured_revision = scope.buffer_revision;
@@ -703,7 +760,7 @@ fn rich_navigation_uses_measured_lines_after_resolving_a_key_chord(root: &std::p
     let mut app = App::connect(&path);
     app.send(16, pb::ClientHello { version: 1, rich_compose: true, ..Default::default() });
     settle_bridge(&mut bridge, &mut ed);
-    let scene = pb::ServerHello::decode(&app.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let scene = ready_scene(&mut bridge, &mut ed, &mut app);
     let pane = scene.panes.iter().find_map(|p| p.pane.as_ref().filter(|p| p.compose.is_some())).unwrap();
     let mut scope = pane_scope(scene.window_id.unwrap(), pane);
     let stop = |source: usize, x: f64, affinity: u32| pb::ComposeStop { source: source as u64, x, affinity };
@@ -823,7 +880,7 @@ fn rich_navigation_uses_measured_lines_after_resolving_a_key_chord(root: &std::p
     let mut malformed = App::connect(&path);
     malformed.send(16,pb::ClientHello { version:1,rich_compose:true,..Default::default() });
     settle_bridge(&mut bridge,&mut ed);
-    let fresh = pb::ServerHello::decode(&malformed.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let fresh = ready_scene(&mut bridge, &mut ed, &mut malformed);
     let pane = fresh.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
     malformed.send(27,pb::ComposeInput { id:1,scope:Some(pane_scope(fresh.window_id.unwrap(),pane)),kind:17,
         payload:vec![0x0a,0x01,0xff],..Default::default() });
@@ -855,7 +912,7 @@ fn rich_compose_edits_keep_source_and_retry_obsolete_input(root: &std::path::Pat
     settle_bridge(&mut bridge, &mut ed);
     let grid_scene = pb::ServerHello::decode(&grid.receive().unwrap().1[..]).unwrap().scene.unwrap();
     assert!(grid_scene.panes.iter().all(|p| p.pane.as_ref().unwrap().compose.is_none()));
-    let scene = pb::ServerHello::decode(&rich.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let scene = ready_scene(&mut bridge, &mut ed, &mut rich);
     let pane = scene.panes.iter().find_map(|p| p.pane.as_ref().filter(|p| p.compose.is_some())).unwrap();
     let compose = pane.compose.as_ref().unwrap();
     assert!(compose.spans.iter().any(|s| s.role == 1), "a semantic heading");
@@ -868,29 +925,29 @@ fn rich_compose_edits_keep_source_and_retry_obsolete_input(root: &std::path::Pat
             selection_revision: c.selection_revision }
     };
     let initial = scope(pane);
+    let mut response_scope = initial.clone();
     let at = original.find("café").unwrap();
     rich.send(27, pb::ComposeInput { id: 1, scope: Some(initial.clone()), position: Some(at as u64), ..Default::default() });
     settle_bridge(&mut bridge, &mut ed);
-    let placed = rich.frame().unwrap();
+    let placed = rich_reply(&mut bridge, &mut ed, &mut rich, &mut response_scope, 1);
     assert!(placed.input_reply.unwrap().accepted);
     assert_eq!(ed.active_window().active_cursors().primary().position, at);
     rich.send(26, pb::Applied { seq: placed.seq });
-    let before_edit = scope(placed.panes.iter().find_map(|p| p.pane.as_ref().filter(|p| p.compose.is_some())).unwrap());
+    let before_edit = scope(rich.panes.iter().find(|p|p.compose.is_some()).unwrap());
     let key = pb::ComposeInput { id: 2, scope: Some(before_edit.clone()), kind: 17,
         payload: pb::Key { key: "X".into(), ..Default::default() }.encode_to_vec(), ..Default::default() };
     let mut obsolete_cursor = key.clone();
     obsolete_cursor.scope = Some(initial);
     rich.send(27, obsolete_cursor);
     settle_bridge(&mut bridge, &mut ed);
-    let stale_cursor = rich.frame().unwrap();
+    let stale_cursor = rich_reply(&mut bridge, &mut ed, &mut rich, &mut response_scope, 2);
     assert!(!stale_cursor.input_reply.unwrap().accepted, "cursor-only changes invalidate pending input too");
     rich.send(26, pb::Applied { seq: stale_cursor.seq });
     rich.send(27, key.clone());
     settle_bridge(&mut bridge, &mut ed);
-    let typed = rich.frame().unwrap();
+    let typed = rich_reply(&mut bridge, &mut ed, &mut rich, &mut response_scope, 2);
     assert!(typed.input_reply.unwrap().accepted);
     rich.send(26, pb::Applied { seq: typed.seq });
-    let current = scope(typed.panes.iter().find_map(|p| p.pane.as_ref().filter(|p| p.compose.is_some())).unwrap());
     let source = |ed: &fresh::app::Editor| {
         let state = ed.active_window().active_state();
         String::from_utf8(state.buffer.slice_bytes(0..state.buffer.len())).unwrap()
@@ -899,22 +956,19 @@ fn rich_compose_edits_keep_source_and_retry_obsolete_input(root: &std::path::Pat
     // Replaying an accepted request cannot type the character twice.
     rich.send(27, key);
     settle_bridge(&mut bridge, &mut ed);
-    let duplicate = rich.frame().unwrap();
+    let duplicate = rich_reply(&mut bridge, &mut ed, &mut rich, &mut response_scope, 2);
     assert!(duplicate.input_reply.unwrap().accepted);
     assert_eq!(source(&ed), original.replacen("café", "Xcafé", 1));
     rich.send(26, pb::Applied { seq: duplicate.seq });
-    let mut undo = pb::ComposeInput { id: 3, scope: Some(before_edit), kind: 21,
+    let undo = pb::ComposeInput { id: 3, scope: Some(before_edit), kind: 21,
         payload: pb::Action { name: "undo".into(), args_json: String::new() }.encode_to_vec(), ..Default::default() };
     rich.send(27, undo.clone());
     settle_bridge(&mut bridge, &mut ed);
-    let stale = rich.frame().unwrap();
+    let stale = rich_reply(&mut bridge, &mut ed, &mut rich, &mut response_scope, 3);
     assert!(!stale.input_reply.unwrap().accepted, "obsolete source geometry is refused");
     assert_eq!(source(&ed), original.replacen("café", "Xcafé", 1));
     rich.send(26, pb::Applied { seq: stale.seq });
-    undo.scope = Some(current);
-    rich.send(27, undo);
-    settle_bridge(&mut bridge, &mut ed);
-    assert!(rich.frame().unwrap().input_reply.unwrap().accepted);
+    assert!(rich_accepted(&mut bridge, &mut ed, &mut rich, &mut response_scope, undo).input_reply.unwrap().accepted);
     assert_eq!(source(&ed), original, "Fresh's normal undo restores the exact CRLF source");
     assert_eq!(std::fs::read(&file).unwrap(), original.as_bytes(), "presentation never saved or rewrote the source");
 }

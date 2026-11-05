@@ -561,6 +561,10 @@ pub struct ComposePane {
     pub asset_document: u64,
     #[prost(message, optional, tag = "17")]
     pub viewport: ::core::option::Option<ComposeViewport>,
+    #[prost(bool, optional, tag = "18")]
+    pub ready: ::core::option::Option<bool>,
+    #[prost(string, tag = "19")]
+    pub error: ::prost::alloc::string::String,
 }
 /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
