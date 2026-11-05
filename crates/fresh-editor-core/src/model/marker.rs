@@ -11,6 +11,9 @@
 /// The Vec-based implementation is kept for compatibility and simplicity in
 /// situations where marker count is low (<100).
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_MARKER_LIST: AtomicUsize = AtomicUsize::new(1);
 
 use crate::model::marker_tree::IntervalTree;
 
@@ -42,6 +45,9 @@ pub enum MarkerEntry {
 /// Point markers (single positions) are represented as zero-length intervals.
 #[derive(Debug)]
 pub struct MarkerList {
+    /// Owners outside EditorState must not use an id after that state has
+    /// been replaced: a new tree can allocate the same numeric MarkerId.
+    instance: usize,
     /// Internal interval tree for O(log n) operations
     tree: IntervalTree,
 
@@ -58,9 +64,14 @@ impl MarkerList {
     /// Create a new empty marker list
     pub fn new() -> Self {
         Self {
+            instance: NEXT_MARKER_LIST.fetch_add(1, Ordering::Relaxed),
             tree: IntervalTree::new(),
             _affinity_map: HashMap::new(),
         }
+    }
+
+    pub fn instance_id(&self) -> usize {
+        self.instance
     }
 
     /// Create a new **right-gravity** point marker at the given position:
@@ -383,6 +394,13 @@ mod tests {
         let list = MarkerList::new();
         assert_eq!(list.marker_count(), 0);
         list.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn marker_owners_have_distinct_lifetimes() {
+        let a = MarkerList::new();
+        let b = MarkerList::new();
+        assert_ne!(a.instance_id(), b.instance_id());
     }
 
     #[test]

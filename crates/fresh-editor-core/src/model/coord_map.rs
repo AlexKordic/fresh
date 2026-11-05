@@ -63,6 +63,7 @@ pub struct CoordMap {
     /// `from_version < min_mappable` returns `None`. Raised both by capacity
     /// eviction (to the evicted delta's version) and by barriers.
     min_mappable: u64,
+    last_barrier: u64,
     cap: usize,
 }
 
@@ -77,6 +78,7 @@ impl CoordMap {
         Self {
             deltas: VecDeque::new(),
             min_mappable: 0,
+            last_barrier: 0,
             cap: cap.max(1),
         }
     }
@@ -122,6 +124,13 @@ impl CoordMap {
         // the floor becomes V: from_version >= V is still fine (it doesn't
         // include the V edit), from_version < V is not.
         self.min_mappable = self.min_mappable.max(version);
+        self.last_barrier = self.last_barrier.max(version);
+    }
+
+    /// Existing markers survive ordinary delta-ring eviction. They require a
+    /// new anchor only when content changed without marker adjustment.
+    pub fn crosses_barrier(&self, from_version: u64) -> bool {
+        from_version < self.last_barrier
     }
 
     fn push(&mut self, delta: EditDelta) {
@@ -144,6 +153,13 @@ impl CoordMap {
     /// or barriered) — the caller should force a full refresh rather than act
     /// on a guessed position.
     pub fn map(&self, coord: usize, from_version: u64) -> Option<usize> {
+        self.map_with_gravity(coord, from_version, false)
+    }
+
+    /// Map with the same insertion gravity as a source marker. Viewport
+    /// anchors use left gravity so typing at the first visible byte stays in
+    /// view, while ordinary plugin coordinates retain right gravity.
+    pub fn map_with_gravity(&self, coord: usize, from_version: u64, left: bool) -> Option<usize> {
         if from_version < self.min_mappable {
             return None;
         }
@@ -152,7 +168,7 @@ impl CoordMap {
             if d.version <= from_version {
                 continue;
             }
-            c = apply_delta(c, d.pos, d.removed, d.inserted);
+            c = apply_delta(c, d.pos, d.removed, d.inserted, left);
         }
         Some(c)
     }
@@ -176,7 +192,7 @@ impl CoordMap {
 /// coordinate strictly inside the replaced span would be mapped to a different
 /// byte than its own auto-shifting marker, breaking the "exact same shift math"
 /// guarantee for stale coordinates landing inside a bulk replacement.
-fn apply_delta(coord: usize, pos: usize, removed: usize, inserted: usize) -> usize {
+fn apply_delta(coord: usize, pos: usize, removed: usize, inserted: usize, left: bool) -> usize {
     let (removed, inserted) = if removed > 0 && inserted > 0 {
         if inserted >= removed {
             (0, inserted - removed)
@@ -195,7 +211,7 @@ fn apply_delta(coord: usize, pos: usize, removed: usize, inserted: usize) -> usi
             c = pos;
         }
     }
-    if inserted > 0 && c >= pos {
+    if inserted > 0 && (c > pos || c == pos && !left) {
         c += inserted;
     }
     c
@@ -204,6 +220,47 @@ fn apply_delta(coord: usize, pos: usize, removed: usize, inserted: usize) -> usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn left_and_right_gravity_match_owned_markers_through_edits() {
+        use crate::model::marker::MarkerList;
+        let mut map = CoordMap::new(32);
+        let mut markers = MarkerList::new();
+        markers.adjust_for_insert(0, 20);
+        let left = markers.create_left_gravity(5);
+        let right = markers.create(5);
+        for (version, (position, removed, inserted)) in [(5, 0, 3), (2, 2, 0), (0, 0, 2), (4, 3, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            if removed > 0 {
+                markers.adjust_for_delete(position, removed);
+            }
+            if inserted > 0 {
+                markers.adjust_for_insert(position, inserted);
+            }
+            map.record_replace(version as u64 + 1, position, removed, inserted);
+            assert_eq!(map.map_with_gravity(5, 0, true), markers.get_position(left));
+            assert_eq!(map.map(5, 0), markers.get_position(right));
+        }
+    }
+
+    #[test]
+    fn marker_barriers_are_distinct_from_delta_history_eviction() {
+        let mut map = CoordMap::new(1);
+        map.record_insert(1, 0, 1);
+        map.record_insert(2, 0, 1);
+        assert!(map.map(0, 0).is_none());
+        assert!(
+            !map.crosses_barrier(0),
+            "existing markers still track ordinary edits"
+        );
+        map.record_barrier(3);
+        map.record_insert(4, 0, 1);
+        map.record_insert(5, 0, 1);
+        assert!(map.crosses_barrier(2));
+        assert!(!map.crosses_barrier(3));
+    }
 
     #[test]
     fn identity_when_no_edits() {
