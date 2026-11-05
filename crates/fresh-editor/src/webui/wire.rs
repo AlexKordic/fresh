@@ -40,6 +40,7 @@ pub(crate) mod kind {
     pub const CONFIGURE: u64 = 25;
     pub const APPLIED: u64 = 26;
     pub const COMPOSE_INPUT: u64 = 27;
+    pub const COMPOSE_ASSET: u64 = 28;
 }
 
 /// The protocol version a client's hello must name.
@@ -527,6 +528,7 @@ macro_rules! proto {
     (@len $t:literal, $v:expr, bool) => { field::uint_len($t, Uint::uint(&$v)) };
     (@len $t:literal, $v:expr, double) => { field::double_len($t, Double::double(&$v)) };
     (@len $t:literal, $v:expr, string) => { field::text_len($t, Text::text(&$v)) };
+    (@len $t:literal, $v:expr, bytes) => { field::bytes_len($t, $v.len()) };
     (@len $t:literal, $v:expr, json) => { field::json_len($t, &$v) };
     (@len $t:literal, $v:expr, optional double) => { field::opt_double_len($t, $v.as_ref().map(|v| Double::double(v))) };
     (@len $t:literal, $v:expr, optional string) => { field::opt_text_len($t, $v.as_ref().map(|v| Text::text(v))) };
@@ -543,6 +545,7 @@ macro_rules! proto {
     (@put $b:ident, $t:literal, $v:expr, bool) => { field::uint($b, $t, Uint::uint(&$v)) };
     (@put $b:ident, $t:literal, $v:expr, double) => { field::double($b, $t, Double::double(&$v)) };
     (@put $b:ident, $t:literal, $v:expr, string) => { field::text($b, $t, Text::text(&$v)) };
+    (@put $b:ident, $t:literal, $v:expr, bytes) => { field::raw_bytes($b, $t, &$v) };
     (@put $b:ident, $t:literal, $v:expr, json) => { field::json($b, $t, &$v) };
     (@put $b:ident, $t:literal, $v:expr, optional double) => { field::opt_double($b, $t, $v.as_ref().map(|v| Double::double(v))) };
     (@put $b:ident, $t:literal, $v:expr, optional string) => { field::opt_text($b, $t, $v.as_ref().map(|v| Text::text(v))) };
@@ -755,6 +758,7 @@ impl<'a> Iterator for Reader<'a> {
 
 use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
 use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection};
+use super::compose_assets::Chunk;
 use super::compose::InputReply;
 use super::compose_navigation::CaretState;
 use crate::view::scene::{
@@ -784,6 +788,11 @@ pub(crate) struct Timing {
 }
 
 proto! {
+    /// A bounded binary image payload, multiplexed with normal input/scene frames.
+    Chunk as ComposeAssetChunk {
+        1 id: uint64, 2 offset: uint64, 3 total: uint64, 4 data: bytes,
+        5 error: string, 6 done: bool,
+    }
     /// A rectangle of cells.
     RectView as Rect { 1 x: uint32, 2 y: uint32, 3 w: uint32, 4 h: uint32 }
     /// A top-level menu and its items.
@@ -907,7 +916,7 @@ proto! {
         6 segments: repeated ComposeSegment, 7 spans: repeated ComposeSpan,
         8 images: repeated ComposeImage, 9 cursors: repeated ComposeSelection,
         10 focused: bool, 11 top_byte: uint64, 12 document_len: uint64,
-        13 selection_revision: uint64, 14 keyboard: bool,
+        13 selection_revision: uint64, 14 keyboard: bool, 15 asset_authority: uint64,
     }
     /// kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
     ComposeSegment {
@@ -1155,6 +1164,7 @@ message Frame {
   SettingsUpdate settings = 22;
   Timing timing = 23;
   InputReply input_reply = 24;
+  repeated ComposeAssetChunk compose_assets = 25;
 }
 // Type 1: the answer to a ClientHello, with the whole scene.
 message ServerHello {
@@ -1196,6 +1206,16 @@ message ComposeInput {
   uint64 layout_id = 9;
   uint32 affinity = 10;
   optional uint64 region = 11;
+}
+// Type 28: read the image annotation identified by this source range through
+// its document authority. No client-supplied path. Cancellation needs only id.
+message ComposeAssetRequest {
+  uint64 id = 1;
+  ComposeScope scope = 2;
+  uint64 start = 3;
+  uint64 end = 4;
+  bool cancel = 5;
+  uint64 authority = 6;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.

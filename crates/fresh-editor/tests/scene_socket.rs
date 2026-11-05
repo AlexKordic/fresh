@@ -212,7 +212,76 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_compose_edits_keep_source_and_retry_obsolete_input(&root, &work);
     rich_navigation_uses_measured_lines_after_resolving_a_key_chord(&root, &work);
     rich_source_regions_belong_to_each_client_and_expire_after_edits(&root,&work);
+    rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(&root,&work);
     drop(std::fs::remove_dir_all(&root));
+}
+
+fn rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(root:&std::path::Path,work:&std::path::Path) {
+    // The transport treats compressed bytes as opaque; Image I/O validates and
+    // decodes the image in the native client. Include every byte value here so
+    // a text conversion cannot accidentally pass a round-trip check.
+    let mut bytes=b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend((0..400_017).map(|i|i as u8));
+    std::fs::write(work.join("asset x.png"),&bytes).unwrap();
+    let file=work.join("assets.md");
+    std::fs::write(&file,"# Assets\n\n![pixel](asset%20x.png)\n\nBody\n").unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file],true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed,&json!({})); }
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("assets.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()});
+    settle_bridge(&mut bridge,&mut ed);
+    let hello=pb::ServerHello::decode(&app.receive().unwrap().1[..]).unwrap().scene.unwrap();
+    let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let mut scope=pane_scope(hello.window_id.unwrap(),pane);
+    let compose=pane.compose.as_ref().unwrap(); let image=&compose.images[0];
+    let request=pb::ComposeAssetRequest {id:1,scope:Some(scope.clone()),start:image.start,end:image.end,
+        authority:compose.asset_authority,..Default::default()};
+    assert_ne!(request.authority,0);
+    app.send(28,request.clone());
+    let mut received=Vec::new(); let mut done=false; let mut moved=false;
+    for _ in 0..30 {
+        settle_bridge(&mut bridge,&mut ed);
+        let Some(frame)=app.frame() else { continue; };
+        for update in &frame.panes {
+            if let Some(pane)=&update.pane { if pane.compose.is_some() { scope=pane_scope(scope.window_id,pane); } }
+        }
+        app.send(26,pb::Applied {seq:frame.seq});
+        for chunk in frame.compose_assets {
+            assert_eq!(chunk.id,1); assert!(chunk.error.is_empty(),"{}",chunk.error);
+            assert_eq!(chunk.offset,received.len() as u64); assert_eq!(chunk.total,bytes.len() as u64);
+            assert!(chunk.data.len()<=128<<10);
+            received.extend(chunk.data); done=chunk.done;
+            if !moved {
+                app.send(17,pb::Key {key:"ArrowRight".into(),..Default::default()});
+                moved=true;
+            }
+        }
+        if done { break; }
+    }
+    assert!(done); assert_eq!(received,bytes);
+    assert_eq!(ed.active_window().active_cursors().primary().position,1,"normal input ran between asset chunks");
+    // Source edits between submission and delivery cancel the old request;
+    // the new frame must terminate its stream with an error, not old bytes.
+    let mut obsolete=request.clone(); obsolete.id=2; obsolete.scope=Some(scope.clone());
+    app.send(28,obsolete);
+    app.send(17,pb::Key {key:"X".into(),..Default::default()});
+    let mut rejected=false;
+    for _ in 0..10 {
+        settle_bridge(&mut bridge,&mut ed);
+        let Some(frame)=app.frame() else { continue; };
+        app.send(26,pb::Applied {seq:frame.seq});
+        for chunk in frame.compose_assets {
+            if chunk.id==2 {
+                assert!(chunk.done); assert!(chunk.data.is_empty());
+                assert!(chunk.error.contains("changed"),"{}",chunk.error);
+                rejected=true;
+            }
+        }
+        if rejected { break; }
+    }
+    assert!(rejected,"obsolete image load received a terminating response");
 }
 
 fn rich_source_regions_belong_to_each_client_and_expire_after_edits(root: &std::path::Path, work: &std::path::Path) {

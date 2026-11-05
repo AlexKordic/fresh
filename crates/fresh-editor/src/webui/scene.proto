@@ -8,6 +8,16 @@ package fresh.scene.v1;
 // and Key would clash with names the app already has.
 option swift_prefix = "Wire";
 
+// A bounded binary image payload, multiplexed with normal input/scene frames.
+message ComposeAssetChunk {
+  uint64 id = 1;
+  uint64 offset = 2;
+  uint64 total = 3;
+  bytes data = 4;
+  string error = 5;
+  bool done = 6;
+}
+
 // A rectangle of cells.
 message Rect {
   uint32 x = 1;
@@ -316,6 +326,7 @@ message ComposePane {
   uint64 document_len = 12;
   uint64 selection_revision = 13;
   bool keyboard = 14;
+  uint64 asset_authority = 15;
 }
 
 // kind: 0 copied text, 1 hidden source, 2 atomic replacement, 3 insertion.
@@ -633,6 +644,7 @@ message Frame {
   SettingsUpdate settings = 22;
   Timing timing = 23;
   InputReply input_reply = 24;
+  repeated ComposeAssetChunk compose_assets = 25;
 }
 // Type 1: the answer to a ClientHello, with the whole scene.
 message ServerHello {
@@ -674,6 +686,16 @@ message ComposeInput {
   uint64 layout_id = 9;
   uint32 affinity = 10;
   optional uint64 region = 11;
+}
+// Type 28: read the image annotation identified by this source range through
+// its document authority. No client-supplied path. Cancellation needs only id.
+message ComposeAssetRequest {
+  uint64 id = 1;
+  ComposeScope scope = 2;
+  uint64 start = 3;
+  uint64 end = 4;
+  bool cancel = 5;
+  uint64 authority = 6;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.

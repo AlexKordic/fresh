@@ -20,6 +20,7 @@ use super::{
 use crate::app::Editor;
 use anyhow::Result;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -66,12 +67,15 @@ pub struct SceneBridge {
     /// The last push's scene, encoded once for every client.
     encoded: EncodedScene,
     compose: super::compose::ComposeCache,
+    assets: super::compose_assets::Service,
+    next_client: u64,
     /// Allocations of the last push, for the next frame's telemetry.
     last_push_allocs: Option<(u64, u64)>,
 }
 
 /// One connected app.
 struct SceneClient {
+    id: u64,
     stream: UnixStream,
     /// Bytes read and not yet a whole message.
     inbuf: Vec<u8>,
@@ -88,6 +92,10 @@ struct SceneClient {
     input_reply: Option<super::compose::InputReply>,
     navigation: super::compose_navigation::Session,
     rich_encoded: EncodedScene,
+    asset_transfers: VecDeque<super::compose_assets::Transfer>,
+    asset_finished: Vec<u64>,
+    last_asset: u64,
+    asset_targets: HashMap<u64, super::compose_assets::Target>,
     /// What it has of the scene.
     scene: ClientScene,
     /// The last frame sent, and the last it applied.
@@ -125,6 +133,8 @@ impl SceneBridge {
             grid: GridHasher::default(),
             encoded: EncodedScene::default(),
             compose: Default::default(),
+            assets: Default::default(),
+            next_client: 1,
             last_push_allocs: None,
         })
     }
@@ -156,7 +166,7 @@ impl SceneBridge {
         let had_clients = !self.clients.is_empty();
         let mut i = 0;
         while i < self.clients.len() {
-            match self.clients[i].read(editor, &mut out, &mut self.compose) {
+            match self.clients[i].read(editor, &mut out, &mut self.compose, &mut self.assets) {
                 Ok(()) => i += 1,
                 Err(reason) => {
                     eprintln!("[scene] client dropped: {reason}");
@@ -166,6 +176,27 @@ impl SceneBridge {
                 }
             }
         }
+        let live: HashSet<_> = self.clients.iter().map(|client| client.id).collect();
+        self.assets.retain_clients(&live);
+        for client in &mut self.clients {
+            for id in client.asset_finished.drain(..) {
+                self.assets.cancel(client.id, id);
+                client.asset_targets.remove(&id);
+            }
+            let obsolete: Vec<_> = client.asset_targets.iter().filter(|(_, target)| !target.current(editor)).map(|(id, _)| *id).collect();
+            for id in obsolete {
+                self.assets.cancel(client.id, id);
+                client.asset_targets.remove(&id);
+                client.asset_transfers.retain(|transfer| transfer.id != id);
+                client.asset_transfers.push_back(super::compose_assets::Transfer::failure(id, "Image source or authority changed; retry the load"));
+            }
+        }
+        for (id, transfer) in self.assets.completed() {
+            if let Some(client) = self.clients.iter_mut().find(|client| client.id == id) {
+                if client.asset_targets.contains_key(&transfer.id) { client.asset_transfers.push_back(transfer); }
+            }
+        }
+        out.frame_owed |= self.clients.iter().any(|client| !client.asset_transfers.is_empty() && client.ready());
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -173,7 +204,8 @@ impl SceneBridge {
                         continue;
                     }
                     tune(&stream);
-                    self.clients.push(SceneClient::new(stream));
+                    self.clients.push(SceneClient::new(self.next_client, stream));
+                    self.next_client += 1;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -333,8 +365,9 @@ fn tune(stream: &UnixStream) {
 }
 
 impl SceneClient {
-    fn new(stream: UnixStream) -> Self {
+    fn new(id: u64, stream: UnixStream) -> Self {
         Self {
+            id,
             stream,
             inbuf: Vec::new(),
             outbuf: Vec::new(),
@@ -347,6 +380,10 @@ impl SceneClient {
             input_reply: None,
             navigation: Default::default(),
             rich_encoded: EncodedScene::default(),
+            asset_transfers: VecDeque::new(),
+            asset_finished: Vec::new(),
+            last_asset: 0,
+            asset_targets: HashMap::new(),
             scene: ClientScene::default(),
             seq: 0,
             applied: 0,
@@ -365,7 +402,8 @@ impl SceneClient {
     }
 
     /// Read what arrived and apply each whole message.
-    fn read(&mut self, editor: &mut Editor, out: &mut BridgePoll, compose: &mut super::compose::ComposeCache) -> Result<(), String> {
+    fn read(&mut self, editor: &mut Editor, out: &mut BridgePoll, compose: &mut super::compose::ComposeCache,
+        assets: &mut super::compose_assets::Service) -> Result<(), String> {
         let mut tmp = [0u8; 16384];
         loop {
             match self.stream.read(&mut tmp) {
@@ -384,7 +422,7 @@ impl SceneClient {
                     let payload = &inbuf[used..][payload];
                     used += n;
                     self.received += 1;
-                    if let Err(e) = self.handle(k, payload, editor, out, compose) {
+                    if let Err(e) = self.handle(k, payload, editor, out, compose, assets) {
                         break Err(e);
                     }
                 }
@@ -404,6 +442,7 @@ impl SceneClient {
         editor: &mut Editor,
         out: &mut BridgePoll,
         compose: &mut super::compose::ComposeCache,
+        assets: &mut super::compose_assets::Service,
     ) -> Result<(), String> {
         let w = |e: WireError| e.to_string();
         if !self.greeted {
@@ -429,6 +468,44 @@ impl SceneClient {
             return Ok(());
         }
         match k {
+            kind::COMPOSE_ASSET => {
+                if !self.rich_compose { return Err("image requests require rich_compose in hello".into()); }
+                let request = super::compose_assets::Request::parse(payload).map_err(w)?;
+                if request.cancel {
+                    assets.cancel(self.id, request.id);
+                    self.asset_transfers.retain(|transfer| transfer.id != request.id);
+                    self.asset_targets.remove(&request.id);
+                    return Ok(());
+                }
+                if request.id <= self.last_asset { return Err("image request ids must increase".into()); }
+                self.last_asset = request.id;
+                if self.asset_transfers.len() >= 16 { return Err("too many pending image replies".into()); }
+                let resolved = (|| {
+                    let scope = request.scope.as_ref().ok_or("image request requires a document")?;
+                    if scope.window != editor.active_window().id.0 || editor.active_window().pane_buffer(scope.leaf) != Some(scope.buffer) {
+                        return Err("image document is no longer displayed".to_string());
+                    }
+                    let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision);
+                    let pane = compose.gather_at(editor, scope.leaf, scope.buffer, region).ok_or("image document is not composing")?;
+                    if pane.buffer_revision != scope.revision { return Err("image source changed; request its current annotation".into()); }
+                    if pane.asset_authority != request.authority { return Err("image filesystem authority changed".into()); }
+                    let image = pane.images.iter().find(|image| image.start == request.start && image.end == request.end)
+                        .ok_or("image annotation is no longer in this source region")?;
+                    let window = editor.active_window();
+                    let document = window.buffer_state(scope.buffer).and_then(|s| s.buffer.file_path()).ok_or("save the document before loading relative images")?;
+                    let path = super::compose_assets::resolve(document, &image.target)?;
+                    Ok((super::compose_assets::Target { scope: *scope, fs: window.authority().filesystem.clone() }, path))
+                })();
+                let result = resolved.and_then(|(target, path)| {
+                    assets.submit(self.id, request.id, target.fs.clone(), path)?;
+                    self.asset_targets.insert(request.id, target);
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    self.asset_transfers.push_back(super::compose_assets::Transfer::failure(request.id, error));
+                    out.frame_owed = true;
+                }
+            }
             kind::COMPOSE_INPUT => {
                 if !self.rich_compose { return Err("rich input requires rich_compose in hello".into()); }
                 let input = super::compose::Input::parse(payload).map_err(w)?;
@@ -465,7 +542,7 @@ impl SceneClient {
                             out.mutated = true;
                             editor.handle_action(action).map_err(|e| e.to_string())
                         } else {
-                            self.handle(input.kind, input.payload, editor, out, compose)
+                            self.handle(input.kind, input.payload, editor, out, compose, assets)
                         };
                         // Always remove the per-input geometry, including a
                         // malformed nested payload or a failed action. An
@@ -623,8 +700,16 @@ impl SceneClient {
         let started = Instant::now();
         self.body.clear();
         let changed = self.scene.write_frame(&mut self.body, self.seq + 1, scene, Some(grid), None);
-        if !changed && self.input_reply.is_none() {
+        if !changed && self.input_reply.is_none() && self.asset_transfers.is_empty() {
             return;
+        }
+        if let Some(transfer) = self.asset_transfers.front_mut() {
+            let chunk = transfer.next();
+            wire::field::msg(&mut self.body, 25, &chunk);
+            if chunk.done {
+                self.asset_finished.push(chunk.id);
+                self.asset_transfers.pop_front();
+            }
         }
         if let Some(reply) = self.input_reply.take() {
             wire::field::msg(&mut self.body, 24, &reply);

@@ -12,6 +12,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::sync::{Arc, Weak};
 
 const SOURCE_LIMIT: usize = 2 << 20;
 const WINDOW_BYTES: usize = 64 << 10;
@@ -52,7 +53,7 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    fn parse(bytes: &[u8]) -> Result<Self, super::wire::WireError> {
+    pub(super) fn parse(bytes: &[u8]) -> Result<Self, super::wire::WireError> {
         let mut scope = Self {
             window: 0,
             leaf: LeafId(fresh_core::SplitId(0)),
@@ -231,6 +232,7 @@ pub(crate) struct ComposePane {
     pub keyboard: bool,
     pub top_byte: usize,
     pub document_len: usize,
+    pub asset_authority: u64,
 }
 
 struct Document {
@@ -317,6 +319,13 @@ impl Document {
 #[derive(Default)]
 pub(crate) struct ComposeCache {
     documents: HashMap<(u64, usize), Document>,
+    authorities: HashMap<
+        u64,
+        (
+            Weak<dyn crate::model::filesystem::FileSystem + Send + Sync>,
+            u64,
+        ),
+    >,
     clock: u64,
 }
 
@@ -356,6 +365,24 @@ impl ComposeCache {
         cursors.sort_by_key(|c| c.id);
         let cursor_positions: Vec<_> = cursors.iter().map(|c| c.position).collect();
         let focused = window.effective_active_split() == leaf;
+        let fs = window.authority().filesystem.clone();
+        self.authorities
+            .retain(|window, _| editor.windows.contains_key(&fresh_core::WindowId(*window)));
+        if !self
+            .authorities
+            .get(&window_id)
+            .is_some_and(|(previous, _)| {
+                previous
+                    .upgrade()
+                    .is_some_and(|previous| Arc::ptr_eq(&previous, &fs))
+            })
+        {
+            self.clock += 1;
+            self.authorities
+                .insert(window_id, (Arc::downgrade(&fs), self.clock));
+            self.documents.retain(|(window, _), _| *window != window_id);
+        }
+        let asset_authority = self.authorities[&window_id].1;
         let state = editor.active_window_mut().buffers.get_mut(&buffer)?;
         // The initial scene is bounded. A document above this limit continues
         // through the existing grid Compose path until paged parsing is added.
@@ -435,6 +462,7 @@ impl ComposeCache {
             projection, doc, revision, cursors, focused, top_byte, &context,
         );
         pane.keyboard = owns_keyboard && focused;
+        pane.asset_authority = asset_authority;
         Some(pane)
     }
 }
@@ -507,6 +535,7 @@ impl ComposePane {
             keyboard: false,
             top_byte,
             document_len: doc.text.len(),
+            asset_authority: 0,
         }
     }
 }
