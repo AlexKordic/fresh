@@ -189,6 +189,9 @@ impl SceneBridge {
             editor.active_window_mut().menu_bar_visible = show;
             out.mutated = true;
         }
+        if !self.clients.iter().any(|client| client.greeted && client.rich_compose) {
+            for window in editor.windows.values_mut() { window.compose_regions.clear(); }
+        }
         out
     }
 
@@ -229,6 +232,7 @@ impl SceneBridge {
             prev_alloc_bytes: self.last_push_allocs.map(|a| a.1),
             ..Timing::default()
         };
+        let mut compose_regions = Vec::new();
         for client in &mut self.clients {
             if !client.greeted {
                 continue;
@@ -247,6 +251,12 @@ impl SceneBridge {
                             let revision = editor.active_window().buffer_state(buffer).map_or(0, |state| state.buffer.version());
                             let region = client.navigation.region(model.window_id, leaf, buffer, revision);
                             pane.compose = self.compose.gather_at(editor, leaf, buffer, region);
+                            if let Some(compose) = &pane.compose {
+                                compose_regions.push(crate::app::window::ComposeRegion {
+                                    leaf, buffer, revision: compose.buffer_revision,
+                                    source: compose.source_start..compose.source_end,
+                                });
+                            }
                         }
                     }
                 }
@@ -268,6 +278,13 @@ impl SceneBridge {
                 client.held = true;
             }
             client.rich_encoded = rich_encoded;
+        }
+        compose_regions.sort_by_key(|r| (r.buffer.0, r.leaf.0.0, r.source.start, r.source.end));
+        compose_regions.dedup();
+        let window = editor.active_window_mut();
+        if window.compose_regions != compose_regions {
+            window.compose_regions = compose_regions;
+            editor.request_plugin_render();
         }
         self.last_push_allocs = crate::alloc_stats::since(allocs_before);
         self.clients.iter().any(|c| c.held)

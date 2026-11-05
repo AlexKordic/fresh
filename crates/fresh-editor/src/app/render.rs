@@ -227,7 +227,7 @@ impl Editor {
     /// skipped has to be guaranteed a retry. (The pre-layout drain at the top
     /// of `render` does take the lock; it runs before any drawing, which is the
     /// point of doing it there.)
-    fn request_plugin_render(&mut self) {
+    pub(crate) fn request_plugin_render(&mut self) {
         #[cfg(feature = "plugins")]
         {
             self.plugin_render_requested = true;
@@ -485,16 +485,37 @@ impl Editor {
             // them in.
             let visible_buffers =
                 pane_rects.visible(&self.active_window().split_manager().visible_leaves());
+            let offers: Vec<_> = visible_buffers
+                .iter()
+                .map(|&(leaf, buffer, area)| {
+                    let top = self.active_window().split_view_states().get(&leaf)
+                        .map_or(0, |vs| vs.buffer_tab_state().viewport.top_byte());
+                    (leaf, buffer, area, top, None::<usize>)
+                })
+                .collect();
+            // Graphical clients can show source nowhere near the terminal's
+            // viewport. Offer those ranges to the SAME plugin/grammar path;
+            // scrolling a terminal to obtain decorations would move every
+            // other client and make the native view race its own source map.
+            #[cfg(feature = "web")]
+            let offers = {
+                let mut offers = offers;
+                for request in &self.active_window().compose_regions {
+                    let Some(&(_, _, area)) = visible_buffers.iter().find(|&&(leaf, buffer, _)| {
+                        leaf == request.leaf && buffer == request.buffer
+                    }) else { continue; };
+                    let current = self.active_window().buffer_state(request.buffer);
+                    if current.is_none_or(|state| state.buffer.version() != request.revision) {
+                        continue;
+                    }
+                    offers.push((request.leaf, request.buffer, area,
+                        request.source.start, Some(request.source.end)));
+                }
+                offers
+            };
 
             let mut total_new_lines = 0usize;
-            for (split_id, buffer_id, split_area) in visible_buffers {
-                // Get viewport from SplitViewState (the authoritative source)
-                let viewport_top_byte = self
-                    .active_window()
-                    .split_view_states()
-                    .get(&split_id)
-                    .map(|vs| vs.buffer_tab_state().viewport.top_byte())
-                    .unwrap_or(0);
+            for (_split_id, buffer_id, split_area, viewport_top_byte, source_end) in offers {
 
                 // Whether this buffer is being composed in any split, read from
                 // the live view states rather than from the plugin snapshot.
@@ -558,14 +579,29 @@ impl Editor {
                         // pane's width. Bounding the offer by the screen rather
                         // than by a flat constant is what keeps it screen-sized
                         // on a file whose lines are megabytes long.
-                        let offer_budget = (split_area.width as usize)
-                            .saturating_mul(visible_count.max(1))
-                            .saturating_mul(4)
-                            .saturating_add(1024)
-                            .min(PLUGIN_LINE_OFFER_BYTES);
+                        let offer_budget = if let Some(end) = source_end {
+                            // Include the range's source and bounded block
+                            // context, rather than estimating pixels in cells.
+                            end.saturating_sub(viewport_top_byte)
+                                .saturating_add(FLOW_RUN_LOOKBEHIND_BYTES)
+                                .min(PLUGIN_LINE_OFFER_BYTES * 2)
+                        } else {
+                            (split_area.width as usize)
+                                .saturating_mul(visible_count.max(1))
+                                .saturating_mul(4)
+                                .saturating_add(1024)
+                                .min(PLUGIN_LINE_OFFER_BYTES)
+                        };
 
                         let top_byte = viewport_top_byte;
                         let seen_byte_ranges = seen_ranges_for_win.entry(buffer_id).or_default();
+                        // A covered native region has no work on a caret-only
+                        // frame. Keep this aggregate in the same set as the
+                        // line offers: normal edit remapping and plugin refresh
+                        // invalidate it along with the affected source lines.
+                        if source_end.is_some_and(|end| seen_byte_ranges.contains(&(top_byte, end))) {
+                            return 0;
+                        }
 
                         // Where the walk starts. Normally the viewport's top
                         // line; for a composing buffer, backed up to the start
@@ -602,15 +638,21 @@ impl Editor {
                         // joins it measures are the ones already on screen, so
                         // a document opens at one line per row and settles over
                         // the next frames as its blocks join.
-                        let rows = crate::view::ui::split_rendering::transforms::join_adjusted_visible_count(
-                            &state.buffer,
-                            &state.conceals,
-                            &state.marker_list,
-                            &[],
-                            top_byte,
-                            visible_count,
-                            composing_in_any_split,
-                        );
+                        let rows = if let Some(end) = source_end {
+                            state.buffer.get_line_number(end)
+                                .saturating_sub(state.buffer.get_line_number(top_byte))
+                                .saturating_add(1)
+                        } else {
+                            crate::view::ui::split_rendering::transforms::join_adjusted_visible_count(
+                                &state.buffer,
+                                &state.conceals,
+                                &state.marker_list,
+                                &[],
+                                top_byte,
+                                visible_count,
+                                composing_in_any_split,
+                            )
+                        };
                         // A split with no rows draws nothing, so it has nothing
                         // to offer — and the walk below has no stopping rule.
                         if rows == 0 {
@@ -808,6 +850,9 @@ impl Editor {
                             for range in fresh_ranges {
                                 seen_byte_ranges.insert(range);
                             }
+                        }
+                        if let Some(end) = source_end.filter(|end| walked_end >= *end) {
+                            seen_byte_ranges.insert((top_byte, end));
                         }
                         count
                     })

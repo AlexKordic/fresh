@@ -295,12 +295,25 @@ impl LspCompletionCandidate {
     }
 }
 
+/// Source content a graphical Compose client needs decorated. These demands
+/// never change a split's cell viewport or its cursor.
+#[cfg(feature = "web")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComposeRegion {
+    pub leaf: LeafId,
+    pub buffer: BufferId,
+    pub revision: u64,
+    pub source: std::ops::Range<usize>,
+}
+
 pub struct Window {
     /// Stable identifier. The base window is always `WindowId(1)`.
     pub id: WindowId,
     /// Geometry is scoped to one scene input, never a terminal client's input.
     #[cfg(feature = "web")]
     pub(crate) compose_input: Option<crate::webui::compose_navigation::InputContext>,
+    #[cfg(feature = "web")]
+    pub(crate) compose_regions: Vec<ComposeRegion>,
 
     /// The connection this workspace acts through: where it acts, whether it
     /// may (`workspace_trust`), with what env, and what keeps the carrier alive.
@@ -2390,6 +2403,8 @@ impl Window {
             id,
             #[cfg(feature = "web")]
             compose_input: None,
+            #[cfg(feature = "web")]
+            compose_regions: Vec::new(),
             label,
             stable_id: crate::workspace::generate_stable_id(),
             // A window is created because someone is about to work in it,

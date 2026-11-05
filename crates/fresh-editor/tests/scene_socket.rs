@@ -216,7 +216,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
 }
 
 fn rich_source_regions_belong_to_each_client_and_expire_after_edits(root: &std::path::Path, work: &std::path::Path) {
-    let original = "# Long\n\n".to_string()+&(0..4000).map(|i|format!("Paragraph {i}: enough text to cross the source window.\n\n")).collect::<String>();
+    let original = "# Long\n\n".to_string()+&(0..4000).map(|i|format!("Paragraph {i}: **bold_{i}** and enough text to cross the source window.\n\n")).collect::<String>();
     let file = work.join("regions.md"); std::fs::write(&file,&original).unwrap();
     let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
     for _ in 0..12 { apply_step(&mut ed,&json!({})); }
@@ -232,26 +232,51 @@ fn rich_source_regions_belong_to_each_client_and_expire_after_edits(root: &std::
     let mut scope_a=pane_scope(hello_a.window_id.unwrap(),&first(&hello_a));
     let mut scope_b=pane_scope(hello_b.window_id.unwrap(),&first(&hello_b));
     assert_eq!(first(&hello_a).compose.unwrap().source_start,0);
-    let moved=rich_step(&mut bridge,&mut ed,&mut a,&mut scope_a,pb::ComposeInput { id:1,region:Some(150_000),..Default::default() });
+    let probe=150_000+original[150_000..].find("**bold_").unwrap();
+    let probe_end=probe+2+original[probe+2..].find("**").unwrap()+2;
+    let probe_buffer=fresh_core::BufferId(scope_a.buffer as usize);
+    let projected=|ed:&fresh::app::Editor| {
+        let state=ed.active_window().buffer_state(probe_buffer).unwrap();
+        state.conceals.project_text(&original[probe..probe_end],probe,&state.marker_list,&[0]).unwrap().text
+    };
+    assert_eq!(projected(&ed),original[probe..probe_end],"distant text was never offered to the terminal's plugin viewport");
+    let request=pb::ComposeInput { id:1,region:Some(150_000),..Default::default() };
+    let mut moved=rich_step(&mut bridge,&mut ed,&mut a,&mut scope_a,request.clone());
+    for _ in 0..10 {
+        if moved.input_reply.as_ref().is_some_and(|r|r.needs_layout) { break; }
+        moved=rich_step(&mut bridge,&mut ed,&mut a,&mut scope_a,request.clone());
+    }
     assert!(moved.input_reply.as_ref().is_some_and(|r|!r.accepted&&r.needs_layout));
     assert!(first(&moved).compose.unwrap().source_start>100_000);
+    for _ in 0..100 {
+        if projected(&ed)==original[probe+2..probe_end-2] { break; }
+        apply_step(&mut ed,&json!({}));
+        let _=fresh::webui::scene_value(&mut ed,COLS,ROWS);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(projected(&ed),original[probe+2..probe_end-2],"the native range reached the real Compose plugin");
     assert_eq!(ed.active_window().focused_view().viewport.top_byte(),0,"requesting content did not scroll the terminal");
     let escape=|id| pb::ComposeInput { id,kind:17,payload:pb::Key { key:"Escape".into(),..Default::default() }.encode_to_vec(),..Default::default() };
     // Complete A's request, and prove B's original source scope is still valid.
-    assert!(rich_step(&mut bridge,&mut ed,&mut a,&mut scope_a,escape(1)).input_reply.unwrap().accepted);
-    let mut peer=rich_step(&mut bridge,&mut ed,&mut b,&mut scope_b,escape(1));
-    for _ in 0..3 {
-        if peer.input_reply.as_ref().unwrap().accepted { break; }
-        peer=rich_step(&mut bridge,&mut ed,&mut b,&mut scope_b,escape(1));
-    }
+    rich_accepted(&mut bridge,&mut ed,&mut a,&mut scope_a,escape(1));
+    let peer=rich_accepted(&mut bridge,&mut ed,&mut b,&mut scope_b,escape(1));
     assert!(peer.input_reply.unwrap().accepted,"one client did not inherit the other client's region");
-    let typed=rich_step(&mut bridge,&mut ed,&mut a,&mut scope_a,pb::ComposeInput { id:2,kind:17,
+    let typed=rich_accepted(&mut bridge,&mut ed,&mut a,&mut scope_a,pb::ComposeInput { id:2,kind:17,
         payload:pb::Key { key:"X".into(),..Default::default() }.encode_to_vec(),..Default::default() });
     assert!(typed.input_reply.as_ref().unwrap().accepted);
     let fresh=first(&typed).compose.unwrap();
     assert_eq!(fresh.source_start,0,"a stale byte hint expires after a source edit");
     assert_eq!(fresh.cursors.iter().find(|c|c.primary).unwrap().position,1);
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+}
+
+fn rich_accepted(bridge:&mut SceneBridge,ed:&mut fresh::app::Editor,app:&mut App,
+    scope:&mut pb::ComposeScope,input:pb::ComposeInput)->pb::Frame {
+    for _ in 0..10 {
+        let frame=rich_step(bridge,ed,app,scope,input.clone());
+        if frame.input_reply.as_ref().is_some_and(|r|r.accepted) { return frame; }
+    }
+    panic!("source input did not settle against the latest decoration revision");
 }
 
 fn pane_scope(window: u64, pane: &pb::Pane) -> pb::ComposeScope {
