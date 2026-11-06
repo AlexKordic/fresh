@@ -615,6 +615,8 @@ pub(crate) struct ComposePane {
     pub text_context: Option<super::compose_text::Context>,
     pub text_chunks: Vec<super::compose_text::Chunk>,
     pub tables: Vec<super::compose_tables::Table>,
+    /// Native insertion separator: 0 unknown, 1 LF (including CR disk files), 2 CRLF.
+    pub native_newline: u32,
 }
 
 struct Document {
@@ -1461,6 +1463,11 @@ impl ComposeCache {
         let mut pane = ComposePane::from_projection(
             projection, doc, revision, cursors, focused, top_byte, &context, tables,
         );
+        pane.native_newline = if state.buffer.line_ending().insertion_str() == "\r\n" {
+            2
+        } else {
+            1
+        };
         pane.keyboard = owns_keyboard && focused;
         pane.asset_authority = asset_authority;
         pane.asset_document = asset_document;
@@ -1572,6 +1579,7 @@ impl ComposePane {
             cursors,
             focused,
             keyboard: false,
+            native_newline: 0,
             top_byte,
             document_len: doc.text.len(),
             asset_authority: 0,

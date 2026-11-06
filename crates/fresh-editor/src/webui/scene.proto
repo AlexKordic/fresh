@@ -353,6 +353,7 @@ message ComposePane {
   ComposeTextContext text_context = 20;
   repeated ComposeTextChunk text_chunks = 21;
   repeated ComposeTable tables = 22;
+  uint32 native_newline = 23;
 }
 
 // Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.

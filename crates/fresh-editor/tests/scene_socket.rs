@@ -837,6 +837,7 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
     let epoch=pane.compose.as_ref().unwrap().viewport.as_ref().unwrap().epoch;
     let context=pane.compose.as_ref().unwrap().text_context.as_ref().unwrap();
+    assert_eq!(pane.compose.as_ref().unwrap().native_newline,2,"native input previews use the buffer insertion policy, not rendered Markdown");
     assert_eq!(context.text,original,"native text services receive the exact Markdown source, including concealed syntax");
     assert_eq!((context.source_start,context.utf16_start,context.selection_start,context.selection_end),(0,0,0,0));
     let mut scope=pane_scope(hello.window_id.unwrap(),pane);
@@ -852,6 +853,7 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     assert_eq!((receipt.window,receipt.leaf,receipt.buffer,receipt.epoch),(scope.window_id,scope.leaf,scope.buffer,epoch));
     assert_eq!(receipt.cursors,vec![0],"only the explicitly edited cursor owns this receipt's dependency");
     let accepted=receipt.pane.as_ref().unwrap();
+    assert_eq!(accepted.native_newline,2,"immutable edit receipts include the insertion policy for dependent native previews");
     assert_eq!(accepted.text_context.as_ref().unwrap().text,original.replacen("café","東京",1));
     assert_eq!(accepted.buffer_revision,ed.active_window().active_state().buffer.version());
     assert_eq!(accepted.cursors.iter().find(|c|c.primary).unwrap().position,ed.active_cursors().primary().position as u64,"receipt cursor coordinates must match the completed edit");

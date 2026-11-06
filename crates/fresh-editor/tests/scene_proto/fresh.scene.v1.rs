@@ -581,6 +581,8 @@ pub struct ComposePane {
     pub text_chunks: ::prost::alloc::vec::Vec<ComposeTextChunk>,
     #[prost(message, repeated, tag = "22")]
     pub tables: ::prost::alloc::vec::Vec<ComposeTable>,
+    #[prost(uint32, tag = "23")]
+    pub native_newline: u32,
 }
 /// Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.
 #[derive(Clone, PartialEq, ::prost::Message)]
