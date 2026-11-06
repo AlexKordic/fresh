@@ -14,9 +14,12 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 
-const SOURCE_LIMIT: usize = 2 << 20;
+const BACKGROUND_PARSE_BYTES: usize = 64 << 10;
 const WINDOW_BYTES: usize = 64 << 10;
 const CACHE_LIMIT: usize = 8;
+
+#[path = "compose_parse.rs"]
+mod parsing;
 
 #[cfg(test)]
 #[path = "compose_profile.rs"]
@@ -171,6 +174,12 @@ pub(crate) struct InputTarget {
     pub pointer: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PointerState {
+    Ready,
+    Pending,
+}
+
 impl InputTarget {
     pub fn valid(&self, editor: &Editor) -> bool {
         let window = editor.active_window();
@@ -305,7 +314,9 @@ impl<'a> Input<'a> {
                 (20, Field::Bytes(bytes)) => {
                     input.replacements.push(TextReplacement::parse(bytes)?)
                 }
-                (21, Field::Bytes(bytes)) => input.observed_cursors.push(CursorAnchor::parse(bytes)?),
+                (21, Field::Bytes(bytes)) => {
+                    input.observed_cursors.push(CursorAnchor::parse(bytes)?)
+                }
                 _ => {}
             }
         }
@@ -353,9 +364,14 @@ impl<'a> Input<'a> {
             return Err(super::wire::WireError::InvalidField("replacement metadata"));
         }
         if !input.observed_cursors.is_empty() {
-            let unique: std::collections::HashSet<_> = input.observed_cursors.iter().map(|c| c.id).collect();
-            if unique.len() != input.observed_cursors.len() || input.replacement.is_none() && !input.text_input {
-                return Err(super::wire::WireError::InvalidField("observed cursors require unique native text targets"));
+            let unique: std::collections::HashSet<_> =
+                input.observed_cursors.iter().map(|c| c.id).collect();
+            if unique.len() != input.observed_cursors.len()
+                || input.replacement.is_none() && !input.text_input
+            {
+                return Err(super::wire::WireError::InvalidField(
+                    "observed cursors require unique native text targets",
+                ));
             }
         }
         Ok(input)
@@ -528,7 +544,7 @@ impl<'a> Input<'a> {
         &mut self,
         editor: &mut Editor,
         cache: &mut ComposeCache,
-    ) -> Result<(), String> {
+    ) -> Result<PointerState, String> {
         let scope = self
             .scope
             .ok_or("The clicked file is no longer available.")?;
@@ -591,6 +607,9 @@ impl<'a> Input<'a> {
             let pane = cache
                 .gather_at(editor, scope.leaf, scope.buffer, Some(start))
                 .ok_or("The image is no longer available. Click again.")?;
+            if cache.parsing_pending(scope.window, scope.buffer.0) {
+                return Ok(PointerState::Pending);
+            }
             if !pane
                 .images
                 .iter()
@@ -605,7 +624,7 @@ impl<'a> Input<'a> {
         } else {
             self.position = Some(mapped);
         }
-        Ok(())
+        Ok(PointerState::Ready)
     }
 
     pub fn pointer(&self, editor: &mut Editor) -> bool {
@@ -744,8 +763,8 @@ pub(crate) struct ComposePane {
 struct Document {
     revision: u64,
     epoch: usize,
-    text: String,
-    text_index: super::compose_text::Index,
+    text: Arc<String>,
+    text_index: Arc<super::compose_text::Index>,
     spans: Vec<ComposeSpan>,
     images: Vec<ComposeImage>,
     paragraphs: Vec<Range<usize>>,
@@ -755,6 +774,9 @@ struct Document {
     tables: super::compose_tables::Tables,
     used: u64,
     decorations: super::compose_decorations::Snapshot,
+    parsed: bool,
+    parse_error: Option<String>,
+    previous_decorations: Option<super::compose_decorations::Snapshot>,
 }
 
 struct CodeBlock {
@@ -765,6 +787,48 @@ struct CodeBlock {
 
 impl Document {
     fn parse(text: String, revision: u64, used: u64, epoch: usize) -> Self {
+        let text = Arc::new(text);
+        let index = Arc::new(super::compose_text::Index::new(&text));
+        Self::parse_shared(text, index, revision, used, epoch, None).unwrap()
+    }
+
+    /// Current source/caret context remains available for immutable edit
+    /// receipts while the semantic parser works on its own shared snapshot.
+    fn pending(text: String, revision: u64, used: u64, epoch: usize) -> Self {
+        let index = Arc::new(super::compose_text::Index::new(&text));
+        Self {
+            revision,
+            epoch,
+            text: Arc::new(text),
+            text_index: index,
+            spans: Vec::new(),
+            images: Vec::new(),
+            paragraphs: Vec::new(),
+            underlines: Vec::new(),
+            heading_openers: Vec::new(),
+            code: Vec::new(),
+            tables: Default::default(),
+            used,
+            decorations: super::compose_decorations::Snapshot::new(revision, Vec::new()),
+            parsed: false,
+            parse_error: None,
+            previous_decorations: None,
+        }
+    }
+
+    fn parse_shared(
+        text: Arc<String>,
+        text_index: Arc<super::compose_text::Index>,
+        revision: u64,
+        used: u64,
+        epoch: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Option<Self> {
+        let cancelled =
+            || cancel.is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire));
+        if cancelled() {
+            return None;
+        }
         let mut spans = Vec::new();
         let mut images = Vec::new();
         let mut image_stack: Vec<ComposeImage> = Vec::new();
@@ -775,7 +839,13 @@ impl Document {
         let mut active_code = None;
         let mut tables = super::compose_tables::Tables::default();
         let mut items: Vec<(usize, usize)> = Vec::new();
-        for (event, range) in Parser::new_ext(&text, Options::all()).into_offset_iter() {
+        for (index, (event, range)) in Parser::new_ext(&text, Options::all())
+            .into_offset_iter()
+            .enumerate()
+        {
+            if index % 128 == 0 && cancelled() {
+                return None;
+            }
             tables.event(&text, &event, &range);
             // Use the parser's item ownership and inline ranges. Tight lists
             // have no Paragraph event; task markers precede their body. An
@@ -926,7 +996,13 @@ impl Document {
                 }
             }
         }
+        if cancelled() {
+            return None;
+        }
         tables.finish(&text, &spans, &images);
+        if cancelled() {
+            return None;
+        }
         let outline = spans
             .iter()
             .map(|span| super::compose_decorations::Semantic {
@@ -946,10 +1022,10 @@ impl Document {
                     }),
             )
             .collect();
-        Self {
+        Some(Self {
             revision,
             epoch,
-            text_index: super::compose_text::Index::new(&text),
+            text_index,
             text,
             spans,
             images,
@@ -960,7 +1036,10 @@ impl Document {
             tables,
             used,
             decorations: super::compose_decorations::Snapshot::new(revision, outline),
-        }
+            parsed: true,
+            parse_error: None,
+            previous_decorations: None,
+        })
     }
 
     /// Native-only overrides are resolved from parsed block ownership and
@@ -1434,6 +1513,9 @@ pub(crate) struct ComposeCache {
         ),
     >,
     clock: u64,
+    parser: Option<Result<parsing::Worker, String>>,
+    parsing: HashMap<parsing::Key, Arc<std::sync::atomic::AtomicBool>>,
+    parse_wanted: std::collections::HashSet<parsing::Key>,
 }
 
 impl ComposeCache {
@@ -1512,18 +1594,10 @@ impl ComposeCache {
         }
         let asset_authority = self.authorities[&window_id].1;
         let readiness_enabled = editor.compose_plugins_active();
-        let (epoch, current_revision, length) = {
+        let (epoch, current_revision) = {
             let state = editor.active_window().buffer_state(buffer)?;
-            (
-                state.marker_list.instance_id(),
-                state.buffer.version(),
-                state.buffer.len(),
-            )
+            (state.marker_list.instance_id(), state.buffer.version())
         };
-        if length > SOURCE_LIMIT {
-            editor.active_window_mut().compose_readiness.remove(buffer);
-            return None;
-        }
         if readiness_enabled {
             let window = editor.active_window_mut();
             if window
@@ -1537,11 +1611,6 @@ impl ComposeCache {
         let window = editor.active_window_mut();
         let readiness = &mut window.compose_readiness;
         let state = window.buffers.get_mut(&buffer)?;
-        // The initial scene is bounded. A document above this limit continues
-        // through the existing grid Compose path until paged parsing is added.
-        if state.buffer.len() > SOURCE_LIMIT {
-            return None;
-        }
         let revision = state.buffer.version();
         let mut document_hash = std::collections::hash_map::DefaultHasher::new();
         state.buffer.file_path().hash(&mut document_hash);
@@ -1565,6 +1634,7 @@ impl ComposeCache {
                 .documents
                 .remove(&key)
                 .filter(|doc| doc.epoch == state.marker_list.instance_id());
+            self.cancel_buffer_parse(window_id, buffer.0);
             if self.documents.len() >= CACHE_LIMIT {
                 if let Some(oldest) = self
                     .documents
@@ -1575,16 +1645,25 @@ impl ComposeCache {
                     self.documents.remove(&oldest);
                 }
             }
-            let mut document =
-                Document::parse(text, revision, self.clock, state.marker_list.instance_id());
+            let mut document = if text.len() > BACKGROUND_PARSE_BYTES {
+                Document::pending(text, revision, self.clock, state.marker_list.instance_id())
+            } else {
+                Document::parse(text, revision, self.clock, state.marker_list.instance_id())
+            };
             if let Some(previous) = previous {
-                let outline = document.decorations.outline().to_vec();
-                document.decorations =
-                    previous
-                        .decorations
-                        .rebase(revision, outline, &state.coord_map);
+                let snapshot = previous
+                    .previous_decorations
+                    .unwrap_or(previous.decorations);
+                if document.parsed {
+                    let outline = document.decorations.outline().to_vec();
+                    document.decorations = snapshot.rebase(revision, outline, &state.coord_map);
+                } else {
+                    document.previous_decorations = Some(snapshot);
+                }
             }
             self.documents.insert(key, document);
+            self.request_parse(window_id, buffer.0);
+            self.schedule();
         }
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
@@ -1643,7 +1722,7 @@ impl ComposeCache {
             .map(|image| image.start..image.end)
             .collect();
         let status = status(start, end);
-        if status == Status::Ready {
+        if status == Status::Ready && doc.parsed {
             let complete = if readiness_enabled {
                 readiness.completed_ranges(buffer)
             } else {
@@ -1672,7 +1751,7 @@ impl ComposeCache {
         } else {
             Vec::new()
         };
-        let projection = if status != Status::Failed {
+        let projection = if status != Status::Failed && doc.parsed {
             let active = doc.decorations.active(&(start..end), &cursor_positions);
             doc.project_native(
                 start,
@@ -1698,8 +1777,11 @@ impl ComposeCache {
         pane.keyboard = owns_keyboard && focused;
         pane.asset_authority = asset_authority;
         pane.asset_document = asset_document;
-        pane.ready = Some(status != Status::Pending);
-        pane.current_projection = status != Status::Failed;
+        pane.ready = Some(status != Status::Pending && (doc.parsed || doc.parse_error.is_some()));
+        // The raw source/index is sufficient for receipts, but semantic
+        // geometry must wait for the worker before accepting measured actions.
+        pane.current_projection =
+            status != Status::Failed && (doc.parsed || doc.parse_error.is_some());
         if status == Status::Failed {
             for image in &mut pane.images {
                 image.rendered = false;
@@ -1708,6 +1790,9 @@ impl ComposeCache {
         }
         if status == Status::Failed {
             pane.error = "Formatting is unavailable. The Markdown source remains editable.".into();
+        }
+        if let Some(error) = &doc.parse_error {
+            pane.error = error.clone();
         }
         Some(pane)
     }
@@ -2174,7 +2259,7 @@ mod tests {
                 .unwrap();
             assert!(!p.text.contains("```"));
             assert!(!p.text.is_empty(), "empty code keeps a native line");
-            assert_eq!(doc.text, text);
+            assert_eq!(doc.text.as_str(), text);
         }
         let text = "Intro\r\r    café\r    second\r";
         let doc = Document::parse(text.into(), 0, 0, 1);
@@ -2263,7 +2348,7 @@ mod tests {
                 .unwrap();
             assert!(images.text.contains("| \u{fffc} | tail |"));
         }
-        assert_eq!(doc.text, text);
+        assert_eq!(doc.text.as_str(), text);
     }
 
     #[test]
@@ -2326,7 +2411,7 @@ mod tests {
             .project_text(text, 0, &state.marker_list, &[])
             .unwrap();
         assert!(grid.text.contains('─') && grid.text.contains('▌'));
-        assert_eq!(doc.text, text);
+        assert_eq!(doc.text.as_str(), text);
     }
 
     #[test]
@@ -2658,7 +2743,7 @@ mod tests {
                 .spans
                 .iter()
                 .all(|s| s.content_start.is_none() || s.role == 13));
-            assert_eq!(doc.text, text);
+            assert_eq!(doc.text.as_str(), text);
         }
     }
 

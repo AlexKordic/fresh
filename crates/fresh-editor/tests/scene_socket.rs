@@ -1514,7 +1514,7 @@ fn rich_input_intents_rebase_and_cancel_when_the_view_changes(root: &std::path::
     let action = |id| pb::ComposeInput { id, kind: 21, buffer_epoch: epoch,
         payload: pb::Action { name: "move_down".into(), ..Default::default() }.encode_to_vec(), ..Default::default() };
     let waiting = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, action(6)).input_reply.unwrap();
-    assert!(waiting.needs_layout && !waiting.accepted && !waiting.cancelled);
+    assert!(waiting.needs_layout && !waiting.accepted && !waiting.cancelled, "{waiting:?}");
     // A presentation toggle cancels a waiting command without another client
     // request. Source mode must never inherit its deferred measured motion.
     apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));

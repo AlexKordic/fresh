@@ -63,8 +63,13 @@ fn profile_rich_compose_document_workloads() {
             continue;
         }
         let mut parse_ms = Vec::new();
+        let mut source_context_ms = Vec::new();
         let mut document = None;
         for revision in 1..=3 {
+            let started = Instant::now();
+            let pending = Document::pending(text.clone(), revision, 0, 1);
+            source_context_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            drop(pending);
             let input = text.clone();
             let started = Instant::now();
             let parsed = Document::parse(input, revision, 0, 1);
@@ -132,9 +137,9 @@ fn profile_rich_compose_document_workloads() {
             table.measurement = None;
         }
         let report = serde_json::json!({
-            "case": name, "source_bytes": text.len(), "source_limit": SOURCE_LIMIT,
-            "available_through_current_cache": text.len() <= SOURCE_LIMIT,
-            "parse_ms": parse_ms, "projection_ms": projection_ms,
+            "case": name, "source_bytes": text.len(), "background_parse_threshold": BACKGROUND_PARSE_BYTES,
+            "semantic_parse_uses_worker": text.len() > BACKGROUND_PARSE_BYTES,
+            "parse_ms": parse_ms, "source_context_ms": source_context_ms, "projection_ms": projection_ms,
             "source_window_bytes": window.len(), "pane_bytes": wire_bytes,
             "pane_without_measurements_bytes": pane.encoded_len(),
             "semantic_spans": doc.spans.len(), "images": doc.images.len(), "table_samples": samples,

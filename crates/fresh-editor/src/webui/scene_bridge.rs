@@ -175,6 +175,7 @@ impl SceneBridge {
     /// `_rows` are there for the browser bridge's HTTP `/resize`.
     pub fn poll(&mut self, editor: &mut Editor, _cols: &mut u16, _rows: &mut u16) -> BridgePoll {
         let mut out = BridgePoll::default();
+        out.frame_owed |= self.compose.poll(editor);
         let active = editor.active_session_id();
         for (&id, window) in &mut editor.windows {
             if id != active { window.compose_readiness.retain_demands(&[]); }
@@ -254,6 +255,7 @@ impl SceneBridge {
             out.mutated = true;
         }
         if !self.clients.iter().any(|client| client.greeted && client.rich_compose) {
+            self.compose.clear();
             for window in editor.windows.values_mut() { window.compose_regions.clear(); window.compose_readiness.clear(); }
         }
         out
@@ -653,6 +655,7 @@ impl SceneClient {
                 if request.id <= self.last_asset { return Err("image request ids must increase".into()); }
                 self.last_asset = request.id;
                 if self.asset_transfers.len() >= 16 { return Err("too many pending image replies".into()); }
+                let mut resolution_retryable = false;
                 let resolved = (|| {
                     let scope = request.scope.as_ref().ok_or("image request requires a document")?;
                     if scope.window != editor.active_window().id.0 || editor.active_window().pane_buffer(scope.leaf) != Some(scope.buffer) {
@@ -661,17 +664,20 @@ impl SceneClient {
                     let viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
                     let region = viewport.map(|v| v.position);
                     let pane = compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.navigation.context(scope)).ok_or("image document is not composing")?;
+                    resolution_retryable = true;
                     if pane.buffer_revision != scope.revision { return Err("image source changed; request its current annotation".into()); }
                     if pane.asset_authority != request.authority { return Err("image filesystem authority changed".into()); }
                     if pane.asset_document != request.document { return Err("image document path changed".into()); }
+                    if compose.parsing_pending(scope.window, scope.buffer.0) { return Err("image metadata is being parsed; retry its current annotation".into()); }
                     let image = pane.images.iter().find(|image| image.start == request.start && image.end == request.end)
                         .ok_or("image annotation is no longer in this source region")?;
+                    resolution_retryable = false;
                     let window = editor.active_window();
                     let document = window.buffer_state(scope.buffer).and_then(|s| s.buffer.file_path()).ok_or("save the document before loading relative images")?;
                     let path = super::compose_assets::resolve(document, &image.target)?;
                     Ok((super::compose_assets::Target { scope: *scope, fs: window.authority().filesystem.clone(), document: document.to_path_buf(), instance: window.buffer_state(scope.buffer).unwrap().marker_list.instance_id() }, path))
                 })();
-                let result = resolved.map_err(|error| (error, false)).and_then(|(target, path)| {
+                let result = resolved.map_err(|error| (error, resolution_retryable)).and_then(|(target, path)| {
                     assets.submit(self.id, request.id, target.fs.clone(), path, request.conditional)
                         .map_err(|error| (error, true))?;
                     self.asset_targets.insert(request.id, target);
@@ -754,14 +760,17 @@ impl SceneClient {
                 }
                 if input.source_revision.is_some() {
                     match input.rebase_pointer(editor, compose) {
-                        Ok(()) if input.pointer(editor) => {
+                        Ok(super::compose::PointerState::Ready) if input.pointer(editor) => {
                             out.mutated = true;
                             self.navigation.clear();
                             let carets = self.navigation.pointer(editor, &input);
                             let result = self.input_result(editor, compose, &input);
                             self.finish_input(super::compose::InputReply { id: input.id, accepted: true, carets, result, ..Default::default() });
                         }
-                        Ok(()) => self.cancel_input(input.id, "The clicked file is no longer available. Click again."),
+                        Ok(super::compose::PointerState::Ready) => self.cancel_input(input.id, "The clicked file is no longer available. Click again."),
+                        Ok(super::compose::PointerState::Pending) => {
+                            self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                        }
                         Err(error) => self.cancel_input(input.id, &error),
                     }
                     out.frame_owed = true;
@@ -789,7 +798,11 @@ impl SceneClient {
                     out.frame_owed = true;
                     return Ok(());
                 }
-                let mut reply = super::compose::InputReply { id: input.id, accepted, ..Default::default() };
+                // A completed parser/formatter can replace the projection
+                // between capture and dispatch without changing its source.
+                // An obsolete scope must request a new layout explicitly.
+                let mut reply = super::compose::InputReply { id: input.id, accepted,
+                    needs_layout: input.scope.is_some() && snapshot.is_none(), ..Default::default() };
                 if !accepted && (input.scope.is_none() || snapshot.is_some()) {
                     if let (Some(scope), Some(region)) = (&input.scope, input.region) {
                         if region > snapshot.as_ref().unwrap().document_len { return Err("source region is outside the document".into()); }
