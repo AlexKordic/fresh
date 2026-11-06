@@ -349,6 +349,7 @@ fn rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(root:
     }
     let empty=compose.tables[0].rows[2].cells[0].start;
     let missing=compose.tables[0].rows[3].content_end;
+    let image=compose.images[0].start;
     let mut scope=pane_scope(hello.window_id.unwrap(),pane);
     let word=original.find("café").unwrap()+2;
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some(word as u64),..Default::default()});
@@ -371,6 +372,15 @@ fn rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(root:
     assert!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().tables[0].rows[3].source);
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:9,kind:21,payload:pb::Action {name:"save".into(),..Default::default()}.encode_to_vec(),..Default::default()});
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:10,position:Some(image+3),..Default::default()});
+    let current=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert!(current.images[0].source_preview && !current.images[0].rendered);
+    assert!(current.tables[0].rows[1].cells[2].revealed && !current.tables[0].rows[1].source);
+    assert!(current.text.contains("![**pic**](<a b.png>)"));
+    if let Some(path)=std::env::var_os("FC_COMPOSE_TABLE_SOURCE_SCENE_FILE") {
+        let mut fixture=current.clone(); fixture.asset_authority=1; fixture.asset_document=1;
+        std::fs::write(path,fixture.encode_to_vec()).unwrap();
+    }
     // A legacy rich client and the table client share source/history, while
     // each keeps the representation it negotiated in its own hello.
     for _ in 0..4 {
