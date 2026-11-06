@@ -56,7 +56,57 @@ pub struct Projection {
     pub segments: Vec<Segment>,
 }
 
+/// A validated borrowed view for repeated ordered coordinate queries.
+/// No strings, segments or per-position tables are copied or retained.
+pub struct ProjectionIndex<'a> {
+    projection: &'a Projection,
+}
+
+impl ProjectionIndex<'_> {
+    pub fn display_position(&self, source: usize, affinity: Affinity) -> Option<usize> {
+        let segments = &self.projection.segments;
+        let first = segments.partition_point(|s| s.source.end < source);
+        let last = segments.partition_point(|s| s.source.start <= source);
+        self.projection
+            .display_position_in(&segments[first..last], source, affinity)
+    }
+
+    pub fn source_position(&self, display: usize, affinity: Affinity) -> Option<usize> {
+        let segments = &self.projection.segments;
+        let first = segments.partition_point(|s| s.display.end < display);
+        let last = segments.partition_point(|s| s.display.start <= display);
+        self.projection
+            .source_position_in(&segments[first..last], display, affinity)
+    }
+}
+
 impl Projection {
+    /// Validate continuity once before repeated binary coordinate lookups.
+    /// Publicly constructed/mutated projections keep their existing linear
+    /// query behavior; an unordered or incomplete map cannot use this index.
+    pub fn index(&self) -> Option<ProjectionIndex<'_>> {
+        let (mut source, mut display) = (self.source.start, 0);
+        for segment in &self.segments {
+            if segment.source.start != source
+                || segment.display.start != display
+                || segment.source.end < source
+                || segment.display.end < display
+                || !self.text.is_char_boundary(segment.display.start)
+                || !self.text.is_char_boundary(segment.display.end)
+            {
+                return None;
+            }
+            if segment.kind == SegmentKind::Copy
+                && segment.source.end - source != segment.display.end - display
+            {
+                return None;
+            }
+            source = segment.source.end;
+            display = segment.display.end;
+        }
+        (source == self.source.end && display == self.text.len())
+            .then_some(ProjectionIndex { projection: self })
+    }
     /// Project an exact source slice using non-overlapping, active conceals.
     ///
     /// Refuse malformed ranges instead of issuing an ambiguous source map.
@@ -230,13 +280,22 @@ impl Projection {
     /// Unmatched replacement content addresses a source edge; identical text
     /// within a replacement remains individually addressable.
     pub fn source_position(&self, display: usize, affinity: Affinity) -> Option<usize> {
+        self.source_position_in(&self.segments, display, affinity)
+    }
+
+    fn source_position_in(
+        &self,
+        segments: &[Segment],
+        display: usize,
+        affinity: Affinity,
+    ) -> Option<usize> {
         if !self.text.is_char_boundary(display) {
             return None;
         }
         if self.segments.is_empty() {
             return (display == 0).then_some(self.source.start);
         }
-        let candidates = self.segments.iter().filter_map(|segment| {
+        let candidates = segments.iter().filter_map(|segment| {
             if display < segment.display.start || display > segment.display.end {
                 return None;
             }
@@ -263,13 +322,22 @@ impl Projection {
     /// Find the displayed caret for a source position. Interior positions in
     /// concealed/replaced text collapse to its appropriate visual edge.
     pub fn display_position(&self, source: usize, affinity: Affinity) -> Option<usize> {
+        self.display_position_in(&self.segments, source, affinity)
+    }
+
+    fn display_position_in(
+        &self,
+        segments: &[Segment],
+        source: usize,
+        affinity: Affinity,
+    ) -> Option<usize> {
         if source < self.source.start || source > self.source.end {
             return None;
         }
         if self.segments.is_empty() {
             return Some(0);
         }
-        let candidates = self.segments.iter().filter_map(|segment| {
+        let candidates = segments.iter().filter_map(|segment| {
             if source < segment.source.start || source > segment.source.end {
                 return None;
             }
@@ -298,6 +366,57 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_queries_match_linear_affinity_at_every_unicode_and_atomic_boundary() {
+        let source = "café 👩🏽‍💻 **bold** and 東京\r\n".repeat(80);
+        for replacement in [
+            None,
+            Some(" "),
+            Some("**padded bold**"),
+            Some("• 東京"),
+            Some("👩🏽‍💻"),
+        ] {
+            let conceals = source
+                .match_indices("**bold**")
+                .map(|(at, text)| Conceal {
+                    source: 173 + at..173 + at + text.len(),
+                    replacement,
+                })
+                .collect::<Vec<_>>();
+            let projection = Projection::new(&source, 173, &conceals).unwrap();
+            let index = projection.index().unwrap();
+            for affinity in [Affinity::Upstream, Affinity::Downstream] {
+                for position in 172..175 + source.len() {
+                    assert_eq!(
+                        index.display_position(position, affinity),
+                        projection.display_position(position, affinity)
+                    );
+                }
+                for position in 0..projection.text.len() + 2 {
+                    assert_eq!(
+                        index.source_position(position, affinity),
+                        projection.source_position(position, affinity)
+                    );
+                }
+            }
+        }
+        let mut malformed = Projection::new("abc", 10, &[]).unwrap();
+        malformed.segments[0].source.start = 9;
+        assert!(malformed.index().is_none());
+        let mut unequal_copy = Projection::new("abc", 10, &[]).unwrap();
+        unequal_copy.source.end += 1;
+        unequal_copy.segments[0].source.end += 1;
+        assert!(unequal_copy.index().is_none());
+        let empty = Projection::new("", 173, &[]).unwrap();
+        assert_eq!(
+            empty
+                .index()
+                .unwrap()
+                .source_position(0, Affinity::Downstream),
+            Some(173)
+        );
+    }
 
     #[test]
     fn a_rendered_heading_keeps_both_sides_of_its_hidden_markup() {
