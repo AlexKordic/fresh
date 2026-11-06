@@ -29,6 +29,7 @@
 // Loader requires filesystem access - runtime only
 #[cfg(feature = "runtime")]
 mod loader;
+mod optimizations;
 mod shebang;
 mod types;
 

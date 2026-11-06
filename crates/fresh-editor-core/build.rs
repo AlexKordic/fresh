@@ -10,10 +10,14 @@
 use std::fs;
 use std::path::Path;
 
+#[path = "src/primitives/grammar/optimizations.rs"]
+mod grammar_optimizations;
+
 fn main() {
     println!("cargo::rerun-if-changed=locales");
     println!("cargo::rerun-if-changed=themes");
     println!("cargo::rerun-if-changed=src/grammars");
+    println!("cargo::rerun-if-changed=src/primitives/grammar/optimizations.rs");
 
     // Always generated: config.rs `include!`s locale_options.rs and
     // theme/types.rs `include!`s builtin_themes.rs, so both must exist even
@@ -243,6 +247,7 @@ fn generate_syntax_packdump(
     // Start with syntect's built-in defaults
     let defaults = SyntaxSet::load_defaults_newlines();
     let mut builder = defaults.into_builder();
+    grammar_optimizations::add_markdown_reference_prefilter(&mut builder);
 
     // Add all embedded grammars — must match the list in types.rs add_embedded_grammars()
     let grammar_files: &[(&str, &str)] = &[

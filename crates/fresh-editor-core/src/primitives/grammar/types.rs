@@ -1840,6 +1840,7 @@ impl Default for GrammarRegistry {
         // Create with defaults and embedded grammars only (no user grammars)
         let defaults = SyntaxSet::load_defaults_newlines();
         let mut builder = defaults.into_builder();
+        super::optimizations::add_markdown_reference_prefilter(&mut builder);
         Self::add_embedded_grammars(&mut builder);
         let syntax_set = builder.build();
         let filename_scopes = Self::build_filename_scopes();
