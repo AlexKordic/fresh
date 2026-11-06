@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// A cell rectangle, serialized as `{x, y, w, h}` (matching the bridge's
 /// historical `rect_json`).
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 pub struct RectView {
     pub x: u16,
     pub y: u16,
@@ -689,8 +689,9 @@ impl Editor {
 
 // ─────────────────────────── popups (completion / hover / action / list / text) ───────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct PopupItemView {
+    pub id: String,
     pub text: String,
     pub detail: Option<String>,
     pub icon: Option<String>,
@@ -704,7 +705,7 @@ pub struct PopupItemView {
 /// both renderers ink the same thing. The field names are the cell runs'
 /// (`t`/`fg`/`bg`/`b`/`i`/`u`/`r`, see `webui::cells_json`), so a frontend
 /// paints a popup run exactly the way it paints a buffer run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct PopupSpanView {
     #[serde(rename = "t")]
     pub text: String,
@@ -750,7 +751,7 @@ impl PopupSpanView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PopupContentView {
     List {
@@ -764,13 +765,22 @@ pub enum PopupContentView {
     },
 }
 
+#[path = "popup_scene.rs"]
+mod popup_scene;
+pub use popup_scene::PopupSourceAnchor;
+
 /// A floating popup (completion menu, hover doc, action chooser, …) projected
-/// semantically. Geometry (`rect`/`content_rect`) is the pipeline's popup layout
-/// so the frontend can position the native box and forward clicks/scroll back
-/// through `handle_mouse` — the existing popup hit-tester resolves them.
-#[derive(Debug, Clone, Serialize)]
+/// semantically. `rect`/`content_rect` retain the pipeline's cell geometry.
+/// `source_anchor` additionally identifies source-relative placement in Compose;
+/// the frontend can measure that anchor with its own typography. `instance`
+/// distinguishes lifetimes and `version` fingerprints the current input target.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct ScenePopup {
+    pub instance: u64,
+    pub version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_anchor: Option<PopupSourceAnchor>,
     pub kind: &'static str,
     pub title: Option<String>,
     pub description: Option<String>,
@@ -785,6 +795,8 @@ fn project_popup(
     outer: Rect,
     inner: Rect,
     scroll: usize,
+    source_anchor: Option<PopupSourceAnchor>,
+    presentation: &[fresh_ui::Item],
 ) -> ScenePopup {
     use crate::view::popup::{PopupContent, PopupKind};
     let kind = match p.kind {
@@ -799,6 +811,7 @@ fn project_popup(
             items: items
                 .iter()
                 .map(|i| PopupItemView {
+                    id: i.id.clone(),
                     text: i.text.clone(),
                     detail: i.detail.clone(),
                     icon: i.icon.clone(),
@@ -825,7 +838,10 @@ fn project_popup(
                 .collect(),
         },
     };
-    ScenePopup {
+    let mut view = ScenePopup {
+        instance: p.instance,
+        version: 0,
+        source_anchor,
         kind,
         title: p.title.clone(),
         description: p.description.clone(),
@@ -833,7 +849,9 @@ fn project_popup(
         content_rect: RectView::from(inner),
         scroll_offset: scroll,
         content,
-    }
+    };
+    view.version = popup_scene::version(&view, p, presentation);
+    view
 }
 
 impl Editor {
@@ -866,14 +884,16 @@ impl Editor {
                 break;
             }
             let (outer, inner) = at(idx);
-            out.push(project_popup(p, outer, inner, p.scroll_offset));
+            out.push(project_popup(p, outer, inner, p.scroll_offset,
+                self.popup_source_anchor(p), self.popup_presentation(idx)));
         }
         // The description carries at most the top of the global stack, after
         // the buffer's — so it is the last entry, and only when there is one.
         if total > buffer_n {
             if let Some(p) = self.global_popups.top() {
                 let (outer, inner) = at(buffer_n);
-                out.push(project_popup(p, outer, inner, p.scroll_offset));
+                out.push(project_popup(p, outer, inner, p.scroll_offset,
+                    self.popup_source_anchor(p), self.popup_presentation(buffer_n)));
             }
         }
         out

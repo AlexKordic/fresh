@@ -23,6 +23,10 @@
 use std::collections::HashMap;
 use std::fmt;
 
+#[cfg(test)]
+#[path = "popup_wire_tests.rs"]
+mod popup_wire_tests;
+
 /// What a message is, its `type` on the wire.
 pub(crate) mod kind {
     pub const SERVER_HELLO: u64 = 1;
@@ -778,7 +782,7 @@ use super::compose_navigation::CaretState;
 use crate::view::scene::{
     ContextMenuView, EntryDialogView, FileExplorerView, FileRow, KbConfirm, KbEditDialog, KbRow,
     KbSearchView, KeybindingEditorView, MapEntryView, MenuEntry, MenuItemView, PaletteView,
-    PopupContentView, PopupItemView, PopupSpanView, RectView, ScenePopup, SearchOptionView,
+    PopupContentView, PopupItemView, PopupSourceAnchor, PopupSpanView, RectView, ScenePopup, SearchOptionView,
     SearchOptionsView, SettingControlView, SettingItemView, SettingsCategoryView,
     SettingsSearchResultView, SettingsView, StatusSegment, StatusView, SuggestionView, TabBarView,
     TabView, TrustDialogView, TrustOptionView,
@@ -847,15 +851,25 @@ proto! {
     }
     PopupItemView {
         1 text: string, 2 detail: optional string, 3 icon: optional string, 4 disabled: bool,
+        5 id: string,
     }
     /// A styled span of a popup's line; colors 0xRRGGBB, left out for the default.
     PopupSpanView {
         1 text: string, 2 fg: optional uint32, 3 bg: optional uint32, 4 bold: bool,
         5 italic: bool, 6 underline: bool, 7 reverse: bool,
     }
+    /// Exact Compose source owner and placement, independent of terminal wrapping.
+    PopupSourceAnchor {
+        1 window_id: uint64, 2 leaf: uint64, 3 buffer: uint64,
+        4 buffer_epoch: uint64, 5 buffer_revision: uint64,
+        6 caret: uint64, 7 horizontal: uint64,
+        // 1: over; 2: below, flipping above if needed; 3: above. All clamp to frame.
+        8 placement: uint32,
+    }
     ScenePopup {
         1 kind: string, 2 title: optional string, 3 description: optional string,
         4 rect: Rect, 5 content_rect: Rect, 6 scroll_offset: uint64, 7 content: PopupContent,
+        8 instance: uint64, 9 version: uint64, 10 source_anchor: maybe PopupSourceAnchor,
     }
     FileRow { 1 name: string, 2 depth: uint64, 3 is_dir: bool, 4 expanded: bool }
     FileExplorerView {

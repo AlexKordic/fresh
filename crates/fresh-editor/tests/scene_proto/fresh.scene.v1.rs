@@ -196,6 +196,8 @@ pub struct PopupItemView {
     pub icon: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, tag = "4")]
     pub disabled: bool,
+    #[prost(string, tag = "5")]
+    pub id: ::prost::alloc::string::String,
 }
 /// A styled span of a popup's line; colors 0xRRGGBB, left out for the default.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -215,6 +217,26 @@ pub struct PopupSpanView {
     #[prost(bool, tag = "7")]
     pub reverse: bool,
 }
+/// Exact Compose source owner and placement, independent of terminal wrapping.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PopupSourceAnchor {
+    #[prost(uint64, tag = "1")]
+    pub window_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub leaf: u64,
+    #[prost(uint64, tag = "3")]
+    pub buffer: u64,
+    #[prost(uint64, tag = "4")]
+    pub buffer_epoch: u64,
+    #[prost(uint64, tag = "5")]
+    pub buffer_revision: u64,
+    #[prost(uint64, tag = "6")]
+    pub caret: u64,
+    #[prost(uint64, tag = "7")]
+    pub horizontal: u64,
+    #[prost(uint32, tag = "8")]
+    pub placement: u32,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScenePopup {
     #[prost(string, tag = "1")]
@@ -231,6 +253,12 @@ pub struct ScenePopup {
     pub scroll_offset: u64,
     #[prost(message, optional, tag = "7")]
     pub content: ::core::option::Option<PopupContent>,
+    #[prost(uint64, tag = "8")]
+    pub instance: u64,
+    #[prost(uint64, tag = "9")]
+    pub version: u64,
+    #[prost(message, optional, tag = "10")]
+    pub source_anchor: ::core::option::Option<PopupSourceAnchor>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileRow {

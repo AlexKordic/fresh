@@ -230,6 +230,9 @@ impl PopupListItem {
 /// - Quick fixes / code actions
 #[derive(Debug, Clone, PartialEq)]
 pub struct Popup {
+    /// Lifetime assigned whenever a manager shows or replaces this popup.
+    pub(crate) instance: u64,
+
     /// Kind of popup - determines input handling behavior
     pub kind: PopupKind,
 
@@ -303,6 +306,7 @@ impl Popup {
     /// Create a new popup with text content using theme colors
     pub fn text(content: Vec<String>, theme: &crate::view::theme::Theme) -> Self {
         Self {
+            instance: 0,
             kind: PopupKind::Text,
             title: None,
             description: None,
@@ -335,6 +339,7 @@ impl Popup {
     ) -> Self {
         let styled_lines = parse_markdown(markdown_text, theme, registry);
         Self {
+            instance: 0,
             kind: PopupKind::Text,
             title: None,
             description: None,
@@ -359,6 +364,7 @@ impl Popup {
     /// Create a new popup with a list of items using theme colors
     pub fn list(items: Vec<PopupListItem>, theme: &crate::view::theme::Theme) -> Self {
         Self {
+            instance: 0,
             kind: PopupKind::List,
             title: None,
             description: None,
@@ -844,6 +850,12 @@ impl Popup {
     }
 }
 
+fn next_popup_instance() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Manager for popups - can show multiple popups with z-ordering
 #[derive(Debug, Clone)]
 pub struct PopupManager {
@@ -857,14 +869,16 @@ impl PopupManager {
     }
 
     /// Show a popup (adds to top of stack)
-    pub fn show(&mut self, popup: Popup) {
+    pub fn show(&mut self, mut popup: Popup) {
+        popup.instance = next_popup_instance();
         self.popups.push(popup);
     }
 
     /// Show a popup, replacing any existing popup of the same kind.
     /// If a popup with the same `PopupKind` already exists in the stack,
     /// it is replaced in-place. Otherwise the new popup is pushed on top.
-    pub fn show_or_replace(&mut self, popup: Popup) {
+    pub fn show_or_replace(&mut self, mut popup: Popup) {
+        popup.instance = next_popup_instance();
         if let Some(pos) = self.popups.iter().position(|p| p.kind == popup.kind) {
             self.popups[pos] = popup;
         } else {
@@ -1004,6 +1018,28 @@ mod tests {
         manager.clear();
         assert!(!manager.is_visible());
         assert_eq!(manager.all().len(), 0);
+    }
+
+    #[test]
+    fn showing_replacing_or_reshowing_a_clone_starts_a_new_popup_lifetime() {
+        let theme = crate::view::theme::Theme::load_builtin(theme::THEME_DARK).unwrap();
+        let mut manager = PopupManager::new();
+        let popup = Popup::text(vec!["same content".into()], &theme);
+        manager.show(popup.clone());
+        let first = manager.top().unwrap().instance;
+        assert_ne!(first, 0);
+        manager.show_or_replace(popup);
+        let replacement = manager.top().unwrap().instance;
+        assert_ne!(replacement, first);
+        assert_eq!(manager.all().len(), 1);
+        let removed = manager.hide().unwrap();
+        manager.show(removed.clone());
+        assert_ne!(manager.top().unwrap().instance, replacement);
+        let reinserted = manager.top().unwrap().instance;
+        manager.show(removed);
+        assert_ne!(manager.top().unwrap().instance, reinserted);
+        assert_eq!(manager.all().len(), 2);
+        assert_eq!(manager.get(0).unwrap().instance, reinserted);
     }
 
     #[test]

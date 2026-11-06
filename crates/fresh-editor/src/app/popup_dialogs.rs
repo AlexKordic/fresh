@@ -659,6 +659,7 @@ impl Editor {
             None
         };
         let popup = Popup {
+            instance: 0,
             kind: PopupKind::List,
             title: Some(format!("LSP Servers ({language})")),
             description: None,
@@ -969,6 +970,7 @@ impl Editor {
             + 4) as u16;
 
         let popup = Popup {
+            instance: 0,
             kind: PopupKind::List,
             title: Some(title),
             description: None,
@@ -1050,6 +1052,7 @@ impl Editor {
             + 4) as u16;
 
         let popup = Popup {
+            instance: 0,
             kind: PopupKind::List,
             title: Some(t!("read_only.menu.title").to_string()),
             description: None,
@@ -1285,6 +1288,7 @@ impl Editor {
             + 4) as u16;
 
         let popup = Popup {
+            instance: 0,
             kind: PopupKind::List,
             title: Some(title),
             description: body,
@@ -1564,6 +1568,7 @@ impl Editor {
             + 4) as u16;
 
         let popup = Popup {
+            instance: 0,
             kind: PopupKind::List,
             title: Some("This project can run code on your machine. Trust it?".to_string()),
             description: None,

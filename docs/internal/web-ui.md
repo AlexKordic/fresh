@@ -26,6 +26,32 @@ Strengths to preserve through any of the work below:
 - **DOM hygiene** — when nothing changed, no frame arrives at all (the server diffs before pushing, §3.1), so the DOM is never touched; scroll positions of natively-scrolled panels survive rebuilds; wheel events over natively-scrolled chrome are deliberately not forwarded.
 - The **gutter/text split** in the bridge output, which exists precisely so a future native selection/copy layer can cover code without line numbers.
 
+### Popup annotations for native Compose consumers
+
+The semantic popup projection retains its original `rect` and `content_rect`
+in cells. It additionally carries an `instance` for each shown lifetime, a
+`version` fingerprint for event-time validation, and each list row's stable
+`id`. Showing a clone or replacing a popup gives it a new lifetime. Content,
+scroll, source owner, placement and action-payload changes invalidate its
+version, including updates that leave the visible labels unchanged.
+The fingerprint includes the retained presentation because a component can
+scroll or change hover independently of the popup model's legacy offset.
+
+A cursor-relative popup in a Compose pane has a `source_anchor` naming its
+window, leaf, buffer, buffer lifetime and source revision. Its caret byte
+supplies y and line height; a separate source byte supplies x (the completion
+word's start when appropriate). Placement explicitly distinguishes over,
+below with an above fallback, and above. Fixed, centered and status-anchored
+popups carry no source anchor. The annotation uses the focused pane's view,
+including when two panes show the same buffer with different carets.
+
+These annotations do not move the retained UI's cell geometry or change the
+existing browser/TUI pointer path. A host relocating a popup must validate its
+owner and version, translate its input into the retained UI, and omit the
+old hit region for input aimed elsewhere. `fresh-ui` provides the scoped
+`dispatch_without_pointer_subtrees` primitive for that last step; keyboard
+and pointer-modal ownership remain with the retained tree.
+
 ## 2. The benchmark — what "VS Code-level polish" decomposes into
 
 "Polish" is not one feature. Measured against VS Code in a browser (vscode.dev / code-server), the bar decomposes into:

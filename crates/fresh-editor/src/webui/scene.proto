@@ -128,6 +128,7 @@ message PopupItemView {
   optional string detail = 2;
   optional string icon = 3;
   bool disabled = 4;
+  string id = 5;
 }
 
 // A styled span of a popup's line; colors 0xRRGGBB, left out for the default.
@@ -141,6 +142,18 @@ message PopupSpanView {
   bool reverse = 7;
 }
 
+// Exact Compose source owner and placement, independent of terminal wrapping.
+message PopupSourceAnchor {
+  uint64 window_id = 1;
+  uint64 leaf = 2;
+  uint64 buffer = 3;
+  uint64 buffer_epoch = 4;
+  uint64 buffer_revision = 5;
+  uint64 caret = 6;
+  uint64 horizontal = 7;
+  uint32 placement = 8;
+}
+
 message ScenePopup {
   string kind = 1;
   optional string title = 2;
@@ -149,6 +162,9 @@ message ScenePopup {
   Rect content_rect = 5;
   uint64 scroll_offset = 6;
   PopupContent content = 7;
+  uint64 instance = 8;
+  uint64 version = 9;
+  PopupSourceAnchor source_anchor = 10;
 }
 
 message FileRow {

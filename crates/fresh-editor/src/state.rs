@@ -1705,6 +1705,7 @@ pub(crate) fn convert_popup_data_to_popup(
     };
 
     Popup {
+        instance: 0,
         kind,
         title: data.title.clone(),
         description: data.description.clone(),
