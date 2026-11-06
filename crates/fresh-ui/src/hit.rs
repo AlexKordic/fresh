@@ -1219,10 +1219,10 @@ impl<M: 'static> Ui<M> {
         let Some(root) = self.find_by_key(key) else {
             return;
         };
-        if self
+        let captured_here = self
             .captured
-            .is_some_and(|element| self.is_ancestor(root, element))
-        {
+            .is_some_and(|element| self.is_ancestor(root, element));
+        if captured_here {
             self.captured = None;
         }
         if self
@@ -1232,11 +1232,13 @@ impl<M: 'static> Ui<M> {
         {
             self.scrollbar_drag = None;
         }
-        if self.drag.as_ref().is_some_and(|drag| {
-            drag.lifted_from
-                .iter()
-                .any(|&element| self.is_ancestor(root, element))
-        }) {
+        if captured_here
+            || self.drag.as_ref().is_some_and(|drag| {
+                drag.lifted_from
+                    .iter()
+                    .any(|&element| self.is_ancestor(root, element))
+            })
+        {
             self.drag = None;
         }
         if let Some((mut targets, button, count)) = self.press.take() {

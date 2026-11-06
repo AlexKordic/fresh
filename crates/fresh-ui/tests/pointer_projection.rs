@@ -507,3 +507,29 @@ fn retiring_a_surface_cancels_its_capture_drag_and_pending_click_without_a_drop(
         .msgs
         .is_empty());
 }
+
+#[test]
+fn retiring_the_captor_itself_also_ends_its_drag_timer() {
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        gesture(text("drag")).key("handle").on(
+            GestureKind::Press,
+            Rc::new(|event| {
+                event.start_drag();
+                None
+            }),
+        ),
+        Size::new(20, 10),
+    );
+    ui.dispatch(Input::press(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(ui.captured().is_some());
+    assert!(ui.dragging());
+    ui.cancel_pointer_subtree(&Key::from("handle"));
+    assert!(ui.captured().is_none());
+    assert!(!ui.dragging());
+    assert!(ui.drag_autoscroll().is_none());
+}
