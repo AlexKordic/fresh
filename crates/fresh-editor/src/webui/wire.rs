@@ -1315,6 +1315,20 @@ message ComposeLine {
   ComposeStop start = 6;
   ComposeStop end = 7;
   uint64 number = 8;
+  ComposeCellLine cell = 9;
+}
+// Cell fragments keep source-order numbers. A row may have columns at the
+// same y; part/parts prove adjacency within a wrapped cell despite sparse data.
+message ComposeCellLine {
+  uint64 table_start = 1;
+  uint64 row_start = 2;
+  optional uint32 column = 3; // absent for a full-width structural source row
+  uint64 part = 4;
+  uint64 parts = 5;
+  double x = 6;
+  double width = 7;
+  double row_y = 8;
+  double row_height = 9;
 }
 message ComposeStop {
   uint64 source = 1;

@@ -1403,6 +1403,32 @@ pub struct ComposeLine {
     pub end: ::core::option::Option<ComposeStop>,
     #[prost(uint64, tag = "8")]
     pub number: u64,
+    #[prost(message, optional, tag = "9")]
+    pub cell: ::core::option::Option<ComposeCellLine>,
+}
+/// Cell fragments keep source-order numbers. A row may have columns at the
+/// same y; part/parts prove adjacency within a wrapped cell despite sparse data.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ComposeCellLine {
+    #[prost(uint64, tag = "1")]
+    pub table_start: u64,
+    #[prost(uint64, tag = "2")]
+    pub row_start: u64,
+    /// absent for a full-width structural source row
+    #[prost(uint32, optional, tag = "3")]
+    pub column: ::core::option::Option<u32>,
+    #[prost(uint64, tag = "4")]
+    pub part: u64,
+    #[prost(uint64, tag = "5")]
+    pub parts: u64,
+    #[prost(double, tag = "6")]
+    pub x: f64,
+    #[prost(double, tag = "7")]
+    pub width: f64,
+    #[prost(double, tag = "8")]
+    pub row_y: f64,
+    #[prost(double, tag = "9")]
+    pub row_height: f64,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct ComposeStop {

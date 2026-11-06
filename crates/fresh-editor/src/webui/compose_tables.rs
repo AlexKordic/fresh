@@ -110,6 +110,11 @@ mod tests {
         let snapshot = tables.snapshot(text, last..text.len(), &[]);
         assert_eq!(snapshot[0].rows.len(), 1);
         assert_eq!(snapshot[0].rows[0].start, last);
+        assert_eq!(
+            snapshot[0].rows[0].previous,
+            Some(text.find("|x|").unwrap())
+        );
+        assert_eq!(snapshot[0].rows[0].next, None);
         let p = Projection::new(
             &text[last..],
             last,
@@ -134,6 +139,10 @@ pub(crate) struct Row {
     /// Structural source editing, including the alignment delimiter line.
     pub source: bool,
     pub cells: Vec<Cell>,
+    /// Parser-owned neighbors, including rows outside the published window.
+    /// These stay on the backend; native geometry addresses rows by source.
+    pub previous: Option<usize>,
+    pub next: Option<usize>,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -282,6 +291,24 @@ impl Tables {
                 if start >= window.end || table.source.end <= window.start {
                     return None;
                 }
+                let separator = Self::separator(text, table);
+                let reveal_separator = cursors.iter().any(|p| separator.contains(p));
+                let mut starts: Vec<_> = table
+                    .rows
+                    .iter()
+                    .map(|row| row_start(text, &row.source))
+                    .collect();
+                if reveal_separator {
+                    starts.push(separator.start);
+                    starts.sort_unstable();
+                }
+                let neighbors = |start| {
+                    let index = starts.binary_search(&start).unwrap();
+                    (
+                        index.checked_sub(1).map(|i| starts[i]),
+                        starts.get(index + 1).copied(),
+                    )
+                };
                 let mut rows: Vec<_> = table
                     .rows
                     .iter()
@@ -326,13 +353,14 @@ impl Tables {
                             header: row.header,
                             source: structural,
                             cells,
+                            previous: neighbors(start).0,
+                            next: neighbors(start).1,
                         })
                     })
                     .collect();
-                let separator = Self::separator(text, table);
                 if separator.start >= window.start
                     && separator.end <= window.end
-                    && cursors.iter().any(|p| separator.contains(p))
+                    && reveal_separator
                 {
                     rows.push(Row {
                         start: separator.start,
@@ -341,6 +369,8 @@ impl Tables {
                         header: false,
                         source: true,
                         cells: Vec::new(),
+                        previous: neighbors(separator.start).0,
+                        next: neighbors(separator.start).1,
                     });
                     rows.sort_by_key(|row| row.start);
                 }

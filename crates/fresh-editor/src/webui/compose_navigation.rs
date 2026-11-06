@@ -9,6 +9,9 @@ use crate::model::event::{BufferId, CursorId, Event, LeafId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[path = "compose_navigation_cells.rs"]
+mod cells;
+
 const MAX_LINES: usize = 16_384;
 const MAX_STOPS: usize = 100_000;
 
@@ -53,6 +56,7 @@ pub(crate) struct Line {
     pub start: Stop,
     pub end: Stop,
     pub stops: Vec<Stop>,
+    cell: Option<cells::Cell>,
 }
 
 #[derive(Debug)]
@@ -66,6 +70,7 @@ pub(crate) struct Layout {
     pub total_lines: usize,
     pub height: f64,
     pub style_revision: u64,
+    bands: Vec<cells::Band>,
 }
 
 fn fields(bytes: &[u8]) -> impl Iterator<Item = Result<(u32, Field<'_>), String>> {
@@ -112,6 +117,7 @@ impl Layout {
             total_lines: 0,
             height: 0.0,
             style_revision: 0,
+            bands: Vec::new(),
         };
         let mut total_stops = 0;
         for f in fields(bytes) {
@@ -142,6 +148,7 @@ impl Layout {
                             affinity: Affinity::Upstream,
                         },
                         stops: Vec::new(),
+                        cell: None,
                     };
                     let (mut has_start, mut has_end) = (false, false);
                     for f in fields(bytes) {
@@ -166,6 +173,9 @@ impl Layout {
                                 has_end = true;
                             }
                             (8, value) => line.number = value.uint() as usize,
+                            (9, Field::Bytes(bytes)) => {
+                                line.cell = Some(cells::Cell::parse(bytes)?)
+                            }
                             _ => {}
                         }
                     }
@@ -176,13 +186,6 @@ impl Layout {
                         || line.source_start > line.source_end
                     {
                         return Err("incomplete graphical line".into());
-                    }
-                    if result
-                        .lines
-                        .last()
-                        .is_some_and(|previous| line.y < previous.y + previous.height - 0.001)
-                    {
-                        return Err("graphical lines overlap".into());
                     }
                     if result
                         .lines
@@ -210,10 +213,17 @@ impl Layout {
                 line.number >= result.total_lines
                     || line.y < 0.0
                     || line.y + line.height > result.height + 0.001
+                    || line.cell.as_ref().is_some_and(|cell| {
+                        line.number
+                            .checked_sub(cell.part)
+                            .and_then(|first| first.checked_add(cell.parts))
+                            .is_none_or(|end| end > result.total_lines)
+                    })
             })
         {
             return Err("incomplete graphical layout".into());
         }
+        result.bands = cells::bands(&result.lines, result.height)?;
         Ok(result)
     }
 
@@ -223,6 +233,7 @@ impl Layout {
         buffer: BufferId,
         source_start: usize,
         source_end: usize,
+        tables: &[super::compose_tables::Table],
     ) -> bool {
         let Some(state) = window.buffer_state(buffer) else {
             return false;
@@ -243,7 +254,8 @@ impl Layout {
                 && source.is_char_boundary(at - self.source_start)
         };
         self.lines.iter().all(|line| {
-            line.source_start >= self.source_start
+            cells::valid_source(line, tables)
+                && line.source_start >= self.source_start
                 && line.source_end <= self.source_end
                 && valid(line.source_start)
                 && valid(line.source_end)
@@ -311,6 +323,7 @@ pub(crate) struct Memory {
     pub revision: u64,
     pub affinity: Affinity,
     pub goal_x: Option<f64>,
+    pub goal_column: Option<(usize, u32)>,
 }
 
 #[derive(Clone)]
@@ -396,6 +409,7 @@ impl Session {
                     scope.buffer,
                     snapshot.source_start,
                     snapshot.source_end,
+                    &snapshot.tables,
                 )
             {
                 return Err("graphical layout does not match the source window".into());
@@ -433,6 +447,7 @@ impl Session {
             .filter(|image| image.rendered)
             .map(|image| image.start..image.end)
             .collect();
+        context.tables = snapshot.tables.clone();
         editor.active_window_mut().compose_input = Some(context);
         Ok(())
     }
@@ -480,7 +495,8 @@ impl Session {
         }
         self.pending = None;
         if let Some(state) = window.buffer_state(scope.buffer) {
-            self.regions.remove(&Identity(scope.window, scope.leaf, scope.buffer));
+            self.regions
+                .remove(&Identity(scope.window, scope.leaf, scope.buffer));
             let revision = state.buffer.version();
             let cursors = window
                 .buffers
@@ -532,6 +548,7 @@ impl Session {
                 revision,
                 affinity: input.affinity,
                 goal_x: None,
+                goal_column: None,
             },
         );
         vec![CaretState {
@@ -579,7 +596,7 @@ fn classify(action: &Action) -> Option<(Motion, bool)> {
     })
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Need {
     region: Option<usize>,
     y: Option<f64>,
@@ -610,6 +627,7 @@ pub(crate) struct InputContext {
     pub need_y: Option<f64>,
     source_revision: u64,
     images: Vec<std::ops::Range<usize>>,
+    tables: Vec<super::compose_tables::Table>,
     prepared: Option<(Action, Vec<Event>, HashMap<CursorId, Memory>)>,
 }
 
@@ -630,6 +648,7 @@ impl InputContext {
             need_y: None,
             source_revision: 0,
             images: Vec::new(),
+            tables: Vec::new(),
             prepared: None,
         }
     }
@@ -673,61 +692,23 @@ impl InputContext {
                 .line_for(from, affinity)
                 .ok_or_else(|| Need::region(from))?;
             let goal = old.and_then(|m| m.goal_x).unwrap_or(x);
-            let target_row = match motion {
-                Motion::Up if layout.lines[row].number == 0 => {
-                    if layout.source_start > 0 {
-                        return Err(Need::region(layout.source_start.saturating_sub(1)));
-                    }
-                    row
-                }
-                Motion::Up => layout
-                    .lines
-                    .iter()
-                    .position(|line| line.number + 1 == layout.lines[row].number)
-                    .ok_or_else(|| Need::y(layout.lines[row].y - 0.1))?,
-                Motion::Down if layout.lines[row].number + 1 == layout.total_lines => {
-                    if layout.source_end < layout.document_len {
-                        return Err(Need::region(layout.source_end));
-                    }
-                    row
-                }
-                Motion::Down => layout
-                    .lines
-                    .iter()
-                    .position(|line| line.number == layout.lines[row].number + 1)
-                    .ok_or_else(|| Need::y(layout.lines[row].y + layout.lines[row].height + 0.1))?,
-                Motion::PageUp | Motion::PageDown => {
-                    let y = layout.lines[row].y
-                        + if backwards {
-                            -layout.page_height
-                        } else {
-                            layout.page_height
-                        };
-                    if y < 0.0 && layout.source_start > 0 {
-                        return Err(Need::region(layout.source_start.saturating_sub(1)));
-                    }
-                    if y >= layout.height && layout.source_end < layout.document_len {
-                        return Err(Need::region(layout.source_end));
-                    }
-                    let y = y.clamp(0.0, (layout.height - 0.001).max(0.0));
-                    layout
-                        .lines
-                        .iter()
-                        .position(|line| y >= line.y && y < line.y + line.height)
-                        .ok_or_else(|| Need::y(y))?
-                }
-                _ => row,
-            };
+            let previous_column = old
+                .filter(|m| m.position == from)
+                .and_then(|m| m.goal_column);
+            let column = previous_column
+                .filter(|(table, _)| {
+                    layout.lines[row]
+                        .cell
+                        .as_ref()
+                        .is_some_and(|c| c.table == *table)
+                })
+                .map(|(_, column)| column);
+            let target_row = layout.target_row(row, motion, goal, &self.tables, column)?;
             let target = match motion {
                 Motion::Start => layout.lines[row].start,
                 Motion::End => layout.lines[row].end,
                 _ if target_row == row && backwards => layout.lines[row].start,
-                _ if target_row == row
-                    && !backwards
-                    && layout.lines[row].number + 1 == layout.total_lines =>
-                {
-                    layout.lines[row].end
-                }
+                _ if target_row == row && !backwards && layout.at_end(row) => layout.lines[row].end,
                 _ => layout.nearest(target_row, goal),
             };
             let new_anchor = if select {
@@ -753,6 +734,11 @@ impl InputContext {
                     revision,
                     affinity: target.affinity,
                     goal_x: vertical.then_some(goal),
+                    goal_column: if vertical {
+                        layout.column_goal(row, target_row, previous_column)
+                    } else {
+                        None
+                    },
                 },
             );
         }
@@ -855,7 +841,9 @@ pub(crate) fn object_events(window: &Window, action: &Action, events: &mut [Even
             continue;
         };
         if cursor.has_block_selection()
-            || !select && cursor.deselect_on_move && cursor.anchor.is_some_and(|a| a != cursor.position)
+            || !select
+                && cursor.deselect_on_move
+                && cursor.anchor.is_some_and(|a| a != cursor.position)
         {
             continue;
         }

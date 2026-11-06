@@ -381,6 +381,67 @@ fn rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(root:
         let mut fixture=current.clone(); fixture.asset_authority=1; fixture.asset_document=1;
         std::fs::write(path,fixture.encode_to_vec()).unwrap();
     }
+    {
+        let data=std::env::var_os("FC_COMPOSE_TABLE_LAYOUT_FILE").map(|path|std::fs::read(path).unwrap())
+            .unwrap_or_else(||include_bytes!("scene_proto/fixtures/compose-table-layout.pb").to_vec());
+        let mut geometry=pb::ComposeLayout::decode(&data[..]).unwrap();
+        let table=current.tables[0].clone();
+        let first=geometry.lines.iter().find(|line|line.cell.as_ref().is_some_and(|c|c.table_start==current.tables[0].start && c.row_start==current.tables[0].rows[0].start && c.column==Some(0))).unwrap();
+        let expected=first.start.as_ref().unwrap().source as usize;
+        geometry.page_height=first.cell.as_ref().unwrap().row_y+1.0;
+        let layout_id=geometry.id;
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:11,position:Some(0),..Default::default()});
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:12,kind:21,layout_id,layout:Some(geometry.clone()),
+            payload:pb::Action {name:"move_page_down".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+        assert_eq!(ed.active_window().active_cursors().primary().position,expected,
+            "Fresh accepts real Core Text cell geometry and pages into the expected source cell");
+        let action=|id,name:&str|pb::ComposeInput {id,kind:21,layout_id,layout:Some(geometry.clone()),
+            payload:pb::Action {name:name.into(),..Default::default()}.encode_to_vec(),..Default::default()};
+        let header=geometry.lines.iter().find(|line|line.cell.as_ref().is_some_and(|c|c.row_start==table.rows[0].start && c.column==Some(1))).unwrap();
+        let parts=geometry.lines.iter().find_map(|line|line.cell.as_ref().filter(|c|c.row_start==table.rows[1].start && c.column==Some(1))).unwrap().parts;
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:13,position:Some(header.start.as_ref().unwrap().source),..Default::default()});
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(14,"move_down"));
+        let cursor=|ed:&fresh::app::Editor|ed.active_window().active_cursors().primary().position as u64;
+        let owned=|position:u64,row:usize|table.rows[row].cells[1].start<=position && position<=table.rows[row].cells[1].end;
+        assert!(owned(cursor(&ed),1),"Down stays in the second column");
+        let mut id=15;
+        for _ in 1..parts {
+            rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(id,"move_down")); id+=1;
+            assert!(owned(cursor(&ed),1),"wrapped cell lines precede the next logical row");
+        }
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(id,"move_down")); id+=1;
+        assert!(owned(cursor(&ed),2),"the next row keeps the logical column");
+        let anchor=cursor(&ed);
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(id,"select_down"));
+        assert_eq!(cursor(&ed),table.rows[3].content_end,"a missing cell enters its real structural source");
+        assert_eq!(ed.active_window().active_cursors().primary().anchor,Some(anchor as usize));
+        assert!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().tables[0].rows[3].source);
+        if let Some(path)=std::env::var_os("FC_COMPOSE_TABLE_MISSING_SCENE_FILE") {
+            let mut fixture=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().clone(); fixture.asset_authority=1; fixture.asset_document=1;
+            std::fs::write(path,fixture.encode_to_vec()).unwrap();
+        }
+        let data=std::env::var_os("FC_COMPOSE_TABLE_SOURCE_LAYOUT_FILE").map(|path|std::fs::read(path).unwrap())
+            .unwrap_or_else(||include_bytes!("scene_proto/fixtures/compose-table-source-layout.pb").to_vec());
+        let source_geometry=pb::ComposeLayout::decode(&data[..]).unwrap();
+        assert_ne!(source_geometry.style_revision,geometry.style_revision,"exercise a pixel-goal reset at source reveal");
+        let mut invalid=source_geometry.clone();
+        invalid.lines.iter_mut().find(|line|line.cell.as_ref().is_some_and(|c|c.row_start==table.rows[0].start && c.column==Some(2)))
+            .unwrap().cell.as_mut().unwrap().column=Some(99);
+        let mut bad=App::connect(&path);
+        bad.send(16,pb::ClientHello {version:1,rich_compose:true,measured_tables:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+        let scene=ready_scene(&mut bridge,&mut ed,&mut bad);
+        let pane=scene.panes.iter().find_map(|p|p.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+        let before=cursor(&ed);
+        bad.send(27,pb::ComposeInput {id:1,scope:Some(pane_scope(scene.window_id.unwrap(),pane)),kind:21,layout_id:invalid.id,layout:Some(invalid),
+            payload:pb::Action {name:"move_down".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+        settle_bridge(&mut bridge,&mut ed);
+        let (kind,payload)=bad.receive().unwrap(); assert_eq!(kind,3);
+        assert!(pb::Error::decode(&payload[..]).unwrap().reason.contains("does not match"));
+        assert_eq!(cursor(&ed),before,"foreign cell ownership cannot move a cursor");
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:id+1,kind:21,layout_id:source_geometry.id,layout:Some(source_geometry),
+            payload:pb::Action {name:"move_down".into(),..Default::default()}.encode_to_vec(),..Default::default()});
+        assert!(owned(cursor(&ed),4),"the logical column survives full-width source reveal and pixel-goal reset");
+    }
     // A legacy rich client and the table client share source/history, while
     // each keeps the representation it negotiated in its own hello.
     for _ in 0..4 {
@@ -391,6 +452,7 @@ fn rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(root:
     let old=legacy.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
     assert!(old.tables.is_empty());
     assert!(old.text.contains("| Text | Value | Image |"));
+    assert_eq!(text(&ed),original,"table navigation and selection do not rewrite source");
 }
 
 fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,work:&std::path::Path) {
@@ -1301,7 +1363,7 @@ fn rich_navigation_uses_measured_lines_after_resolving_a_key_chord(root: &std::p
         let mut stops: Vec<_> = points.into_iter().map(|(s,x)| stop(s,x,0)).collect();
         stops.push(last.clone());
         pb::ComposeLine { number, y, height, source_start: start as u64, source_end: end as u64,
-            start: Some(first), end: Some(last), stops }
+            start: Some(first), end: Some(last), stops, cell: None }
     };
     let mut body: Vec<(usize,f64)> = Vec::new();
     let mut x = 0.0;
