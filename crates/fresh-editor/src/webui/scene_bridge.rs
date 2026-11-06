@@ -47,7 +47,10 @@ const FRAMES_AHEAD: u64 = 2;
 /// The native protocol accepts 16 MiB messages and permits two outstanding
 /// frames. Its queue must not inherit the browser's smaller 8 MiB cap.
 /// A TLV header uses at most two ten-byte varints.
-const OUTBUF_CAP: usize = (wire::MAX_PAYLOAD + 20) * FRAMES_AHEAD as usize;
+/// Reserve one separately acknowledged index chunk and one retirement notice
+/// without borrowing either render frame's allowance.
+const OUTBUF_CAP: usize = (wire::MAX_PAYLOAD + 20) * FRAMES_AHEAD as usize
+    + (super::compose_index::MAX_PAYLOAD + 20) * 2;
 
 #[cfg(test)]
 #[test]
@@ -106,6 +109,7 @@ pub struct SceneBridge {
 
 /// One connected app.
 struct SceneClient {
+    index: super::compose_index::Session,
     id: u64,
     stream: UnixStream,
     /// Bytes read and not yet a whole message.
@@ -472,6 +476,17 @@ impl SceneBridge {
     /// apps shrank (one stopped reading for too long), so the host refits.
     pub fn maintain(&mut self, editor: &mut Editor) -> bool {
         let before = self.clients.len();
+        for client in &mut self.clients {
+            if client.hello_sent && client.outbuf.len() - client.out_start <= wire::MAX_PAYLOAD {
+                if let Some(chunk) = client.index.next(editor, &self.compose) {
+                    use wire::Message;
+                    client.body.clear();
+                    chunk.encode(&mut client.body);
+                    debug_assert!(client.body.len() <= super::compose_index::MAX_PAYLOAD);
+                    client.queue(kind::COMPOSE_INDEX_CHUNK);
+                }
+            }
+        }
         self.clients.retain_mut(|c| match c.flush() {
             Ok(()) => true,
             Err(e) => {
@@ -514,6 +529,7 @@ fn tune(stream: &UnixStream) {
 impl SceneClient {
     fn new(id: u64, stream: UnixStream) -> Self {
         Self {
+            index: Default::default(),
             id,
             stream,
             inbuf: Vec::new(),
@@ -1118,6 +1134,12 @@ impl SceneClient {
                         self.telemetry = v.flag();
                     }
                 }
+            }
+            kind::COMPOSE_INDEX_REQUEST => {
+                if !self.rich_compose {
+                    return Err("document navigation requires rich_compose in hello".into());
+                }
+                self.index.handle(super::compose_index::Request::parse(payload).map_err(w)?);
             }
             kind::APPLIED => {
                 for f in Reader::new(payload) {

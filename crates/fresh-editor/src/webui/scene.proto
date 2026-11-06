@@ -538,6 +538,44 @@ message ComposeCaret {
   uint32 affinity = 3;
 }
 
+// Source ownership for a complete document navigation generation.
+message ComposeIndexOwner {
+  uint64 window = 1;
+  uint64 leaf = 2;
+  uint64 buffer = 3;
+  uint64 epoch = 4;
+  uint64 revision = 5;
+  uint64 authority = 6;
+  uint64 document = 7;
+  uint64 length = 8;
+}
+
+// A complete label can span parts; offsets and lengths count UTF-8 bytes.
+// kind: heading levels 1-6, link 16, image 17. No target URI or image data.
+message ComposeIndexPart {
+  uint64 index = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+  uint32 kind = 4;
+  uint64 label_offset = 5;
+  string label = 6;
+  bool label_done = 7;
+  uint64 label_length = 8;
+}
+
+// Type 4: independently acknowledged metadata, never a render Frame.
+// At most 128 KiB; errors discard the generation rather than its tail.
+message ComposeIndexChunk {
+  uint64 id = 1;
+  ComposeIndexOwner owner = 2;
+  uint64 total_entries = 3;
+  uint64 label_bytes = 4;
+  uint64 sequence = 5;
+  repeated ComposeIndexPart parts = 6;
+  bool done = 7;
+  string error = 8;
+}
+
 // A line between panes.
 message Separator {
   bool vertical = 1;
@@ -820,6 +858,8 @@ message ServerHello {
   bool native_popup_projection = 4;
   // Atomic, revisioned source selection groups in ComposeInput field 22.
   bool compose_source_selections = 5;
+  // Complete document navigation inventories, independently streamed as type 4.
+  bool compose_semantic_index = 6;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -892,6 +932,14 @@ message ComposeInput {
 message ComposeSelectionTarget {
   optional uint64 position = 1;
   optional uint64 anchor = 2;
+}
+// Type 31: exactly one of owner (subscribe), cancel or applied_sequence.
+// IDs increase per client; at most one inventory and one unacknowledged chunk.
+message ComposeIndexRequest {
+  uint64 id = 1;
+  ComposeIndexOwner owner = 2;
+  bool cancel = 3;
+  optional uint64 applied_sequence = 4;
 }
 // Source carets captured with the input's source_revision (or scope revision).
 // A receipt reports only IDs whose unchanged mapped ranges match the live

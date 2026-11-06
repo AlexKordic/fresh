@@ -871,6 +871,68 @@ pub struct ComposeCaret {
     #[prost(uint32, tag = "3")]
     pub affinity: u32,
 }
+/// Source ownership for a complete document navigation generation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeIndexOwner {
+    #[prost(uint64, tag = "1")]
+    pub window: u64,
+    #[prost(uint64, tag = "2")]
+    pub leaf: u64,
+    #[prost(uint64, tag = "3")]
+    pub buffer: u64,
+    #[prost(uint64, tag = "4")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "5")]
+    pub revision: u64,
+    #[prost(uint64, tag = "6")]
+    pub authority: u64,
+    #[prost(uint64, tag = "7")]
+    pub document: u64,
+    #[prost(uint64, tag = "8")]
+    pub length: u64,
+}
+/// A complete label can span parts; offsets and lengths count UTF-8 bytes.
+/// kind: heading levels 1-6, link 16, image 17. No target URI or image data.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeIndexPart {
+    #[prost(uint64, tag = "1")]
+    pub index: u64,
+    #[prost(uint64, tag = "2")]
+    pub start: u64,
+    #[prost(uint64, tag = "3")]
+    pub end: u64,
+    #[prost(uint32, tag = "4")]
+    pub kind: u32,
+    #[prost(uint64, tag = "5")]
+    pub label_offset: u64,
+    #[prost(string, tag = "6")]
+    pub label: ::prost::alloc::string::String,
+    #[prost(bool, tag = "7")]
+    pub label_done: bool,
+    #[prost(uint64, tag = "8")]
+    pub label_length: u64,
+}
+/// Type 4: independently acknowledged metadata, never a render Frame.
+/// At most 128 KiB; errors discard the generation rather than its tail.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeIndexChunk {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub owner: ::core::option::Option<ComposeIndexOwner>,
+    #[prost(uint64, tag = "3")]
+    pub total_entries: u64,
+    #[prost(uint64, tag = "4")]
+    pub label_bytes: u64,
+    #[prost(uint64, tag = "5")]
+    pub sequence: u64,
+    #[prost(message, repeated, tag = "6")]
+    pub parts: ::prost::alloc::vec::Vec<ComposeIndexPart>,
+    #[prost(bool, tag = "7")]
+    pub done: bool,
+    #[prost(string, tag = "8")]
+    pub error: ::prost::alloc::string::String,
+}
 /// A line between panes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Separator {
@@ -1367,6 +1429,9 @@ pub struct ServerHello {
     /// Atomic, revisioned source selection groups in ComposeInput field 22.
     #[prost(bool, tag = "5")]
     pub compose_source_selections: bool,
+    /// Complete document navigation inventories, independently streamed as type 4.
+    #[prost(bool, tag = "6")]
+    pub compose_semantic_index: bool,
 }
 /// Type 3: why Fresh is closing the connection.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1487,6 +1552,19 @@ pub struct ComposeSelectionTarget {
     pub position: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "2")]
     pub anchor: ::core::option::Option<u64>,
+}
+/// Type 31: exactly one of owner (subscribe), cancel or applied_sequence.
+/// IDs increase per client; at most one inventory and one unacknowledged chunk.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeIndexRequest {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub owner: ::core::option::Option<ComposeIndexOwner>,
+    #[prost(bool, tag = "3")]
+    pub cancel: bool,
+    #[prost(uint64, optional, tag = "4")]
+    pub applied_sequence: ::core::option::Option<u64>,
 }
 /// Source carets captured with the input's source_revision (or scope revision).
 /// A receipt reports only IDs whose unchanged mapped ranges match the live

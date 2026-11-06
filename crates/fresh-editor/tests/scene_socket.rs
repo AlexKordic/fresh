@@ -226,6 +226,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     assert_eq!(hello.version, 1);
     assert!(hello.compose_region_probes, "the server advertises independent region-probe support, including to legacy grid clients");
     assert!(hello.compose_source_selections, "native source selection groups are explicitly advertised");
+    assert!(hello.compose_semantic_index, "complete source navigation is explicitly advertised");
     let scene = hello.scene.unwrap();
     assert_eq!((scene.width, scene.height), (Some(u32::from(COLS)), Some(u32::from(ROWS))));
     assert_eq!(scene.rows.len(), usize::from(ROWS), "every row of the grid");
@@ -305,8 +306,71 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_table_edges_cross_disjoint_source_windows(&root,&work);
     rich_page_motion_keeps_pixel_distance_across_source_windows(&root,&work);
     rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
+    rich_semantic_navigation_streams_complete_source_independently_of_frames(&root, &work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
+}
+
+fn rich_semantic_navigation_streams_complete_source_independently_of_frames(root: &std::path::Path, work: &std::path::Path) {
+    let label = "e\u{301}東京👩🏽‍💻".repeat(8000) + " FINAL_NEEDLE";
+    let source = format!("# {label}\r\n\r\n{}## Offscreen heading\r\n\r\n[final link](target.md) ![final image](pic.png)\r\n",
+        "plain paragraph without semantic entries\r\n\r\n".repeat(3000));
+    let file = work.join("semantic-navigation.md"); std::fs::write(&file, &source).unwrap();
+    let mut ed = build_editor(COLS, ROWS, &[file.clone()], true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed, &json!({})); }
+    apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));
+    let mut bridge = SceneBridge::bind(&root.join("semantic-navigation.sock"), &ed).unwrap();
+    let mut app = App::connect(&root.join("semantic-navigation.sock"));
+    app.send(16, pb::ClientHello { version: 1, rich_compose: true, ..Default::default() });
+    settle_bridge(&mut bridge, &mut ed); ready_scene(&mut bridge, &mut ed, &mut app);
+    let pane = app.panes.iter().find(|p|p.compose.is_some()).unwrap().clone();
+    let compose = pane.compose.unwrap();
+    assert!(compose.source_end < source.len() as u64, "navigation must exceed the projection window");
+    let owner = pb::ComposeIndexOwner { window: app.window, leaf: pane.leaf, buffer: pane.buffer.unwrap(),
+        epoch: compose.viewport.unwrap().epoch, revision: compose.buffer_revision,
+        authority: compose.asset_authority, document: compose.asset_document, length: source.len() as u64 };
+    let receive = |app: &mut App| -> pb::ComposeIndexChunk {
+        for _ in 0..30 {
+            let (kind, payload) = app.receive().expect("index chunk or frame");
+            match kind {
+                4 => { assert!(payload.len() <= 128 << 10); return pb::ComposeIndexChunk::decode(&payload[..]).unwrap(); }
+                2 => { let frame = pb::Frame::decode(&payload[..]).unwrap(); app.observe(&frame); app.send(26, pb::Applied { seq: frame.seq }); }
+                _ => panic!("unexpected kind {kind}"),
+            }
+        }
+        panic!("index chunk was not delivered");
+    };
+    app.send(31, pb::ComposeIndexRequest { id:1, owner:Some(owner.clone()), ..Default::default() });
+    settle_bridge(&mut bridge, &mut ed);
+    let mut chunk = receive(&mut app); assert!(!chunk.done); assert_eq!(chunk.sequence,0);
+    // The independent stream does not block ordinary rendering, and Applied
+    // for a render frame does not release another index chunk.
+    app.send(17, pb::Key { key:"ArrowRight".into(), ..Default::default() });
+    settle_bridge(&mut bridge, &mut ed);
+    let frame = app.frame().expect("a normal key renders while index acknowledgment is withheld");
+    app.send(26, pb::Applied { seq: frame.seq });
+    settle_bridge(&mut bridge, &mut ed);
+    while let Some((kind,payload)) = app.receive() {
+        assert_eq!(kind,2,"no second index chunk before its own acknowledgment");
+        let frame=pb::Frame::decode(&payload[..]).unwrap(); app.observe(&frame); app.send(26,pb::Applied {seq:frame.seq});
+    }
+    let mut names:Vec<String>=Vec::new();
+    loop {
+        assert_eq!(chunk.owner.as_ref(),Some(&owner)); assert!(chunk.error.is_empty()); assert_eq!(chunk.total_entries,4);
+        for part in &chunk.parts {
+            if part.index as usize == names.len() { names.push(String::new()); }
+            let name=&mut names[part.index as usize]; assert_eq!(part.label_offset as usize,name.len()); name.push_str(&part.label);
+        }
+        app.send(31,pb::ComposeIndexRequest { id:1,applied_sequence:Some(chunk.sequence),..Default::default() });
+        if chunk.done {break;}
+        settle_bridge(&mut bridge,&mut ed); chunk=receive(&mut app);
+    }
+    assert_eq!(names,[label,"Offscreen heading".into(),"final link".into(),"final image".into()]);
+    assert_eq!(std::fs::read(&file).unwrap(),source.as_bytes(),"navigation never rewrites Markdown");
+    app.send(31,pb::ComposeIndexRequest { id:2,owner:Some(owner),..Default::default() });
+    settle_bridge(&mut bridge,&mut ed); assert!(!receive(&mut app).done);
+    apply_step(&mut ed,&json!({"type":"changed"})); settle_bridge(&mut bridge,&mut ed);
+    let retired=receive(&mut app); assert_eq!(retired.id,2); assert!(retired.done); assert!(!retired.error.is_empty());
 }
 
 fn scoped_compose_commands_follow_their_window_and_buffer_lifetime(root: &std::path::Path) {

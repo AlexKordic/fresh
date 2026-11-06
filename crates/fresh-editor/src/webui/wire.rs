@@ -36,6 +36,7 @@ pub(crate) mod kind {
     pub const SERVER_HELLO: u64 = 1;
     pub const FRAME: u64 = 2;
     pub const ERROR: u64 = 3;
+    pub const COMPOSE_INDEX_CHUNK: u64 = 4;
     pub const CLIENT_HELLO: u64 = 16;
     pub const KEY: u64 = 17;
     pub const MOUSE: u64 = 18;
@@ -51,6 +52,7 @@ pub(crate) mod kind {
     pub const COMPOSE_ASSET: u64 = 28;
     pub const COMPOSE_VIEWPORT_REQUEST: u64 = 29;
     pub const POPUP_POINTER: u64 = 30;
+    pub const COMPOSE_INDEX_REQUEST: u64 = 31;
 }
 
 /// The protocol version a client's hello must name.
@@ -790,6 +792,7 @@ use super::compose_assets::Chunk;
 use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewportReply};
 use super::compose_tables::{Measurement as ComposeTableMeasurement, Column as ComposeTableColumn, Sample as ComposeTableSample, Style as ComposeTableStyle};
 use super::compose::{EditReceipt, InputReply};
+use super::compose_index::{Owner as IndexOwner, Part as IndexPart, Chunk as IndexChunk};
 use super::compose_navigation::CaretState;
 use crate::view::scene::{
     ContextMenuView, EntryDialogView, FileExplorerView, FileRow, KbConfirm, KbEditDialog, KbRow,
@@ -1039,6 +1042,24 @@ proto! {
         5 pane: ComposePane, 6 cursors: repeated uint64, 7 preserved_cursors: repeated uint64,
     }
     CaretState as ComposeCaret { 1 id: uint64, 2 position: uint64, 3 affinity: uint32 }
+    /// Source ownership for a complete document navigation generation.
+    IndexOwner as ComposeIndexOwner {
+        1 window: uint64, 2 leaf: uint64, 3 buffer: uint64, 4 epoch: uint64,
+        5 revision: uint64, 6 authority: uint64, 7 document: uint64, 8 length: uint64,
+    }
+    /// A complete label can span parts; offsets and lengths count UTF-8 bytes.
+    /// kind: heading levels 1-6, link 16, image 17. No target URI or image data.
+    IndexPart as ComposeIndexPart {
+        1 index: uint64, 2 start: uint64, 3 end: uint64, 4 kind: uint32,
+        5 label_offset: uint64, 6 label: string, 7 label_done: bool, 8 label_length: uint64,
+    }
+    /// Type 4: independently acknowledged metadata, never a render Frame.
+    /// At most 128 KiB; errors discard the generation rather than its tail.
+    IndexChunk as ComposeIndexChunk {
+        1 id: uint64, 2 owner: ComposeIndexOwner, 3 total_entries: uint64,
+        4 label_bytes: uint64, 5 sequence: uint64, 6 parts: repeated ComposeIndexPart,
+        7 done: bool, 8 error: string,
+    }
     /// A line between panes.
     SeparatorModel as Separator { 1 vertical: bool, 2 x: uint32, 3 y: uint32, 4 len: uint32 }
     /// The colors chrome is drawn with, 0xRRGGBB, each left out for the default.
@@ -1282,6 +1303,8 @@ message ServerHello {
   bool native_popup_projection = 4;
   // Atomic, revisioned source selection groups in ComposeInput field 22.
   bool compose_source_selections = 5;
+  // Complete document navigation inventories, independently streamed as type 4.
+  bool compose_semantic_index = 6;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -1354,6 +1377,14 @@ message ComposeInput {
 message ComposeSelectionTarget {
   optional uint64 position = 1;
   optional uint64 anchor = 2;
+}
+// Type 31: exactly one of owner (subscribe), cancel or applied_sequence.
+// IDs increase per client; at most one inventory and one unacknowledged chunk.
+message ComposeIndexRequest {
+  uint64 id = 1;
+  ComposeIndexOwner owner = 2;
+  bool cancel = 3;
+  optional uint64 applied_sequence = 4;
 }
 // Source carets captured with the input's source_revision (or scope revision).
 // A receipt reports only IDs whose unchanged mapped ranges match the live
@@ -1893,6 +1924,7 @@ impl ClientScene {
         field::uint(out, 3, 1);
         field::uint(out, 4, 1);
         field::uint(out, 5, 1);
+        field::uint(out, 6, 1);
     }
 }
 

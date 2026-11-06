@@ -35,6 +35,9 @@ pub(super) mod links;
 mod selection;
 pub(crate) use selection::Target as SelectionTarget;
 
+#[path = "compose_semantics.rs"]
+pub(super) mod semantics;
+
 #[cfg(test)]
 #[path = "compose_profile.rs"]
 mod profile;
@@ -827,6 +830,7 @@ pub(crate) struct ComposePane {
 }
 
 struct Document {
+    semantics: Arc<semantics::Inventory>,
     revision: u64,
     epoch: usize,
     text: Arc<String>,
@@ -869,6 +873,7 @@ impl Document {
             revision,
             epoch,
             text: Arc::new(text),
+            semantics: Default::default(),
             text_index: index,
             spans: Vec::new(),
             images: Vec::new(),
@@ -902,6 +907,7 @@ impl Document {
             return None;
         }
         let mut spans = Vec::new();
+        let mut semantics = semantics::Collector::default();
         // Repeated reference links share one parsed destination allocation.
         let mut link_targets: HashSet<Arc<str>> = HashSet::new();
         let mut images = Vec::new();
@@ -923,6 +929,12 @@ impl Document {
                 return None;
             }
             tables.event(&text, &event, &range);
+            semantics.event(&event, &range);
+            if let Some(image) = image_stack.last_mut() {
+                if let Some(value) = semantics::plain_text(&event) {
+                    image.alt.push_str(&value);
+                }
+            }
             tight_flows.event(&text, &event, &range);
             // Use the parser's item ownership and inline ranges. Tight lists
             // have no Paragraph event; task markers precede their body. An
@@ -1001,11 +1013,8 @@ impl Document {
                     });
                 }
                 Event::End(TagEnd::CodeBlock) => active_code = None,
-                Event::Code(text) => {
+                Event::Code(_) => {
                     role = 7;
-                    if let Some(image) = image_stack.last_mut() {
-                        image.alt.push_str(&text);
-                    }
                 }
                 Event::Start(Tag::Table(_)) => role = 8,
                 Event::Start(Tag::BlockQuote(_)) => role = 9,
@@ -1056,12 +1065,9 @@ impl Document {
                         source_preview: false,
                     });
                 }
-                Event::Text(text) => {
+                Event::Text(_) => {
                     if let Some(index) = active_code {
                         code[index].content.push(range.clone());
-                    }
-                    if let Some(image) = image_stack.last_mut() {
-                        image.alt.push_str(&text);
                     }
                 }
                 Event::End(TagEnd::Image) => {
@@ -1135,6 +1141,7 @@ impl Document {
         Some(Self {
             revision,
             epoch,
+            semantics: Arc::new(semantics.finish()),
             text_index,
             text,
             spans,
@@ -1634,6 +1641,20 @@ fn source_line_has_cursor(text: &str, position: usize, cursors: &[usize]) -> boo
     })
 }
 
+fn document_identity(
+    path: Option<&std::path::Path>,
+    buffer: usize,
+    authority: u64,
+    epoch: usize,
+) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hash);
+    buffer.hash(&mut hash);
+    authority.hash(&mut hash);
+    epoch.hash(&mut hash);
+    hash.finish()
+}
+
 pub(super) fn source_line_end(text: &str, position: usize) -> usize {
     let mut end = text[position..]
         .find(['\r', '\n'])
@@ -1694,6 +1715,66 @@ pub(crate) struct ComposeCache {
 }
 
 impl ComposeCache {
+    /// A read-only complete document snapshot, independent of this client's
+    /// displayed source window. Main scene gathering prepares the cache.
+    pub(crate) fn semantic_inventory(
+        &self,
+        editor: &Editor,
+        owner: &super::compose_index::Owner,
+    ) -> Result<Option<Arc<semantics::Inventory>>, String> {
+        if !(InputTarget {
+            id: 0,
+            scope: owner.scope(),
+            epoch: owner.epoch,
+            pointer: true,
+        })
+        .valid(editor)
+        {
+            return Err("Document navigation source was closed or replaced.".into());
+        }
+        let window = editor.active_window();
+        let state = window.buffer_state(BufferId(owner.buffer)).unwrap();
+        let authority = self
+            .authorities
+            .get(&owner.window)
+            .filter(|(fs, generation)| {
+                *generation == owner.authority
+                    && fs
+                        .upgrade()
+                        .is_some_and(|fs| Arc::ptr_eq(&fs, &window.authority().filesystem))
+            })
+            .ok_or("Document navigation authority changed.")?
+            .1;
+        if state.buffer.version() != owner.revision
+            || state.buffer.len() != owner.length
+            || document_identity(
+                state.buffer.file_path(),
+                owner.buffer,
+                authority,
+                owner.epoch,
+            ) != owner.document
+        {
+            return Err("Document navigation source changed; request its current revision.".into());
+        }
+        let Some(document) = self
+            .documents
+            .get(&(owner.window, owner.buffer))
+            .filter(|doc| doc.revision == owner.revision && doc.epoch == owner.epoch)
+        else {
+            return Ok(None);
+        };
+        if let Some(error) = &document.parse_error {
+            return Err(error.clone());
+        }
+        if !document.parsed {
+            return Ok(None);
+        }
+        if let Some(error) = &document.semantics.error {
+            return Err(error.clone());
+        }
+        Ok(Some(Arc::clone(&document.semantics)))
+    }
+
     pub fn gather_at(
         &mut self,
         editor: &mut Editor,
@@ -1797,12 +1878,12 @@ impl ComposeCache {
         let readiness = &mut window.compose_readiness;
         let state = window.buffers.get_mut(&buffer)?;
         let revision = state.buffer.version();
-        let mut document_hash = std::collections::hash_map::DefaultHasher::new();
-        state.buffer.file_path().hash(&mut document_hash);
-        buffer.0.hash(&mut document_hash);
-        asset_authority.hash(&mut document_hash);
-        state.marker_list.instance_id().hash(&mut document_hash);
-        let asset_document = document_hash.finish();
+        let asset_document = document_identity(
+            state.buffer.file_path(),
+            buffer.0,
+            asset_authority,
+            state.marker_list.instance_id(),
+        );
         let key = (window_id, buffer.0);
         self.clock += 1;
         if !self
@@ -3018,6 +3099,17 @@ mod tests {
         assert_eq!(doc.images.len(), 1);
         assert_eq!(doc.images[0].target, "outer.png");
         assert_eq!(doc.images[0].alt, "outer inner");
+    }
+
+    #[test]
+    fn image_attachment_and_navigation_share_complete_parsed_alt_names() {
+        let source = "![outer *word*\n`code` ![inner](inner.png)](outer.png)\r\n";
+        let doc = Document::parse(source.into(), 0, 0, 1);
+        assert_eq!(doc.images.len(), 1);
+        assert_eq!(doc.semantics.entries.len(), 1);
+        assert_eq!(doc.images[0].alt, "outer word code inner");
+        assert_eq!(doc.images[0].alt, doc.semantics.entries[0].label);
+        assert_eq!(doc.text.as_bytes(), source.as_bytes());
     }
 
     #[test]
