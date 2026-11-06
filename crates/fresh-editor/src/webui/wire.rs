@@ -990,6 +990,7 @@ proto! {
         4 need_region: optional uint64, 5 carets: repeated ComposeCaret,
         6 need_y: optional double, 7 compose: maybe ComposePane,
         8 cancelled: bool, 9 error: string, 10 edit: maybe ComposeEditReceipt,
+        11 result: maybe ComposeEditReceipt,
     }
     /// The exact source and edited cursor set immediately after a native edit.
     /// Kept in the accepted reply, including retries of the same input ID.

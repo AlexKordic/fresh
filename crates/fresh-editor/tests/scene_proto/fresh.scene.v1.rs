@@ -776,6 +776,8 @@ pub struct InputReply {
     pub error: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "10")]
     pub edit: ::core::option::Option<ComposeEditReceipt>,
+    #[prost(message, optional, tag = "11")]
+    pub result: ::core::option::Option<ComposeEditReceipt>,
 }
 /// The exact source and edited cursor set immediately after a native edit.
 /// Kept in the accepted reply, including retries of the same input ID.

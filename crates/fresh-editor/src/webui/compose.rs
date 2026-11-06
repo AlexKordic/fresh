@@ -37,6 +37,8 @@ pub(crate) struct InputReply {
     pub carets: Vec<super::compose_navigation::CaretState>,
     pub compose: Option<ComposePane>,
     pub edit: Option<EditReceipt>,
+    /// Correlated source/cursor group after a scoped action, not edited ownership.
+    pub result: Option<EditReceipt>,
     /// Terminal outcome: this request will never be retried or applied.
     pub cancelled: bool,
     pub error: String,

@@ -479,6 +479,7 @@ message InputReply {
   bool cancelled = 8;
   string error = 9;
   ComposeEditReceipt edit = 10;
+  ComposeEditReceipt result = 11;
 }
 
 // The exact source and edited cursor set immediately after a native edit.

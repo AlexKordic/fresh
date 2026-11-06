@@ -523,6 +523,58 @@ impl SceneClient {
         result
     }
 
+    /// A snapshot of this action's resulting source and cursor group, never
+    /// reconstructed from a later scene. A tab/view/lifetime change has no
+    /// result in the original Compose owner and dependent text must recover.
+    fn input_result(
+        &self,
+        editor: &mut Editor,
+        compose: &mut super::compose::ComposeCache,
+        input: &super::compose::Input<'_>,
+    ) -> Option<super::compose::EditReceipt> {
+        let scope = input.scope?;
+        let captured = self
+            .pending_input_target
+            .filter(|target| target.id == input.id)?;
+        if !(super::compose::InputTarget {
+            id: input.id,
+            scope,
+            epoch: captured.epoch,
+            pointer: false,
+        })
+        .valid(editor)
+        {
+            return None;
+        }
+        let position = editor.active_window().active_cursors().primary().position;
+        let epoch = editor
+            .active_window()
+            .buffer_state(scope.buffer)?
+            .marker_list
+            .instance_id();
+        let mut pane = compose.gather_tables_at(
+            editor,
+            scope.leaf,
+            scope.buffer,
+            Some(position),
+            self.measured_tables,
+        )?;
+        pane.viewport =
+            super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
+        if let Some(viewport) = &pane.viewport {
+            pane.top_byte = viewport.position;
+        }
+        Some(super::compose::EditReceipt {
+            window: scope.window,
+            leaf: scope.leaf.0 .0,
+            buffer: scope.buffer.0,
+            epoch,
+            pane,
+            cursors: Vec::new(),
+            preserved_cursors: Vec::new(),
+        })
+    }
+
     fn finish_input(&mut self, reply: super::compose::InputReply) {
         if reply.accepted || reply.cancelled {
             self.last_input = self.last_input.max(reply.id);
@@ -706,7 +758,8 @@ impl SceneClient {
                             out.mutated = true;
                             self.navigation.clear();
                             let carets = self.navigation.pointer(editor, &input);
-                            self.finish_input(super::compose::InputReply { id: input.id, accepted: true, carets, ..Default::default() });
+                            let result = self.input_result(editor, compose, &input);
+                            self.finish_input(super::compose::InputReply { id: input.id, accepted: true, carets, result, ..Default::default() });
                         }
                         Ok(()) => self.cancel_input(input.id, "The clicked file is no longer available. Click again."),
                         Err(error) => self.cancel_input(input.id, &error),
@@ -779,6 +832,7 @@ impl SceneClient {
                     }
                 }
                 reply.accepted = accepted;
+                if accepted { reply.result = self.input_result(editor, compose, &input); }
                 self.finish_input(reply);
                 out.frame_owed = true;
             }
