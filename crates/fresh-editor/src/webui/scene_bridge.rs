@@ -858,6 +858,23 @@ impl SceneClient {
                     out.frame_owed = true;
                     return Ok(());
                 }
+                if !input.selection_targets.is_empty() {
+                    if !super::compose::document_keyboard(editor) {
+                        self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                    } else {
+                        match input.select(editor) {
+                            Ok(()) => {
+                                out.mutated = true;
+                                self.navigation.clear();
+                                let result = self.input_result(editor, compose, &input);
+                                self.finish_input(super::compose::InputReply { id: input.id, accepted: true, result, ..Default::default() });
+                            }
+                            Err(error) => self.cancel_input(input.id, &error),
+                        }
+                    }
+                    out.frame_owed = true;
+                    return Ok(());
+                }
                 if input.replacement.is_some() || input.text_input {
                     if !super::compose::document_keyboard(editor) {
                         self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });

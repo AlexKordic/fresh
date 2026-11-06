@@ -48,6 +48,28 @@ share one destination allocation. Native output buffering follows the native
 16 MiB message limit and two outstanding frames, independently of the browser
 bridge's smaller queue cap.
 
+### Source selection transactions
+
+The native hello advertises `compose_source_selections`. A revisioned
+`ComposeInput` can carry `selection_targets` (field 22) instead of a key,
+pointer, text or layout request. Each target contains a required UTF-8 source
+position and an optional anchor; the first target is primary. The complete
+group must contain 1–1024 nonoverlapping selections, belong to the focused
+Compose buffer/lifetime, and rebase through unchanged source ranges. Fresh
+validates every endpoint before moving any cursor. It retains the primary
+identity, allocates real secondary identities, clears obsolete navigation
+state and returns a correlated action receipt without editing source bytes.
+Selections remain available in read-only buffers. `ComposePane.editable`
+(optional field 26) separately reports whether text editing is enabled.
+Modal ownership defers the same request ID; invalid/retired source cancels it.
+
+The native accessibility setters map displayed UTF-16 ranges through the
+existing projection into this transaction. Text queued after a selection
+depends on its accepted receipt; temporary display cursor IDs never edit
+source. A missing or cancelled result retains dependent text for explicit
+recovery. These additions do not supply a document-wide semantic index or
+claim interactive VoiceOver qualification.
+
 ### Popup annotations for native Compose consumers
 
 The semantic popup projection retains its original `rect` and `content_rect`

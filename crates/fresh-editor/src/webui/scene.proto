@@ -374,6 +374,7 @@ message ComposePane {
   uint32 native_newline = 23;
   bool current_projection = 24;
   repeated ComposeHangingContext hanging_contexts = 25;
+  optional bool editable = 26;
 }
 
 // Measurement-only prefix samples; style ranges are relative display bytes.
@@ -817,6 +818,8 @@ message ServerHello {
   bool compose_region_probes = 3;
   // Separate retained popup pictures and owner-scoped projected pointer input.
   bool native_popup_projection = 4;
+  // Atomic, revisioned source selection groups in ComposeInput field 22.
+  bool compose_source_selections = 5;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -880,6 +883,15 @@ message ComposeInput {
   optional uint64 replacement_cursor = 19;
   repeated ComposeReplacementTarget replacements = 20;
   repeated ComposeCursorAnchor observed_cursors = 21;
+  // Exclusive selection intent; no key, text, pointer or geometry payload.
+  // The first target is primary. Fresh allocates secondary cursor identities.
+  repeated ComposeSelectionTarget selection_targets = 22;
+}
+// Absolute UTF-8 source endpoints from source_revision. The complete group is
+// rebased only through unchanged ranges. At most 1024 nonoverlapping targets.
+message ComposeSelectionTarget {
+  optional uint64 position = 1;
+  optional uint64 anchor = 2;
 }
 // Source carets captured with the input's source_revision (or scope revision).
 // A receipt reports only IDs whose unchanged mapped ranges match the live

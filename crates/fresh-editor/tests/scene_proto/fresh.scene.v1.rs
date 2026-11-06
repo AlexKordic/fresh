@@ -619,6 +619,8 @@ pub struct ComposePane {
     pub current_projection: bool,
     #[prost(message, repeated, tag = "25")]
     pub hanging_contexts: ::prost::alloc::vec::Vec<ComposeHangingContext>,
+    #[prost(bool, optional, tag = "26")]
+    pub editable: ::core::option::Option<bool>,
 }
 /// Measurement-only prefix samples; style ranges are relative display bytes.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1362,6 +1364,9 @@ pub struct ServerHello {
     /// Separate retained popup pictures and owner-scoped projected pointer input.
     #[prost(bool, tag = "4")]
     pub native_popup_projection: bool,
+    /// Atomic, revisioned source selection groups in ComposeInput field 22.
+    #[prost(bool, tag = "5")]
+    pub compose_source_selections: bool,
 }
 /// Type 3: why Fresh is closing the connection.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1469,6 +1474,19 @@ pub struct ComposeInput {
     pub replacements: ::prost::alloc::vec::Vec<ComposeReplacementTarget>,
     #[prost(message, repeated, tag = "21")]
     pub observed_cursors: ::prost::alloc::vec::Vec<ComposeCursorAnchor>,
+    /// Exclusive selection intent; no key, text, pointer or geometry payload.
+    /// The first target is primary. Fresh allocates secondary cursor identities.
+    #[prost(message, repeated, tag = "22")]
+    pub selection_targets: ::prost::alloc::vec::Vec<ComposeSelectionTarget>,
+}
+/// Absolute UTF-8 source endpoints from source_revision. The complete group is
+/// rebased only through unchanged ranges. At most 1024 nonoverlapping targets.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeSelectionTarget {
+    #[prost(uint64, optional, tag = "1")]
+    pub position: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub anchor: ::core::option::Option<u64>,
 }
 /// Source carets captured with the input's source_revision (or scope revision).
 /// A receipt reports only IDs whose unchanged mapped ranges match the live

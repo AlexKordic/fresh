@@ -968,6 +968,7 @@ proto! {
         22 tables: repeated ComposeTable,
         23 native_newline: uint32, 24 current_projection: bool,
         25 hanging_contexts: repeated ComposeHangingContext,
+        26 editable: optional bool,
     }
     /// Measurement-only prefix samples; style ranges are relative display bytes.
     ComposeHangingContext { 1 item_start: uint64, 2 content_start: uint64, 3 text: string,
@@ -1279,6 +1280,8 @@ message ServerHello {
   bool compose_region_probes = 3;
   // Separate retained popup pictures and owner-scoped projected pointer input.
   bool native_popup_projection = 4;
+  // Atomic, revisioned source selection groups in ComposeInput field 22.
+  bool compose_source_selections = 5;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -1342,6 +1345,15 @@ message ComposeInput {
   optional uint64 replacement_cursor = 19;
   repeated ComposeReplacementTarget replacements = 20;
   repeated ComposeCursorAnchor observed_cursors = 21;
+  // Exclusive selection intent; no key, text, pointer or geometry payload.
+  // The first target is primary. Fresh allocates secondary cursor identities.
+  repeated ComposeSelectionTarget selection_targets = 22;
+}
+// Absolute UTF-8 source endpoints from source_revision. The complete group is
+// rebased only through unchanged ranges. At most 1024 nonoverlapping targets.
+message ComposeSelectionTarget {
+  optional uint64 position = 1;
+  optional uint64 anchor = 2;
 }
 // Source carets captured with the input's source_revision (or scope revision).
 // A receipt reports only IDs whose unchanged mapped ranges match the live
@@ -1880,6 +1892,7 @@ impl ClientScene {
         field::raw_bytes(out, 2, &frame);
         field::uint(out, 3, 1);
         field::uint(out, 4, 1);
+        field::uint(out, 5, 1);
     }
 }
 

@@ -31,6 +31,10 @@ mod flow;
 #[path = "compose_links.rs"]
 pub(super) mod links;
 
+#[path = "compose_selection.rs"]
+mod selection;
+pub(crate) use selection::Target as SelectionTarget;
+
 #[cfg(test)]
 #[path = "compose_profile.rs"]
 mod profile;
@@ -95,6 +99,7 @@ pub(crate) struct Input<'a> {
     pub text_input: bool,
     pub replacements: Vec<TextReplacement>,
     pub observed_cursors: Vec<CursorAnchor>,
+    pub selection_targets: Vec<SelectionTarget>,
 }
 
 /// Event-time source ownership for carets not necessarily changed by this edit.
@@ -277,6 +282,7 @@ impl<'a> Input<'a> {
             text_input: false,
             replacements: Vec::new(),
             observed_cursors: Vec::new(),
+            selection_targets: Vec::new(),
         };
         let mut start = None;
         let mut end = None;
@@ -326,6 +332,19 @@ impl<'a> Input<'a> {
                 }
                 (21, Field::Bytes(bytes)) => {
                     input.observed_cursors.push(CursorAnchor::parse(bytes)?)
+                }
+                (22, Field::Bytes(bytes)) => {
+                    if input.selection_targets.len() >= selection::MAX_TARGETS {
+                        return Err(super::wire::WireError::InvalidField(
+                            "too many source selections",
+                        ));
+                    }
+                    input.selection_targets.push(SelectionTarget::parse(bytes)?);
+                }
+                (22, _) => {
+                    return Err(super::wire::WireError::InvalidField(
+                        "source selection target wire type",
+                    ))
                 }
                 _ => {}
             }
@@ -383,6 +402,27 @@ impl<'a> Input<'a> {
                     "observed cursors require unique native text targets",
                 ));
             }
+        }
+        if !input.selection_targets.is_empty()
+            && (input.scope.is_none()
+                || input.source_revision.is_none()
+                || input.buffer_epoch == 0
+                || input.kind != 0
+                || !input.payload.is_empty()
+                || input.position.is_some()
+                || input.attachment_start.is_some()
+                || input.extend
+                || input.count != 1
+                || input.region.is_some()
+                || input.layout.is_some()
+                || input.layout_id != 0
+                || input.replacement.is_some()
+                || input.text_input
+                || !input.observed_cursors.is_empty())
+        {
+            return Err(super::wire::WireError::InvalidField(
+                "source selection input",
+            ));
         }
         Ok(input)
     }
@@ -783,6 +823,7 @@ pub(crate) struct ComposePane {
     /// Complete source regions required by this pane's formatter, including
     /// independently prepared offscreen marker lines. Not a wire payload.
     pub format_regions: Vec<Range<usize>>,
+    pub editable: Option<bool>,
 }
 
 struct Document {
@@ -1938,6 +1979,7 @@ impl ComposeCache {
         let mut pane = ComposePane::from_projection(
             projection, doc, revision, cursors, focused, top_byte, &context, tables,
         );
+        pane.editable = Some(!state.editing_disabled);
         pane.format_regions.extend(prefixes.regions);
         if !prefixes.contexts.is_empty() {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -2089,6 +2131,7 @@ impl ComposePane {
             tables,
             hanging_contexts,
             format_regions,
+            editable: None,
         }
     }
 }
