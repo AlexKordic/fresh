@@ -15,6 +15,8 @@ pub struct ComposeViewport {
     pub epoch: u64,
     #[prost(double, tag = "6")]
     pub horizontal_offset: f64,
+    #[prost(uint64, optional, tag = "7")]
+    pub region: ::core::option::Option<u64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeViewportReply {
@@ -1465,6 +1467,9 @@ pub struct ComposeViewportRequest {
     pub epoch: u64,
     #[prost(double, tag = "7")]
     pub horizontal_offset: f64,
+    /// Optional adjacent source probe. Retain context at position while loading it.
+    #[prost(uint64, optional, tag = "8")]
+    pub region: ::core::option::Option<u64>,
 }
 /// Measured geometry belongs to this client. Reused by id until source,
 /// projection, width or fonts change. All coordinates are native points.

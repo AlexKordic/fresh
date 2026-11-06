@@ -318,8 +318,8 @@ impl SceneBridge {
                             let leaf = fresh_core::LeafId(fresh_core::SplitId(pane.leaf));
                             let buffer = crate::model::event::BufferId(buffer);
                             let viewport = super::compose_viewport::snapshot(editor, client.id, leaf, buffer);
-                            let region = viewport.map(|v| v.position);
-                            pane.compose = self.compose.gather_tables_at(editor, leaf, buffer, region, client.measured_tables, client.paragraph_windows);
+                            let region = viewport.map(|v| v.requested_region());
+                            pane.compose = self.compose.gather_tables_with_context(editor, leaf, buffer, region, client.measured_tables, client.paragraph_windows, viewport.and_then(|v| v.context()));
                             if let Some(compose) = &mut pane.compose { compose.viewport = viewport; }
                             if let Some(compose) = &mut pane.compose {
                                 for table in &mut compose.tables {
@@ -671,8 +671,13 @@ impl SceneClient {
                         return Err("image document is no longer displayed".to_string());
                     }
                     let viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
-                    let region = viewport.map(|v| v.position);
-                    let pane = compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.paragraph_windows, self.navigation.context(scope)).ok_or("image document is not composing")?;
+                    let region = viewport.map(|v| v.requested_region());
+                    let navigation = self.navigation.context(scope);
+                    let keep = match (navigation, viewport.and_then(|v| v.context())) {
+                        (Some(a), Some(b)) => Some(a.start.min(b.start)..a.end.max(b.end)),
+                        (a, b) => a.or(b),
+                    };
+                    let pane = compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.paragraph_windows, keep).ok_or("image document is not composing")?;
                     resolution_retryable = true;
                     if pane.buffer_revision != scope.revision { return Err("image source changed; request its current annotation".into()); }
                     if pane.asset_authority != request.authority { return Err("image filesystem authority changed".into()); }
@@ -793,8 +798,10 @@ impl SceneClient {
                 let mut accepted = false;
                 let current = input.scope.as_ref().and_then(|scope| {
                     let viewport = (scope.window == editor.active_window().id.0).then(|| super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer)).flatten();
-                    let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision).or(viewport.map(|v| v.position));
-                    compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.paragraph_windows, self.navigation.context(scope))
+                    let navigation = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision);
+                    let region = navigation.or(viewport.map(|v| v.requested_region()));
+                    let keep = self.navigation.context(scope).or_else(|| if navigation.is_none() { viewport.and_then(|v| v.context()) } else { None });
+                    compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.paragraph_windows, keep)
                 });
                 if current.as_ref().is_some_and(|pane| pane.ready == Some(false) && !pane.current_projection) {
                     self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });

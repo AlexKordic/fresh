@@ -16,6 +16,7 @@ message ComposeViewport {
   uint64 sequence = 4;
   uint64 epoch = 5;
   double horizontal_offset = 6;
+  optional uint64 region = 7;
 }
 
 message ComposeViewportReply {
@@ -877,6 +878,8 @@ message ComposeViewportRequest {
   double offset = 5;
   uint64 epoch = 6;
   double horizontal_offset = 7;
+  // Optional adjacent source probe. Retain context at position while loading it.
+  optional uint64 region = 8;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.

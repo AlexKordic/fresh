@@ -287,6 +287,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_navigation_uses_measured_lines_after_resolving_a_key_chord(&root, &work);
     rich_source_regions_belong_to_each_client_and_expire_after_edits(&root,&work);
     rich_viewports_are_independent_and_rebase_queued_scrolls(&root, &work);
+    rich_viewport_regions_keep_collapsed_table_context(&root, &work);
     rich_input_intents_rebase_and_cancel_when_the_view_changes(&root, &work);
     rich_images_use_binary_chunks_and_obsolete_reads_do_not_apply(&root,&work);
     rich_image_objects_select_edit_move_delete_and_undo_as_source(&root,&work);
@@ -1451,6 +1452,7 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     let epoch = initial_a.compose.unwrap().viewport.unwrap().epoch;
     let request = pb::ComposeViewportRequest {
         id: 1, scope: Some(scope_a.clone()), position: 100_000, offset: -7.5, horizontal_offset: 137.25, epoch,
+        region: Some(100_300),
         ..Default::default()
     };
     let frame = viewport_step(&mut bridge, &mut ed, &mut a, request.clone());
@@ -1461,11 +1463,13 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     assert_eq!(shown.viewport.as_ref().unwrap().position, 100_000);
     assert_eq!(shown.viewport.as_ref().unwrap().offset, -7.5);
     assert_eq!(shown.viewport.as_ref().unwrap().horizontal_offset, 137.25);
+    assert_eq!(shown.viewport.as_ref().unwrap().region, Some(100_300));
     assert_eq!(shown.cursors.iter().find(|c| c.primary).unwrap().position, 0);
     assert_eq!(shown.text_context.as_ref().unwrap(), &text_context,
         "scrolling to another source window cannot renumber the input-method context or selection");
     assert_eq!(active(&b).compose.as_ref().unwrap().viewport.as_ref().unwrap().horizontal_offset, 0.0);
     assert_eq!(active(&b).compose.unwrap().viewport.unwrap().position, 0);
+    assert_eq!(active(&b).compose.unwrap().viewport.unwrap().region, None);
     assert_eq!(ed.active_window().focused_view().viewport.top_byte(), 0, "a graphical scroll cannot move the terminal");
 
     // A scroll captured before another client inserts a multibyte prefix is
@@ -1476,12 +1480,13 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     });
     assert!(typed.input_reply.unwrap().accepted);
     assert_eq!(active(&b).compose.unwrap().viewport.unwrap().position, 0, "inserting exactly at the top does not hide the inserted text");
-    let mut queued = request.clone(); queued.id = 2; queued.position += 128;
+    let mut queued = request.clone(); queued.id = 2; queued.position += 128; queued.region = Some(100_428);
     let frame = viewport_step(&mut bridge, &mut ed, &mut a, queued.clone());
     assert!(frame.viewport_reply.unwrap().accepted);
     let current = active(&a);
     let rebased = current.compose.as_ref().unwrap().viewport.as_ref().unwrap();
     assert_eq!(rebased.position, 100_130);
+    assert_eq!(rebased.region, Some(100_430));
     assert_eq!(rebased.offset, -7.5);
     assert_eq!(rebased.horizontal_offset, 137.25);
     assert_eq!(rebased.sequence, 2);
@@ -1510,6 +1515,49 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     rich_accepted(&mut bridge, &mut ed, &mut b, &mut scope_b, pb::ComposeInput {
         id: 2, kind: 17, payload: pb::Key { key: "Escape".into(), ..Default::default() }.encode_to_vec(), ..Default::default()
     });
+}
+
+fn rich_viewport_regions_keep_collapsed_table_context(root: &std::path::Path, work: &std::path::Path) {
+    let original = "| Head | Image |\n|---|---|\n| tiny | ![p](".to_string()
+        + &"x".repeat(90_000) + ".png) |\n\n"
+        + &(0..1000).map(|i| format!("Paragraph {i} with measured café words.\n\n")).collect::<String>();
+    let file = work.join("viewport-regions.md"); std::fs::write(&file, &original).unwrap();
+    let mut ed = build_editor(COLS, ROWS, &[file.clone()], true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed, &json!({})); }
+    apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));
+    let path = root.join("viewport-regions.sock"); let mut bridge = SceneBridge::bind(&path, &ed).unwrap();
+    let mut a = App::connect(&path); let mut b = App::connect(&path);
+    for app in [&mut a, &mut b] {
+        app.send(16, pb::ClientHello { version: 1, rich_compose: true, measured_tables: true, paragraph_windows: true, ..Default::default() });
+    }
+    settle_bridge(&mut bridge, &mut ed); ready_scene(&mut bridge, &mut ed, &mut a); ready_scene(&mut bridge, &mut ed, &mut b);
+    let active = |app: &App| app.panes.iter().find(|pane| pane.compose.is_some()).unwrap().clone();
+    let initial = active(&a); let first = initial.compose.as_ref().unwrap();
+    assert!(!first.tables.is_empty()); let edge = first.source_end;
+    assert!(edge < first.document_len);
+    let scope = pane_scope(a.window, &initial); let epoch = first.viewport.as_ref().unwrap().epoch;
+    let request = pb::ComposeViewportRequest { id: 1, scope: Some(scope.clone()), position: 0, offset: -3.25,
+        epoch, region: Some(edge), ..Default::default() };
+    assert!(viewport_step(&mut bridge, &mut ed, &mut a, request.clone()).viewport_reply.unwrap().accepted);
+    let filled = active(&a).compose.unwrap();
+    assert_eq!(filled.source_start, 0); assert!(filled.source_end > edge);
+    assert!(!filled.tables.is_empty(), "loading the next region cannot drop the visible table");
+    assert_eq!(filled.viewport.as_ref().unwrap().position, 0); assert_eq!(filled.viewport.as_ref().unwrap().offset, -3.25);
+    assert_eq!(filled.viewport.as_ref().unwrap().region, Some(edge));
+    assert_eq!(filled.cursors.iter().find(|cursor| cursor.primary).unwrap().position, 0);
+    assert_eq!(active(&b).compose.as_ref().unwrap().source_end, edge);
+    assert_eq!(active(&b).compose.unwrap().viewport.unwrap().region, None);
+    let mut moved = request.clone(); moved.id = 2; moved.position = edge; moved.region = None; moved.offset = -2.0;
+    assert!(viewport_step(&mut bridge, &mut ed, &mut a, moved.clone()).viewport_reply.unwrap().accepted);
+    let forward = active(&a).compose.unwrap();
+    assert_eq!(forward.viewport.as_ref().unwrap().region, None); assert!(forward.source_start > 0);
+    moved.id = 3; moved.region = Some(edge - 1);
+    assert!(viewport_step(&mut bridge, &mut ed, &mut a, moved).viewport_reply.unwrap().accepted);
+    let backward = active(&a).compose.unwrap();
+    assert!(backward.source_start < forward.source_start); assert!(backward.source_end >= edge);
+    assert_eq!(backward.viewport.as_ref().unwrap().position, edge);
+    assert_eq!(backward.viewport.as_ref().unwrap().offset, -2.0);
+    assert_eq!(std::fs::read(file).unwrap(), original.as_bytes());
 }
 
 fn rich_accepted(bridge:&mut SceneBridge,ed:&mut fresh::app::Editor,app:&mut App,
