@@ -73,6 +73,16 @@ pub(super) struct Band {
     pub bottom: f64,
 }
 
+/// A parser-owned neighbor survives replacing the source window which held
+/// the motion's origin. Pixel line numbers do not survive that replacement.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Destination {
+    table: usize,
+    row: usize,
+    column: Option<u32>,
+    backwards: bool,
+}
+
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 0.001
 }
@@ -184,6 +194,36 @@ pub(super) fn valid_source(line: &Line, tables: &[super::super::compose_tables::
 }
 
 impl Layout {
+    pub(super) fn resume_cell(
+        &self,
+        destination: Destination,
+        goal: f64,
+        tables: &[super::super::compose_tables::Table],
+    ) -> Result<usize, Need> {
+        let result = self
+            .bands
+            .iter()
+            .find(|band| {
+                self.lines[band.lines.start]
+                    .cell
+                    .as_ref()
+                    .is_some_and(|cell| {
+                        cell.table == destination.table && cell.row == destination.row
+                    })
+            })
+            .ok_or_else(|| Need::region(destination.row))
+            .and_then(|band| {
+                self.enter(
+                    band,
+                    destination.column,
+                    goal,
+                    destination.backwards,
+                    tables,
+                )
+            });
+        result.map_err(|need| need.destination(destination))
+    }
+
     fn band_for(&self, line: usize) -> &Band {
         self.bands.iter().find(|b| b.lines.contains(&line)).unwrap()
     }
@@ -319,17 +359,16 @@ impl Layout {
                 source_row.next
             };
             if let Some(start) = neighbor {
-                let band = self
-                    .bands
-                    .iter()
-                    .find(|b| {
-                        self.lines[b.lines.start]
-                            .cell
-                            .as_ref()
-                            .is_some_and(|c| c.table == cell.table && c.row == start)
-                    })
-                    .ok_or_else(|| Need::region(start))?;
-                return self.enter(band, cell.column.or(preferred), goal, backwards, tables);
+                return self.resume_cell(
+                    Destination {
+                        table: cell.table,
+                        row: start,
+                        column: cell.column.or(preferred),
+                        backwards,
+                    },
+                    goal,
+                    tables,
+                );
             }
             // Leave the whole table, not a sibling column whose source happens
             // to precede/follow this cell in the serialized line order.
@@ -803,6 +842,45 @@ mod tests {
             need.region,
             Some(40),
             "parser adjacency survives a bounded source window"
+        );
+    }
+
+    #[test]
+    fn neighbor_destination_survives_disjoint_windows_and_a_second_sparse_measurement() {
+        let (mut origin, mut tables) = fixture();
+        origin.lines.truncate(4);
+        origin.total_lines = 4;
+        origin.source_end = 40;
+        origin.height = 50.0;
+        origin.bands = bands(&origin.lines, origin.height).unwrap();
+        tables[0].rows.truncate(1);
+        let destination = origin
+            .target_row(3, Motion::Down, 130.0, &tables, None)
+            .unwrap_err()
+            .destination
+            .unwrap();
+
+        let (mut target, tables) = fixture();
+        target.lines = target.lines[4..].to_vec();
+        target.source_start = 40;
+        target.bands = bands(&target.lines, target.height).unwrap();
+        assert_eq!(
+            target.resume_cell(destination, 130.0, &tables).unwrap(),
+            1,
+            "the origin need not remain measurable in the next source window"
+        );
+        // The desired column exists, but its leading part is absent.
+        target.lines[1].cell.as_mut().unwrap().part = 1;
+        target.lines[1].cell.as_mut().unwrap().parts = 2;
+        let need = target.resume_cell(destination, 130.0, &tables).unwrap_err();
+        assert!(need.y.is_some() && need.destination.is_some());
+        target.lines[1].cell.as_mut().unwrap().part = 0;
+        assert_eq!(
+            target
+                .resume_cell(need.destination.unwrap(), 130.0, &tables)
+                .unwrap(),
+            1,
+            "another measurement must resume the same logical destination"
         );
     }
 

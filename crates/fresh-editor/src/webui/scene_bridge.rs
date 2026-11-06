@@ -343,6 +343,9 @@ impl SceneBridge {
                                     }
                                     if let Some(reply) = client.input_reply.as_mut().filter(|reply| !reply.accepted && !reply.cancelled) {
                                         reply.compose = measurement;
+                                        // A newly ready offscreen projection must retain the
+                                        // requested focus. A later pixel request takes priority.
+                                        if reply.need_region.is_none() && reply.need_y.is_none() { reply.need_region = Some(region); }
                                         client.last_measurement = Some(fingerprint);
                                     }
                                 }

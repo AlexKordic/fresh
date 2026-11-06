@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 #[path = "compose_navigation_cells.rs"]
 mod cells;
+#[path = "compose_navigation_pending.rs"]
+mod pending;
 
 const MAX_LINES: usize = 16_384;
 const MAX_STOPS: usize = 100_000;
@@ -350,6 +352,7 @@ pub(crate) struct Session {
     cached: Option<CachedLayout>,
     memory: HashMap<CursorId, Memory>,
     pending: Option<(u64, Identity, Action)>,
+    plans: HashMap<CursorId, pending::CursorPlan>,
     regions: HashMap<Identity, (u64, usize)>,
 }
 
@@ -372,6 +375,7 @@ impl Session {
         if self.identity != Some(identity) {
             self.cached = None;
             self.memory.clear();
+            self.plans.clear();
         }
         self.identity = Some(identity);
         self.regions.insert(identity, (scope.revision, anchor));
@@ -400,6 +404,7 @@ impl Session {
             self.identity = Some(identity);
             self.cached = None;
             self.memory.clear();
+            self.plans.clear();
         }
         if let Some(bytes) = input.layout {
             let layout = Layout::parse(bytes)?;
@@ -440,6 +445,7 @@ impl Session {
             .map(|c| c.layout.clone());
         let memory = std::mem::take(&mut self.memory);
         let mut context = InputContext::new(scope.leaf, scope.buffer, layout, memory);
+        context.plans = std::mem::take(&mut self.plans);
         context.source_revision = scope.revision;
         context.images = snapshot
             .images
@@ -482,6 +488,7 @@ impl Session {
         };
         self.memory = context.memory;
         if let Some(action) = context.deferred {
+            self.plans = context.plans;
             self.pending = Some((
                 input.id,
                 Identity(scope.window, scope.leaf, scope.buffer),
@@ -494,6 +501,7 @@ impl Session {
             return reply;
         }
         self.pending = None;
+        self.plans.clear();
         if let Some(state) = window.buffer_state(scope.buffer) {
             self.regions
                 .remove(&Identity(scope.window, scope.leaf, scope.buffer));
@@ -537,6 +545,7 @@ impl Session {
         }
         self.memory.clear();
         self.pending = None;
+        self.plans.clear();
         let window = editor.active_window();
         let id = window.active_cursors().primary_id();
         let position = window.active_cursors().primary().position;
@@ -563,11 +572,12 @@ impl Session {
         self.cached = None;
         self.memory.clear();
         self.pending = None;
+        self.plans.clear();
         self.regions.clear();
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Motion {
     Up,
     Down,
@@ -600,6 +610,7 @@ fn classify(action: &Action) -> Option<(Motion, bool)> {
 struct Need {
     region: Option<usize>,
     y: Option<f64>,
+    destination: Option<cells::Destination>,
 }
 
 impl Need {
@@ -607,13 +618,20 @@ impl Need {
         Self {
             region: Some(position),
             y: None,
+            destination: None,
         }
     }
     fn y(y: f64) -> Self {
         Self {
             region: None,
             y: Some(y),
+            destination: None,
         }
+    }
+
+    fn destination(mut self, destination: cells::Destination) -> Self {
+        self.destination = Some(destination);
+        self
     }
 }
 
@@ -629,6 +647,7 @@ pub(crate) struct InputContext {
     images: Vec<std::ops::Range<usize>>,
     tables: Vec<super::compose_tables::Table>,
     prepared: Option<(Action, Vec<Event>, HashMap<CursorId, Memory>)>,
+    plans: HashMap<CursorId, pending::CursorPlan>,
 }
 
 impl InputContext {
@@ -650,99 +669,8 @@ impl InputContext {
             images: Vec::new(),
             tables: Vec::new(),
             prepared: None,
+            plans: HashMap::new(),
         }
-    }
-
-    fn plan(
-        &self,
-        window: &Window,
-        motion: Motion,
-        select: bool,
-    ) -> Result<(Vec<Event>, HashMap<CursorId, Memory>), Need> {
-        let Some(layout) = self.layout.as_ref() else {
-            return Err(Need::default());
-        };
-        let state = window.buffer_state(self.buffer).ok_or_else(Need::default)?;
-        let revision = state.buffer.version();
-        let mut events = Vec::new();
-        let mut memory = self.memory.clone();
-        for (id, cursor) in window.active_cursors().iter() {
-            let old = self
-                .memory
-                .get(&id)
-                .filter(|m| m.position == cursor.position && m.revision == revision);
-            let affinity = old.map_or(Affinity::Downstream, |m| m.affinity);
-            let backwards = matches!(motion, Motion::Up | Motion::PageUp);
-            let vertical = matches!(
-                motion,
-                Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown
-            );
-            let from = if vertical && !select && cursor.deselect_on_move {
-                cursor.anchor.map_or(cursor.position, |a| {
-                    if backwards {
-                        a.min(cursor.position)
-                    } else {
-                        a.max(cursor.position)
-                    }
-                })
-            } else {
-                cursor.position
-            };
-            let (row, x) = layout
-                .line_for(from, affinity)
-                .ok_or_else(|| Need::region(from))?;
-            let goal = old.and_then(|m| m.goal_x).unwrap_or(x);
-            let previous_column = old
-                .filter(|m| m.position == from)
-                .and_then(|m| m.goal_column);
-            let column = previous_column
-                .filter(|(table, _)| {
-                    layout.lines[row]
-                        .cell
-                        .as_ref()
-                        .is_some_and(|c| c.table == *table)
-                })
-                .map(|(_, column)| column);
-            let target_row = layout.target_row(row, motion, goal, &self.tables, column)?;
-            let target = match motion {
-                Motion::Start => layout.lines[row].start,
-                Motion::End => layout.lines[row].end,
-                _ if target_row == row && backwards => layout.lines[row].start,
-                _ if target_row == row && !backwards && layout.at_end(row) => layout.lines[row].end,
-                _ => layout.nearest(target_row, goal),
-            };
-            let new_anchor = if select {
-                Some(cursor.anchor.unwrap_or(cursor.position))
-            } else if cursor.deselect_on_move {
-                None
-            } else {
-                cursor.anchor
-            };
-            events.push(Event::MoveCursor {
-                cursor_id: id,
-                old_position: cursor.position,
-                new_position: target.source,
-                old_anchor: cursor.anchor,
-                new_anchor,
-                old_sticky_column: cursor.sticky_column,
-                new_sticky_column: None,
-            });
-            memory.insert(
-                id,
-                Memory {
-                    position: target.source,
-                    revision,
-                    affinity: target.affinity,
-                    goal_x: vertical.then_some(goal),
-                    goal_column: if vertical {
-                        layout.column_goal(row, target_row, previous_column)
-                    } else {
-                        None
-                    },
-                },
-            );
-        }
-        Ok((events, memory))
     }
 }
 

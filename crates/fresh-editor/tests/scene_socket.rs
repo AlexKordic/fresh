@@ -277,6 +277,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_native_content_is_independent_of_terminal_markdown_measure(&root,&work);
     rich_native_code_frames_reveal_and_edit_parser_owned_source(&root,&work);
     rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(&root,&work);
+    rich_table_motion_crosses_disjoint_source_windows(&root,&work);
     rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
@@ -453,6 +454,71 @@ fn rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(root:
     assert!(old.tables.is_empty());
     assert!(old.text.contains("| Text | Value | Image |"));
     assert_eq!(text(&ed),original,"table navigation and selection do not rewrite source");
+}
+
+fn rich_table_motion_crosses_disjoint_source_windows(root:&std::path::Path,work:&std::path::Path) {
+    let original="| Left | Right |\n| --- | --- |\n".to_owned()+"| "+&"x".repeat(90_000)+" | previous-value |\n| origin-left | origin-value |\n";
+    let wanted=original.find("| x").unwrap() as u64;
+    let origin_row=original.find("| origin-left").unwrap() as u64;
+    let origin=original.find("origin-value").unwrap() as u64;
+    let destination=original.find("previous-value").unwrap() as u64;
+    let file=work.join("table-windows.md"); std::fs::write(&file,&original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 {apply_step(&mut ed,&json!({}));}
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("table-windows.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,measured_tables:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let initial=ready_scene(&mut bridge,&mut ed,&mut app);
+    let pane=initial.panes.iter().find_map(|p|p.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let mut scope=pane_scope(initial.window_id.unwrap(),pane);
+    let epoch=pane.compose.as_ref().unwrap().viewport.as_ref().unwrap().epoch;
+    viewport_step(&mut bridge,&mut ed,&mut app,pb::ComposeViewportRequest {id:1,scope:Some(scope.clone()),position:origin_row,epoch,..Default::default()});
+    scope=pane_scope(app.window,app.panes.iter().find(|p|p.compose.is_some()).unwrap());
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some(origin),..Default::default()});
+    let shown=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert!(shown.source_start>=origin_row && shown.source_start>wanted);
+    let make_geometry=|id:u64,compose:&pb::ComposePane,row:u64,point:u64,number:u64,total:u64| {
+        let table=compose.tables.iter().find(|t|t.rows.iter().any(|r|r.start==row)).unwrap();
+        let cell=&table.rows.iter().find(|r|r.start==row).unwrap().cells[1];
+        let stop=pb::ComposeStop {source:point,x:110.0,affinity:0};
+        pb::ComposeLayout {id,page_height:20.0,source_start:compose.source_start,source_end:compose.source_end,
+            document_len:compose.document_len,total_lines:total,height:40.0,style_revision:1,lines:vec![pb::ComposeLine {
+                number,y:8.0,height:10.0,source_start:cell.start,source_end:cell.end,stops:vec![stop.clone()],start:Some(stop.clone()),end:Some(stop),
+                cell:Some(pb::ComposeCellLine {table_start:table.start,row_start:row,column:Some(1),part:0,parts:1,x:100.0,width:80.0,row_y:0.0,row_height:30.0})
+            }]}
+    };
+    let first=make_geometry(201,shown,origin_row,origin,1,3);
+    let action=|layout:Option<pb::ComposeLayout>|pb::ComposeInput {id:2,kind:21,layout_id:layout.as_ref().map_or(0,|l|l.id),layout,
+        payload:pb::Action {name:"select_up".into(),..Default::default()}.encode_to_vec(),..Default::default()};
+    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(Some(first))).input_reply.unwrap();
+    assert!(reply.needs_layout && !reply.accepted); assert_eq!(reply.need_region,Some(wanted));
+    assert_eq!(ed.active_window().active_cursors().primary().position as u64,origin);
+    let mut request=action(None); request.region=Some(wanted);
+    let mut reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,request).input_reply.unwrap();
+    for _ in 0..10 {
+        if reply.compose.as_ref().is_some_and(|c|c.ready!=Some(false)) {break;}
+        settle_bridge(&mut bridge,&mut ed);
+        reply=rich_reply(&mut bridge,&mut ed,&mut app,&mut scope,2).input_reply.unwrap();
+    }
+    let measured=reply.compose.as_ref().unwrap();
+    assert!(measured.ready!=Some(false));
+    assert!(measured.source_start<=wanted && wanted<measured.source_end);
+    assert!(measured.source_end<origin,"the new measurement deliberately excludes the original cursor");
+    assert_eq!(reply.need_region,Some(wanted),"the measurement reply must retain its requested anchor");
+    let target=make_geometry(202,measured,wanted,destination,3,4);
+    let mut sparse=target.clone(); sparse.total_lines=5; sparse.lines[0].cell.as_mut().unwrap().parts=2;
+    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(Some(sparse))).input_reply.unwrap();
+    assert!(reply.needs_layout && !reply.accepted); assert!(reply.need_y.is_some());
+    assert_eq!(reply.need_region,None,"a later pixel request must take priority over the old measurement anchor");
+    assert_eq!(ed.active_window().active_cursors().primary().position as u64,origin);
+    let mut target=target; target.id=203;
+    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(Some(target))).input_reply.unwrap();
+    assert!(reply.accepted,"original motion must complete: accepted={}, region={:?}, y={:?}, error={}",reply.accepted,reply.need_region,reply.need_y,reply.error);
+    assert_eq!(ed.active_window().active_cursors().primary().position as u64,destination);
+    assert_eq!(ed.active_window().active_cursors().primary().anchor,Some(origin as usize));
+    assert_eq!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().viewport.as_ref().unwrap().position,origin_row);
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
 }
 
 fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,work:&std::path::Path) {
