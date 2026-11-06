@@ -14,6 +14,8 @@ pub(crate) struct Value {
     pub affinity: u32,
     /// Caret-fragment top relative to the native content top, in points.
     pub offset: f64,
+    /// Horizontal translation of this client's native document, in points.
+    pub horizontal_offset: f64,
     pub sequence: u64,
     pub epoch: usize,
 }
@@ -40,7 +42,8 @@ impl Request {
                         usize::try_from(v.uint()).map_err(|_| "viewport position is too large")?
                 }
                 (4, v) => {
-                    value.affinity = u32::try_from(v.uint()).map_err(|_| "invalid viewport affinity")?
+                    value.affinity =
+                        u32::try_from(v.uint()).map_err(|_| "invalid viewport affinity")?
                 }
                 (5, v) => {
                     value.offset = match v {
@@ -52,6 +55,12 @@ impl Request {
                     value.epoch =
                         usize::try_from(v.uint()).map_err(|_| "viewport epoch is too large")?
                 }
+                (7, v) => {
+                    value.horizontal_offset = match v {
+                        Field::Fixed64(bits) => f64::from_bits(bits),
+                        _ => return Err(WireError::Truncated.to_string()),
+                    }
+                }
                 _ => {}
             }
         }
@@ -59,6 +68,8 @@ impl Request {
             || value.affinity > 1
             || !value.offset.is_finite()
             || value.offset.abs() > 100_000.0
+            || !value.horizontal_offset.is_finite()
+            || !(0.0..=100_000_000.0).contains(&value.horizontal_offset)
         {
             return Err("invalid graphical viewport".into());
         }
@@ -133,6 +144,7 @@ impl Registry {
             entry.instance = instance;
             entry.value.position = top;
             entry.value.offset = 0.0;
+            entry.value.horizontal_offset = 0.0;
             entry.value.affinity = 0;
             entry.value.epoch = instance;
         }
@@ -286,6 +298,35 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn horizontal_translation_is_optional_finite_nonnegative_and_bounded() {
+        use super::super::wire::field;
+        let mut base = Vec::new();
+        field::uint(&mut base, 1, 1);
+        // An empty scope is sufficient for parsing; ownership is checked by update.
+        field::raw_bytes(&mut base, 2, &[]);
+        assert_eq!(Request::parse(&base).unwrap().value.horizontal_offset, 0.0);
+        for value in [0.25, 100_000_000.0] {
+            let mut bytes = base.clone();
+            field::double(&mut bytes, 7, value);
+            assert_eq!(
+                Request::parse(&bytes).unwrap().value.horizontal_offset,
+                value
+            );
+        }
+        for value in [-0.25, f64::NAN, f64::INFINITY, 100_000_000.25] {
+            let mut bytes = base.clone();
+            field::double(&mut bytes, 7, value);
+            assert!(Request::parse(&bytes).is_err());
+        }
+        let mut bytes = base;
+        field::uint(&mut bytes, 7, 1);
+        assert!(
+            Request::parse(&bytes).is_err(),
+            "a viewport coordinate must be a double"
+        );
+    }
+
+    #[test]
     fn source_markers_survive_long_edit_sessions_and_clean_up_only_their_own_tree() {
         let mut editor = crate::webui::build_editor(80, 24, &[], false).unwrap();
         crate::webui::apply_step(&mut editor, &json!({"type":"zero\nalpha café\nomega\n"}));
@@ -309,6 +350,7 @@ mod tests {
             value: Value {
                 position: 10,
                 offset: -3.5,
+                horizontal_offset: 129.75,
                 sequence: 1,
                 ..initial
             },
@@ -331,6 +373,14 @@ mod tests {
         let after = snapshot(&mut editor, 42, leaf, buffer).unwrap();
         assert_eq!(after.position, 1110);
         assert_eq!(after.offset, -3.5);
+        assert_eq!(after.horizontal_offset, 129.75);
+        assert_eq!(
+            snapshot(&mut editor, 43, leaf, buffer)
+                .unwrap()
+                .horizontal_offset,
+            0.0,
+            "another client cannot inherit the document translation"
+        );
         assert!(
             !update(&mut editor, 42, &Request { id: 2, ..request }),
             "an unanchored request older than the ring must refresh"
@@ -388,6 +438,7 @@ mod tests {
             value: Value {
                 position: 6,
                 offset: -5.0,
+                horizontal_offset: 80.5,
                 sequence: 1,
                 ..initial
             },
@@ -399,6 +450,7 @@ mod tests {
         state.coord_map.record_barrier(revision);
         let reset = snapshot(&mut editor, 7, leaf, buffer).unwrap();
         assert_eq!(reset.offset, 0.0);
+        assert_eq!(reset.horizontal_offset, 0.0);
         assert!(!update(&mut editor, 7, &request));
     }
 }

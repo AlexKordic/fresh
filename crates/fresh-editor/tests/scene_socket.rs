@@ -1250,7 +1250,7 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     let mut scope_b = pane_scope(b.window, &active(&b));
     let epoch = initial_a.compose.unwrap().viewport.unwrap().epoch;
     let request = pb::ComposeViewportRequest {
-        id: 1, scope: Some(scope_a.clone()), position: 100_000, offset: -7.5, epoch,
+        id: 1, scope: Some(scope_a.clone()), position: 100_000, offset: -7.5, horizontal_offset: 137.25, epoch,
         ..Default::default()
     };
     let frame = viewport_step(&mut bridge, &mut ed, &mut a, request.clone());
@@ -1260,9 +1260,11 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     assert!(shown.source_start > 0 && shown.source_start <= request.position && shown.source_end >= request.position);
     assert_eq!(shown.viewport.as_ref().unwrap().position, 100_000);
     assert_eq!(shown.viewport.as_ref().unwrap().offset, -7.5);
+    assert_eq!(shown.viewport.as_ref().unwrap().horizontal_offset, 137.25);
     assert_eq!(shown.cursors.iter().find(|c| c.primary).unwrap().position, 0);
     assert_eq!(shown.text_context.as_ref().unwrap(), &text_context,
         "scrolling to another source window cannot renumber the input-method context or selection");
+    assert_eq!(active(&b).compose.as_ref().unwrap().viewport.as_ref().unwrap().horizontal_offset, 0.0);
     assert_eq!(active(&b).compose.unwrap().viewport.unwrap().position, 0);
     assert_eq!(ed.active_window().focused_view().viewport.top_byte(), 0, "a graphical scroll cannot move the terminal");
 
@@ -1281,12 +1283,13 @@ fn rich_viewports_are_independent_and_rebase_queued_scrolls(root: &std::path::Pa
     let rebased = current.compose.as_ref().unwrap().viewport.as_ref().unwrap();
     assert_eq!(rebased.position, 100_130);
     assert_eq!(rebased.offset, -7.5);
+    assert_eq!(rebased.horizontal_offset, 137.25);
     assert_eq!(rebased.sequence, 2);
     assert_eq!(ed.active_window().focused_view().viewport.top_byte(), 0);
     assert_eq!(current.compose.as_ref().unwrap().cursors.iter().find(|c| c.primary).unwrap().position, 2);
 
     // A duplicate is acknowledged without reapplying a different payload.
-    queued.position = 3; queued.offset = -99.0;
+    queued.position = 3; queued.offset = -99.0; queued.horizontal_offset = 999.0;
     assert!(viewport_step(&mut bridge, &mut ed, &mut a, queued).viewport_reply.unwrap().accepted);
     assert_eq!(active(&a).compose.unwrap().viewport.unwrap(), *rebased);
 

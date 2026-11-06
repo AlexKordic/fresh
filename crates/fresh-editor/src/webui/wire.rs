@@ -796,8 +796,8 @@ pub(crate) struct Timing {
 }
 
 proto! {
-    /// A source marker and a caret-fragment offset in native points, per client.
-    ComposeViewport { 1 position: uint64, 2 affinity: uint32, 3 offset: double, 4 sequence: uint64, 5 epoch: uint64 }
+    /// A source marker, caret-fragment offset and horizontal translation in native points, per client.
+    ComposeViewport { 1 position: uint64, 2 affinity: uint32, 3 offset: double, 4 sequence: uint64, 5 epoch: uint64, 6 horizontal_offset: double }
     ComposeViewportReply { 1 id: uint64, 2 accepted: bool }
     /// A bounded binary image payload, multiplexed with normal input/scene frames.
     Chunk as ComposeAssetChunk {
@@ -1292,6 +1292,7 @@ message ComposeViewportRequest {
   uint32 affinity = 4;
   double offset = 5;
   uint64 epoch = 6;
+  double horizontal_offset = 7;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.

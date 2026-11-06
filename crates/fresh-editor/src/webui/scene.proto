@@ -8,13 +8,14 @@ package fresh.scene.v1;
 // and Key would clash with names the app already has.
 option swift_prefix = "Wire";
 
-// A source marker and a caret-fragment offset in native points, per client.
+// A source marker, caret-fragment offset and horizontal translation in native points, per client.
 message ComposeViewport {
   uint64 position = 1;
   uint32 affinity = 2;
   double offset = 3;
   uint64 sequence = 4;
   uint64 epoch = 5;
+  double horizontal_offset = 6;
 }
 
 message ComposeViewportReply {
@@ -811,6 +812,7 @@ message ComposeViewportRequest {
   uint32 affinity = 4;
   double offset = 5;
   uint64 epoch = 6;
+  double horizontal_offset = 7;
 }
 // Measured geometry belongs to this client. Reused by id until source,
 // projection, width or fonts change. All coordinates are native points.
