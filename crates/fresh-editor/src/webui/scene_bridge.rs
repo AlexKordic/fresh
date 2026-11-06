@@ -92,6 +92,7 @@ struct SceneClient {
     telemetry: bool,
     rich_compose: bool,
     measured_tables: bool,
+    paragraph_windows: bool,
     /// Measurements already delivered for each visible pane/table identity.
     table_measurements: HashSet<(u64, u64, u64, usize, usize, u64)>,
     last_input: u64,
@@ -318,7 +319,7 @@ impl SceneBridge {
                             let buffer = crate::model::event::BufferId(buffer);
                             let viewport = super::compose_viewport::snapshot(editor, client.id, leaf, buffer);
                             let region = viewport.map(|v| v.position);
-                            pane.compose = self.compose.gather_tables_at(editor, leaf, buffer, region, client.measured_tables);
+                            pane.compose = self.compose.gather_tables_at(editor, leaf, buffer, region, client.measured_tables, client.paragraph_windows);
                             if let Some(compose) = &mut pane.compose { compose.viewport = viewport; }
                             if let Some(compose) = &mut pane.compose {
                                 for table in &mut compose.tables {
@@ -328,10 +329,11 @@ impl SceneBridge {
                                 }
                             }
                             if let Some(compose) = &pane.compose {
-                                compose_regions.push(crate::app::window::ComposeRegion {
-                                    leaf, buffer, revision: compose.buffer_revision,
-                                    source: compose.source_start..compose.source_end,
-                                });
+                                for source in &compose.format_regions {
+                                    compose_regions.push(crate::app::window::ComposeRegion {
+                                        leaf, buffer, revision: compose.buffer_revision, source: source.clone(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -344,10 +346,12 @@ impl SceneBridge {
                         let revision = editor.active_window().buffer_state(scope.buffer).map_or(0, |state| state.buffer.version());
                         if let Some(region) = client.navigation.region(scope.window, scope.leaf, scope.buffer, revision) {
                             let keep=client.navigation.context(&scope);
-                            let measurement = self.compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, Some(region), client.measured_tables, keep);
+                            let measurement = self.compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, Some(region), client.measured_tables, client.paragraph_windows, keep);
                             if let Some(compose) = &measurement {
-                                compose_regions.push(crate::app::window::ComposeRegion { leaf: scope.leaf, buffer: scope.buffer,
-                                    revision: compose.buffer_revision, source: compose.source_start..compose.source_end });
+                                for source in &compose.format_regions {
+                                    compose_regions.push(crate::app::window::ComposeRegion { leaf: scope.leaf, buffer: scope.buffer,
+                                        revision: compose.buffer_revision, source: source.clone() });
+                                }
                                 if let Some(target) = client.pending_input_target {
                                     let ready = compose.ready != Some(false);
                                     let fingerprint = (target.id, compose.buffer_revision, compose.projection_revision, compose.selection_revision, ready);
@@ -459,6 +463,7 @@ impl SceneClient {
             telemetry: false,
             rich_compose: false,
             measured_tables: false,
+            paragraph_windows: false,
             table_measurements: HashSet::new(),
             last_input: 0,
             last_input_reply: None,
@@ -560,6 +565,7 @@ impl SceneClient {
             scope.buffer,
             Some(position),
             self.measured_tables,
+            self.paragraph_windows,
         )?;
         pane.viewport =
             super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
@@ -607,13 +613,14 @@ impl SceneClient {
             if k != kind::CLIENT_HELLO {
                 return Err(format!("expected a hello, got message type {k}"));
             }
-            let (mut version, mut telemetry, mut rich_compose, mut measured_tables) = (0, false, false, false);
+            let (mut version, mut telemetry, mut rich_compose, mut measured_tables, mut paragraph_windows) = (0, false, false, false, false);
             for f in Reader::new(payload) {
                 match f.map_err(w)? {
                     (1, v) => version = v.uint(),
                     (2, v) => telemetry = v.flag(),
                     (3, v) => rich_compose = v.flag(),
                     (4, v) => measured_tables = v.flag(),
+                    (5, v) => paragraph_windows = v.flag(),
                     _ => {}
                 }
             }
@@ -625,6 +632,8 @@ impl SceneClient {
             self.rich_compose = rich_compose;
             if measured_tables && !rich_compose { return Err("measured tables require rich_compose".into()); }
             self.measured_tables = measured_tables;
+            if paragraph_windows && !rich_compose { return Err("paragraph windows require rich_compose".into()); }
+            self.paragraph_windows = paragraph_windows;
             out.frame_owed = true;
             return Ok(());
         }
@@ -663,7 +672,7 @@ impl SceneClient {
                     }
                     let viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
                     let region = viewport.map(|v| v.position);
-                    let pane = compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.navigation.context(scope)).ok_or("image document is not composing")?;
+                    let pane = compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.paragraph_windows, self.navigation.context(scope)).ok_or("image document is not composing")?;
                     resolution_retryable = true;
                     if pane.buffer_revision != scope.revision { return Err("image source changed; request its current annotation".into()); }
                     if pane.asset_authority != request.authority { return Err("image filesystem authority changed".into()); }
@@ -746,7 +755,7 @@ impl SceneClient {
                             let edit = input.scope.and_then(|scope| {
                                 let epoch = editor.active_window().buffer_state(scope.buffer)?.marker_list.instance_id();
                                 let position = editor.active_window().active_cursors().primary().position;
-                                let mut pane = compose.gather_tables_at(editor, scope.leaf, scope.buffer, Some(position), self.measured_tables)?;
+                                let mut pane = compose.gather_tables_at(editor, scope.leaf, scope.buffer, Some(position), self.measured_tables, self.paragraph_windows)?;
                                 pane.viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
                                 if let Some(viewport) = &pane.viewport { pane.top_byte = viewport.position; }
                                 Some(super::compose::EditReceipt { window: scope.window, leaf: scope.leaf.0.0, buffer: scope.buffer.0, epoch, pane, cursors, preserved_cursors })
@@ -785,7 +794,7 @@ impl SceneClient {
                 let current = input.scope.as_ref().and_then(|scope| {
                     let viewport = (scope.window == editor.active_window().id.0).then(|| super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer)).flatten();
                     let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision).or(viewport.map(|v| v.position));
-                    compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.navigation.context(scope))
+                    compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.paragraph_windows, self.navigation.context(scope))
                 });
                 if current.as_ref().is_some_and(|pane| pane.ready == Some(false) && !pane.current_projection) {
                     self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });

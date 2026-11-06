@@ -313,7 +313,7 @@ mod tests {
         let leaf = editor.active_window().effective_active_split();
         let buffer = editor.active_window().active_buffer();
         cache
-            .gather_tables_at(editor, leaf, buffer, Some(0), true)
+            .gather_tables_at(editor, leaf, buffer, Some(0), true, false)
             .unwrap()
     }
 

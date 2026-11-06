@@ -763,6 +763,9 @@ pub(crate) struct ComposePane {
     pub native_newline: u32,
     pub current_projection: bool,
     pub hanging_contexts: Vec<ComposeHangingContext>,
+    /// Complete source regions required by this pane's formatter, including
+    /// independently prepared offscreen marker lines. Not a wire payload.
+    pub format_regions: Vec<Range<usize>>,
 }
 
 struct Document {
@@ -1069,11 +1072,22 @@ impl Document {
         self.source_window_with_context(top_byte, region, None)
     }
 
+    #[cfg(test)]
     fn source_window_with_context(
         &self,
         top_byte: usize,
         region: Option<usize>,
         keep: Option<Range<usize>>,
+    ) -> Range<usize> {
+        self.source_window_policy(top_byte, region, keep, false)
+    }
+
+    fn source_window_policy(
+        &self,
+        top_byte: usize,
+        region: Option<usize>,
+        keep: Option<Range<usize>>,
+        paragraph_windows: bool,
     ) -> Range<usize> {
         let mut anchor = region.unwrap_or(top_byte).min(self.text.len());
         while !self.text.is_char_boundary(anchor) {
@@ -1085,14 +1099,20 @@ impl Document {
             }
             // Preserve paragraph joins, but do not let an unrelated preceding
             // paragraph pull the requested byte beyond the window's end.
-            let paragraph = self
-                .paragraphs
-                .iter()
-                .find(|r| r.contains(&at))
-                .map_or_else(
-                    || self.text[..at].rfind('\n').map_or(0, |n| n + 1),
-                    |r| r.start,
-                );
+            let parsed_paragraph = self.paragraphs.iter().find(|r| r.contains(&at));
+            let paragraph = parsed_paragraph.map_or_else(
+                || self.text[..at].rfind('\n').map_or(0, |n| n + 1),
+                |r| r.start,
+            );
+            // Loose-list Paragraph events provide their own complete shaping
+            // context. A capable client receives the opening marker separately.
+            // Tight lists retain their existing item context until their flow
+            // and soft-wrap continuation contract is qualified.
+            if paragraph_windows && parsed_paragraph.is_some() {
+                // Include source-owned leading whitespace so Home/Left can
+                // still address it and native hanging layout charges it once.
+                return self.text[..paragraph].rfind('\n').map_or(0, |n| n + 1);
+            }
             // Tight list paragraphs may omit Paragraph events. Retain their
             // marker context so hanging measurement is repeatable on a page.
             if self
@@ -1135,6 +1155,15 @@ impl Document {
         }
         if end < self.text.len() {
             end += self.text[end..].find('\n').map_or(0, |n| n + 1);
+        }
+        if paragraph_windows {
+            if let Some(paragraph) = self
+                .paragraphs
+                .iter()
+                .find(|r| r.start < end && end < r.end)
+            {
+                end = paragraph.end;
+            }
         }
         start..end
     }
@@ -1531,7 +1560,7 @@ impl ComposeCache {
         buffer: BufferId,
         region: Option<usize>,
     ) -> Option<ComposePane> {
-        self.gather_tables_at(editor, leaf, buffer, region, false)
+        self.gather_tables_at(editor, leaf, buffer, region, false, false)
     }
 
     pub fn gather_tables_at(
@@ -1541,8 +1570,17 @@ impl ComposeCache {
         buffer: BufferId,
         region: Option<usize>,
         measured_tables: bool,
+        paragraph_windows: bool,
     ) -> Option<ComposePane> {
-        self.gather_tables_with_context(editor, leaf, buffer, region, measured_tables, None)
+        self.gather_tables_with_context(
+            editor,
+            leaf,
+            buffer,
+            region,
+            measured_tables,
+            paragraph_windows,
+            None,
+        )
     }
 
     pub fn gather_tables_with_context(
@@ -1552,6 +1590,7 @@ impl ComposeCache {
         buffer: BufferId,
         region: Option<usize>,
         measured_tables: bool,
+        paragraph_windows: bool,
         keep: Option<Range<usize>>,
     ) -> Option<ComposePane> {
         let context = editor.get_key_context();
@@ -1672,7 +1711,7 @@ impl ComposeCache {
         }
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
-        let window = doc.source_window_with_context(top_byte, region, keep);
+        let window = doc.source_window_policy(top_byte, region, keep, paragraph_windows);
         let (mut start, mut end) = (window.start, window.end);
         // Conceal replacements must travel whole. Extend the requested slice
         // rather than clipping a range into an invalid source map.
@@ -1726,8 +1765,29 @@ impl ComposeCache {
             })
             .map(|image| image.start..image.end)
             .collect();
-        let status = status(start, end);
-        if status == Status::Ready && doc.parsed {
+        let visible_status = status(start, end);
+        let prefixes = if paragraph_windows && doc.parsed && visible_status != Status::Failed {
+            prefixes::prepare(
+                doc,
+                state,
+                readiness,
+                buffer,
+                readiness_enabled,
+                measured_tables,
+                start..end,
+                &cursor_positions,
+            )
+        } else {
+            Default::default()
+        };
+        let status = if visible_status == Status::Failed || prefixes.failed {
+            Status::Failed
+        } else if visible_status == Status::Pending || prefixes.pending {
+            Status::Pending
+        } else {
+            Status::Ready
+        };
+        if visible_status == Status::Ready && doc.parsed {
             let complete = if readiness_enabled {
                 readiness.completed_ranges(buffer)
             } else {
@@ -1774,6 +1834,16 @@ impl ComposeCache {
         let mut pane = ComposePane::from_projection(
             projection, doc, revision, cursors, focused, top_byte, &context, tables,
         );
+        pane.format_regions.extend(prefixes.regions);
+        if !prefixes.contexts.is_empty() {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            pane.projection_revision.hash(&mut hash);
+            prefixes.contexts.hash(&mut hash);
+            pane.projection_revision = hash.finish();
+            pane.hanging_contexts.extend(prefixes.contexts);
+            pane.hanging_contexts
+                .sort_by_key(|context| context.item_start);
+        }
         pane.native_newline = if state.buffer.line_ending().insertion_str() == "\r\n" {
             2
         } else {
@@ -1785,8 +1855,9 @@ impl ComposeCache {
         pane.ready = Some(status != Status::Pending && (doc.parsed || doc.parse_error.is_some()));
         // The raw source/index is sufficient for receipts, but semantic
         // geometry must wait for the worker before accepting measured actions.
-        pane.current_projection =
-            status != Status::Failed && (doc.parsed || doc.parse_error.is_some());
+        pane.current_projection = status != Status::Failed
+            && !prefixes.pending
+            && (doc.parsed || doc.parse_error.is_some());
         if status == Status::Failed {
             for image in &mut pane.images {
                 image.rendered = false;
@@ -1834,6 +1905,7 @@ impl ComposePane {
             })
             .collect();
         let hanging_contexts = prefixes::contexts(&p, &spans, &doc.text);
+        let format_regions = vec![p.source.clone()];
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         p.source.hash(&mut hash);
         doc.epoch.hash(&mut hash);
@@ -1912,6 +1984,7 @@ impl ComposePane {
             text_chunks,
             tables,
             hanging_contexts,
+            format_regions,
         }
     }
 }

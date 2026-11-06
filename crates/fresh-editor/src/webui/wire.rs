@@ -1249,6 +1249,8 @@ message ClientHello {
   bool rich_compose = 3;
   // Opt in to measured table cells; requires rich_compose.
   bool measured_tables = 4;
+  // Accept offscreen prefix samples and complete paragraph windows.
+  bool paragraph_windows = 5;
 }
 // A pane identity and the exact source/projection the client interacted with.
 message ComposeScope {

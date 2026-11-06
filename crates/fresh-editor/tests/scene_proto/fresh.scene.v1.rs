@@ -1328,6 +1328,9 @@ pub struct ClientHello {
     /// Opt in to measured table cells; requires rich_compose.
     #[prost(bool, tag = "4")]
     pub measured_tables: bool,
+    /// Accept offscreen prefix samples and complete paragraph windows.
+    #[prost(bool, tag = "5")]
+    pub paragraph_windows: bool,
 }
 /// A pane identity and the exact source/projection the client interacted with.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

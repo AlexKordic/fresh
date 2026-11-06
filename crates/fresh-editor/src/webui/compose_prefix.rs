@@ -1,7 +1,7 @@
 //! Parser-owned list-prefix samples, independent of a consumer's source slice.
 //! They are measurement inputs, never editable text or terminal columns.
 
-use super::ComposeSpan;
+use super::{ComposeSpan, Document};
 use fresh_core::compose::{Affinity, Projection};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -15,6 +15,149 @@ pub(crate) struct Context {
     pub spans: Vec<ComposeSpan>,
     /// Whether the enclosing pane's source_start is a physical line start.
     pub source_line_start: bool,
+}
+
+#[derive(Default)]
+pub(super) struct Prepared {
+    pub contexts: Vec<Context>,
+    pub regions: Vec<std::ops::Range<usize>>,
+    pub pending: bool,
+    pub failed: bool,
+}
+
+/// Independently format the opening line instead of expanding the visible
+/// window to every earlier paragraph of its list item. Whole initial physical
+/// lines and atomic replacements remain deliberate exceptions, not hard bounds.
+pub(super) fn prepare(
+    doc: &Document,
+    state: &crate::state::EditorState,
+    readiness: &mut crate::app::compose_readiness::Registry,
+    buffer: crate::model::event::BufferId,
+    readiness_enabled: bool,
+    measured_tables: bool,
+    window: std::ops::Range<usize>,
+    cursors: &[usize],
+) -> Prepared {
+    use crate::app::compose_readiness::Status;
+    let mut result = Prepared::default();
+    for item in doc.spans.iter().filter(|item| {
+        item.role == 13
+            && item.start < window.start
+            && item.end > window.start
+            && item.content_start.is_some_and(|body| body <= window.start)
+    }) {
+        let body = item.content_start.unwrap();
+        let mut start = doc.text[..item.start]
+            .rfind(['\r', '\n'])
+            .map_or(0, |at| at + 1);
+        let mut end = super::source_line_end(&doc.text, body);
+        let content_end = doc.text[start..end].trim_end_matches(['\r', '\n']).len() + start;
+        let active = state
+            .conceals
+            .query_viewport(start, end, &state.marker_list, cursors);
+        // A trailing flow join is irrelevant to the marker sample. An atomic
+        // replacement beginning in the opening line must remain complete.
+        for (range, _) in &active {
+            if range.start < content_end {
+                start = start.min(range.start);
+                end = end.max(range.end);
+            }
+        }
+        for image in doc
+            .images
+            .iter()
+            .filter(|image| image.start >= start && image.start < content_end)
+        {
+            end = end.max(image.end);
+        }
+        if doc.text.get(start..end).is_none() {
+            result.failed = true;
+            continue;
+        }
+        result.regions.push(start..end);
+        let status = if readiness_enabled {
+            readiness.demand(buffer, start..end)
+        } else {
+            Status::Ready
+        };
+        match status {
+            Status::Pending => {
+                result.pending = true;
+                continue;
+            }
+            Status::Failed => {
+                result.failed = true;
+                continue;
+            }
+            Status::Ready => {}
+        }
+        let active = state
+            .conceals
+            .query_viewport(start, end, &state.marker_list, cursors)
+            .into_iter()
+            .filter(|(range, _)| range.start >= start && range.end <= end)
+            .collect();
+        let objects = doc
+            .images
+            .iter()
+            .filter(|image| {
+                image.start >= start
+                    && image.end <= end
+                    && !cursors
+                        .iter()
+                        .any(|position| image.start < *position && *position < image.end)
+            })
+            .map(|image| image.start..image.end)
+            .collect::<Vec<_>>();
+        let revealed = doc
+            .images
+            .iter()
+            .filter(|image| {
+                image.start >= start
+                    && image.end <= end
+                    && cursors
+                        .iter()
+                        .any(|position| image.start < *position && *position < image.end)
+            })
+            .map(|image| image.start..image.end)
+            .collect::<Vec<_>>();
+        let tables = if measured_tables {
+            doc.tables.snapshot(&doc.text, start..end, cursors)
+        } else {
+            Vec::new()
+        };
+        let Some(projection) =
+            doc.project_native(start, end, cursors, &objects, &revealed, &tables, active)
+        else {
+            result.failed = true;
+            continue;
+        };
+        let spans = doc
+            .spans
+            .iter()
+            .filter(|span| span.start < end && span.end > start)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(mut context) = contexts(&projection, &spans, &doc.text)
+            .into_iter()
+            .find(|context| context.item_start == item.start)
+        {
+            context.source_line_start = physical_start(&doc.text, window.start);
+            result.contexts.push(context);
+        } else {
+            result.failed = true;
+        }
+    }
+    result.regions.sort_by_key(|range| (range.start, range.end));
+    result.regions.dedup();
+    result
+}
+
+fn physical_start(source: &str, at: usize) -> bool {
+    let previous = at.checked_sub(1).and_then(|at| source.as_bytes().get(at));
+    at == 0
+        || previous == Some(&b'\n')
+        || previous == Some(&b'\r') && source.as_bytes().get(at) != Some(&b'\n')
 }
 
 pub(super) fn contexts(p: &Projection, spans: &[ComposeSpan], source: &str) -> Vec<Context> {
@@ -74,14 +217,7 @@ pub(super) fn contexts(p: &Projection, spans: &[ComposeSpan], source: &str) -> V
     samples.sort_by_key(|(range, _, _)| (range.start, range.end));
     let mut next_style = 0;
     let mut active: Vec<usize> = Vec::new();
-    let previous = p
-        .source
-        .start
-        .checked_sub(1)
-        .and_then(|at| source.as_bytes().get(at));
-    let source_line_start = p.source.start == 0
-        || previous == Some(&b'\n')
-        || previous == Some(&b'\r') && source.as_bytes().get(p.source.start) != Some(&b'\n');
+    let source_line_start = physical_start(source, p.source.start);
     samples
         .into_iter()
         .map(|(range, body, item)| {
@@ -124,6 +260,181 @@ pub(super) fn contexts(p: &Projection, spans: &[ComposeSpan], source: &str) -> V
 mod tests {
     use super::*;
     use fresh_core::compose::Conceal;
+
+    #[test]
+    fn paragraph_windows_keep_source_indentation_and_independently_require_a_certified_marker() {
+        use crate::app::compose_readiness::{Registry, Status};
+        use crate::model::event::BufferId;
+        use crate::view::overlay::OverlayNamespace;
+        use std::sync::Arc;
+        let text = "1) **Opening** café\r\n\r\n".to_owned()
+            + &"   Paragraph 東京 👩🏽‍💻 with words that retain their complete shaping context.\r\n\r\n".repeat(1400);
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(text.len());
+        let body = text.find("**").unwrap();
+        let close = text.find("** café").unwrap();
+        let namespace = OverlayNamespace::from_string("prefix-test".into());
+        state.conceals.add(
+            &mut state.marker_list,
+            namespace.clone(),
+            body..body + 2,
+            None,
+        );
+        state
+            .conceals
+            .add(&mut state.marker_list, namespace, close..close + 2, None);
+        let doc = Document::parse(text, 0, 0, state.marker_list.instance_id());
+        let anchor = doc.text.rfind("Paragraph").unwrap();
+        let legacy = doc.source_window(0, Some(anchor));
+        let window = doc.source_window_policy(0, Some(anchor), None, true);
+        assert_eq!(legacy.start, 0);
+        assert!(window.start > body);
+        assert!(window.end - window.start < super::super::WINDOW_BYTES * 2);
+        assert!(doc.text[window.clone()].starts_with("   Paragraph"));
+        let id = BufferId(3);
+        let mut readiness = Registry::default();
+        readiness.track(id, state.marker_list.instance_id(), 0);
+        let batch = readiness
+            .begin(1, id, &[(window.start, window.end)])
+            .unwrap();
+        readiness.complete(&batch, true);
+        assert_eq!(readiness.status(id, window.clone()), Status::Ready);
+        let waiting = prepare(
+            &doc,
+            &state,
+            &mut readiness,
+            id,
+            true,
+            false,
+            window.clone(),
+            &[],
+        );
+        assert!(waiting.pending && !waiting.failed && waiting.contexts.is_empty());
+        assert_eq!(waiting.regions.len(), 1);
+        let head = waiting.regions[0].clone();
+        assert_eq!(head.start, 0);
+        assert!(head.end < window.start);
+        let batch = readiness.begin(1, id, &[(head.start, head.end)]).unwrap();
+        readiness.complete(&batch, true);
+        let ready = prepare(&doc, &state, &mut readiness, id, true, false, window, &[]);
+        assert!(!ready.pending && !ready.failed);
+        assert_eq!(ready.contexts[0].text, "1) O");
+        assert!(ready.contexts[0].source_line_start);
+        assert!(ready.contexts[0].spans.iter().any(|span| span.flags == 1));
+        // A replaced marker owner cannot borrow the earlier completion.
+        readiness.track(id, state.marker_list.instance_id() + 1, 0);
+        let replacement = prepare(
+            &doc,
+            &state,
+            &mut readiness,
+            id,
+            true,
+            false,
+            anchor..doc.text.len(),
+            &[],
+        );
+        assert!(replacement.pending && replacement.contexts.is_empty());
+    }
+
+    #[test]
+    fn paragraph_window_ends_keep_the_entire_joined_paragraph() {
+        let first = "First physical line\r\n   continued café 👩🏽‍💻 source\r\n".repeat(2200);
+        let doc = Document::parse(
+            "1) Heading\r\n\r\n   ".to_owned() + &first + "\r\n   Next paragraph\r\n",
+            0,
+            0,
+            1,
+        );
+        let paragraph = doc
+            .paragraphs
+            .iter()
+            .find(|range| range.len() > super::super::WINDOW_BYTES)
+            .unwrap();
+        let window =
+            doc.source_window_policy(paragraph.start, Some(paragraph.start + 3), None, true);
+        assert!(window.start <= paragraph.start);
+        assert!(
+            window.end >= paragraph.end,
+            "complete paragraph context is not a hard byte cutoff"
+        );
+    }
+
+    #[test]
+    fn offscreen_prefixes_keep_a_multiline_first_image_atomic() {
+        use crate::app::compose_readiness::Registry;
+        use crate::model::event::BufferId;
+        use std::sync::Arc;
+        let text = "1) ![first\n   image](image.png)\n\n".to_owned()
+            + &"   Later paragraph words.\n\n".repeat(4000);
+        let doc = Document::parse(text, 0, 0, 1);
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(doc.text.len());
+        let anchor = doc.text.rfind("Later").unwrap();
+        let window = doc.source_window_policy(0, Some(anchor), None, true);
+        let result = prepare(
+            &doc,
+            &state,
+            &mut Registry::default(),
+            BufferId(3),
+            false,
+            false,
+            window,
+            &[],
+        );
+        assert!(!result.pending && !result.failed);
+        assert_eq!(result.contexts[0].text, "1) \u{fffc}");
+        assert!(result.regions[0].end >= doc.images[0].end);
+    }
+
+    #[test]
+    fn offscreen_prefixes_keep_a_replacement_crossing_the_opening_line_boundary_whole() {
+        use crate::app::compose_readiness::Registry;
+        use crate::model::event::BufferId;
+        use crate::view::overlay::OverlayNamespace;
+        use std::sync::Arc;
+        let text = "Before\n1) Opening\n\n".to_owned() + &"   Later paragraph.\n\n".repeat(5000);
+        let doc = Document::parse(text, 0, 0, 1);
+        let item = doc.spans.iter().find(|span| span.role == 13).unwrap();
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(doc.text.len());
+        let range = item.start - 1..item.content_start.unwrap();
+        state.conceals.add(
+            &mut state.marker_list,
+            OverlayNamespace::from_string("prefix-test".into()),
+            range.clone(),
+            Some(" ".into()),
+        );
+        let anchor = doc.text.rfind("Later").unwrap();
+        let window = doc.source_window_policy(0, Some(anchor), None, true);
+        let result = prepare(
+            &doc,
+            &state,
+            &mut Registry::default(),
+            BufferId(3),
+            false,
+            false,
+            window,
+            &[],
+        );
+        assert!(!result.pending && !result.failed);
+        assert_eq!(result.contexts[0].text, " O");
+        assert!(result.regions[0].start <= range.start);
+    }
 
     #[test]
     fn samples_use_projected_prefixes_one_complete_body_grapheme_and_relative_styles() {
