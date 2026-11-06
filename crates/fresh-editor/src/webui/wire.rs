@@ -995,7 +995,7 @@ proto! {
     /// Kept in the accepted reply, including retries of the same input ID.
     EditReceipt as ComposeEditReceipt {
         1 window: uint64, 2 leaf: uint64, 3 buffer: uint64, 4 epoch: uint64,
-        5 pane: ComposePane, 6 cursors: repeated uint64,
+        5 pane: ComposePane, 6 cursors: repeated uint64, 7 preserved_cursors: repeated uint64,
     }
     CaretState as ComposeCaret { 1 id: uint64, 2 position: uint64, 3 affinity: uint32 }
     /// A line between panes.
@@ -1281,6 +1281,15 @@ message ComposeInput {
   bool text_input = 18;
   optional uint64 replacement_cursor = 19;
   repeated ComposeReplacementTarget replacements = 20;
+  repeated ComposeCursorAnchor observed_cursors = 21;
+}
+// Source carets captured with the input's source_revision (or scope revision).
+// A receipt reports only IDs whose unchanged mapped ranges match the live
+// caret and selection immediately before the native transaction.
+message ComposeCursorAnchor {
+  optional uint64 id = 1;
+  optional uint64 position = 2;
+  optional uint64 anchor = 3;
 }
 // Additional captured carets in the same atomic source transaction. An omitted
 // text uses the primary Paste payload; an explicitly empty text deletes.

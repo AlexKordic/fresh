@@ -52,6 +52,7 @@ pub(crate) struct EditReceipt {
     pub epoch: usize,
     pub pane: ComposePane,
     pub cursors: Vec<usize>,
+    pub preserved_cursors: Vec<usize>,
 }
 
 pub(crate) struct Input<'a> {
@@ -74,6 +75,45 @@ pub(crate) struct Input<'a> {
     pub replacement_cursor: Option<usize>,
     pub text_input: bool,
     pub replacements: Vec<TextReplacement>,
+    pub observed_cursors: Vec<CursorAnchor>,
+}
+
+/// Event-time source ownership for carets not necessarily changed by this edit.
+pub(crate) struct CursorAnchor {
+    pub id: usize,
+    pub position: usize,
+    pub anchor: Option<usize>,
+}
+
+impl CursorAnchor {
+    fn parse(bytes: &[u8]) -> Result<Self, super::wire::WireError> {
+        use super::wire::{Field, Reader, WireError};
+        let (mut id, mut position, mut anchor) = (None, None, None);
+        for field in Reader::new(bytes) {
+            let (tag, value) = field?;
+            let slot = match tag {
+                1 => &mut id,
+                2 => &mut position,
+                3 => &mut anchor,
+                _ => continue,
+            };
+            if slot.is_some() {
+                return Err(WireError::InvalidField("duplicate observed cursor anchor"));
+            }
+            let Field::Varint(value) = value else {
+                return Err(WireError::InvalidField("observed cursor anchor wire type"));
+            };
+            *slot = Some(usize::try_from(value).map_err(|_| WireError::LongVarint)?);
+        }
+        match (id, position) {
+            (Some(id), Some(position)) => Ok(Self {
+                id,
+                position,
+                anchor,
+            }),
+            _ => Err(WireError::InvalidField("incomplete observed cursor anchor")),
+        }
+    }
 }
 
 pub(crate) struct TextReplacement {
@@ -211,6 +251,7 @@ impl<'a> Input<'a> {
             replacement_cursor: None,
             text_input: false,
             replacements: Vec::new(),
+            observed_cursors: Vec::new(),
         };
         let mut start = None;
         let mut end = None;
@@ -258,6 +299,7 @@ impl<'a> Input<'a> {
                 (20, Field::Bytes(bytes)) => {
                     input.replacements.push(TextReplacement::parse(bytes)?)
                 }
+                (21, Field::Bytes(bytes)) => input.observed_cursors.push(CursorAnchor::parse(bytes)?),
                 _ => {}
             }
         }
@@ -304,7 +346,80 @@ impl<'a> Input<'a> {
         {
             return Err(super::wire::WireError::InvalidField("replacement metadata"));
         }
+        if !input.observed_cursors.is_empty() {
+            let unique: std::collections::HashSet<_> = input.observed_cursors.iter().map(|c| c.id).collect();
+            if unique.len() != input.observed_cursors.len() || input.replacement.is_none() && !input.text_input {
+                return Err(super::wire::WireError::InvalidField("observed cursors require unique native text targets"));
+            }
+        }
         Ok(input)
+    }
+
+    /// Match event-time source ranges through retained coordinate history, then
+    /// compare the exact live caret/selection before this transaction. Merely
+    /// appearing in the later receipt does not establish cursor ownership.
+    pub fn preserved_cursors(&self, editor: &Editor) -> Vec<usize> {
+        let Some(scope) = self.scope else {
+            return Vec::new();
+        };
+        if !(InputTarget {
+            id: self.id,
+            scope,
+            epoch: self.buffer_epoch,
+            pointer: false,
+        })
+        .valid(editor)
+        {
+            return Vec::new();
+        }
+        let window = editor.active_window();
+        let Some(state) = window.buffer_state(scope.buffer) else {
+            return Vec::new();
+        };
+        let Some(view) = window
+            .buffers
+            .splits()
+            .and_then(|(_, views)| views.get(&scope.leaf))
+            .and_then(|v| v.buffer_state(scope.buffer))
+        else {
+            return Vec::new();
+        };
+        let revision = self.source_revision.unwrap_or(scope.revision);
+        if revision > state.buffer.version() {
+            return Vec::new();
+        }
+        self.observed_cursors
+            .iter()
+            .filter_map(|observed| {
+                let anchor = observed.anchor.unwrap_or(observed.position);
+                if observed.position > isize::MAX as usize || anchor > isize::MAX as usize {
+                    return None;
+                }
+                let range = state.coord_map.map_unchanged_range(
+                    observed.position.min(anchor)..observed.position.max(anchor),
+                    revision,
+                )?;
+                if range.end > state.buffer.len() {
+                    return None;
+                }
+                let position = if observed.position < anchor {
+                    range.start
+                } else {
+                    range.end
+                };
+                let anchor = observed.anchor.map(|_| {
+                    if observed.position < anchor {
+                        range.end
+                    } else {
+                        range.start
+                    }
+                });
+                let cursor = view
+                    .cursors
+                    .get(crate::model::event::CursorId(observed.id))?;
+                (cursor.position == position && cursor.anchor == anchor).then_some(observed.id)
+            })
+            .collect()
     }
 
     pub fn replace(&self, editor: &mut Editor) -> Result<(), String> {
@@ -2156,6 +2271,133 @@ mod tests {
         assert!(
             native.text.contains("`─ ▌ > literal`\r\n\r\n"),
             "literal glyphs survive while the joined rule receives its own line"
+        );
+    }
+
+    #[test]
+    fn observed_cursor_ownership_maps_unchanged_ranges_and_rejects_moved_or_opaque_owners() {
+        use crate::model::cursor::Cursor;
+        let mut editor = crate::webui::build_editor(80, 24, &[], false).unwrap();
+        crate::webui::apply_step(&mut editor, &serde_json::json!({"type":"alpha café tail"}));
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        let primary = editor.active_cursors().primary_id();
+        *editor.active_cursors_mut().primary_mut() = Cursor::new(0);
+        let secondary = editor
+            .active_cursors_mut()
+            .add(Cursor::with_selection(11, 6));
+        let scope = Scope {
+            window: editor.active_window().id.0,
+            leaf: editor.active_window().effective_active_split(),
+            buffer: editor.active_window().active_buffer(),
+            revision: editor.active_state().buffer.version(),
+            projection: 0,
+            selection: 0,
+        };
+        let mut input = Input::parse(&[]).unwrap();
+        input.scope = Some(scope);
+        input.buffer_epoch = editor.active_state().marker_list.instance_id();
+        input.observed_cursors = vec![
+            CursorAnchor {
+                id: primary.0,
+                position: 0,
+                anchor: None,
+            },
+            CursorAnchor {
+                id: secondary.0,
+                position: 6,
+                anchor: Some(11),
+            },
+        ];
+        assert_eq!(
+            input.preserved_cursors(&editor),
+            vec![primary.0, secondary.0]
+        );
+        editor
+            .replace_native_texts(vec![(0..0, "前".into(), primary)])
+            .unwrap();
+        assert_eq!(
+            input.preserved_cursors(&editor),
+            vec![primary.0, secondary.0],
+            "known source edits preserve reversed selection ownership"
+        );
+        input.observed_cursors[1].position = usize::MAX;
+        assert_eq!(
+            input.preserved_cursors(&editor),
+            vec![primary.0],
+            "impossible offsets cannot overflow source rebasing"
+        );
+        input.observed_cursors[1].position = 6;
+        editor
+            .active_cursors_mut()
+            .get_mut(secondary)
+            .unwrap()
+            .position += 1;
+        assert_eq!(
+            input.preserved_cursors(&editor),
+            vec![primary.0],
+            "a live ID at a different caret is not owned"
+        );
+        *editor.active_cursors_mut().get_mut(secondary).unwrap() = Cursor::with_selection(14, 9);
+        input.source_revision = Some(editor.active_state().buffer.version() + 1);
+        assert!(
+            input.preserved_cursors(&editor).is_empty(),
+            "future revisions cannot establish provenance"
+        );
+        input.source_revision = None;
+        let state = editor.active_state_mut();
+        state.coord_map.record_barrier(state.buffer.version());
+        assert!(
+            input.preserved_cursors(&editor).is_empty(),
+            "opaque edits invalidate prior source anchors"
+        );
+        input.buffer_epoch += 1;
+        assert!(
+            input.preserved_cursors(&editor).is_empty(),
+            "marker lifetime changes cannot transfer ownership"
+        );
+    }
+
+    #[test]
+    fn observed_cursor_input_requires_complete_unique_anchors_on_native_text() {
+        use super::super::wire::field;
+        let anchor = |fields: &[(u32, u64)]| {
+            let mut bytes = Vec::new();
+            for &(tag, value) in fields {
+                field::opt_uint(&mut bytes, tag, Some(value));
+            }
+            bytes
+        };
+        for fields in [
+            vec![],
+            vec![(1, 0)],
+            vec![(2, 0)],
+            vec![(1, 0), (1, 1), (2, 0)],
+            vec![(1, 0), (2, 0), (3, 1), (3, 2)],
+        ] {
+            assert!(CursorAnchor::parse(&anchor(&fields)).is_err());
+        }
+        let mut wrong_type = anchor(&[(2, 0)]);
+        field::raw_bytes(&mut wrong_type, 1, b"0");
+        assert!(CursorAnchor::parse(&wrong_type).is_err());
+        let valid = anchor(&[(1, 0), (2, 0), (3, 3)]);
+        assert_eq!(CursorAnchor::parse(&valid).unwrap().anchor, Some(3));
+        let mut bytes = Vec::new();
+        field::raw_bytes(&mut bytes, 21, &valid);
+        assert!(
+            Input::parse(&bytes).is_err(),
+            "ordinary keys cannot carry native text ownership"
+        );
+        bytes.clear();
+        field::raw_bytes(&mut bytes, 2, &[]);
+        field::uint(&mut bytes, 3, 20);
+        field::uint(&mut bytes, 14, 1);
+        field::uint(&mut bytes, 18, 1);
+        field::raw_bytes(&mut bytes, 21, &valid);
+        assert_eq!(Input::parse(&bytes).unwrap().observed_cursors.len(), 1);
+        field::raw_bytes(&mut bytes, 21, &valid);
+        assert!(
+            Input::parse(&bytes).is_err(),
+            "duplicate IDs must not manufacture a cursor group"
         );
     }
 

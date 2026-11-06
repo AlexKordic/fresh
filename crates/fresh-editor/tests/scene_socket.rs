@@ -848,10 +848,14 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     let action=|id,name:&str|pb::ComposeInput {id,kind:21,payload:pb::Action {name:name.into(),..Default::default()}.encode_to_vec(),..Default::default()};
     let secondary=ed.active_cursors_mut().add(fresh::model::cursor::Cursor::new(original.len()-2));
     let revision=scope.buffer_revision;
-    let first=rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(1,revision,"東京"));
+    let mut captured=replacement(1,revision,"東京");
+    captured.observed_cursors=vec![pb::ComposeCursorAnchor {id:Some(0),position:Some(0),anchor:None},
+        pb::ComposeCursorAnchor {id:Some(secondary.0 as u64),position:Some((original.len()-2) as u64),anchor:None}];
+    let first=rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,captured);
     let receipt=first.input_reply.unwrap().edit.expect("native replacements return an immutable source receipt");
     assert_eq!((receipt.window,receipt.leaf,receipt.buffer,receipt.epoch),(scope.window_id,scope.leaf,scope.buffer,epoch));
-    assert_eq!(receipt.cursors,vec![0],"only the explicitly edited cursor owns this receipt's dependency");
+    assert_eq!(receipt.cursors,vec![0],"explicit native edits retain their exact edited cursor set");
+    assert_eq!(receipt.preserved_cursors,vec![0,secondary.0 as u64],"unchanged carets are separately proven against captured source anchors");
     let accepted=receipt.pane.as_ref().unwrap();
     assert_eq!(accepted.native_newline,2,"immutable edit receipts include the insertion policy for dependent native previews");
     assert_eq!(accepted.text_context.as_ref().unwrap().text,original.replacen("café","東京",1));

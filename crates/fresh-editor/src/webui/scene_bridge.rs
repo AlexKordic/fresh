@@ -679,6 +679,7 @@ impl SceneClient {
                     let cursors = if input.replacement.is_some() {
                         input.replacement_cursor.into_iter().chain(input.replacements.iter().map(|r| r.cursor)).collect()
                     } else { editor.active_window().active_cursors().iter().map(|(id, _)| id.0).collect::<Vec<_>>() };
+                    let preserved_cursors = input.preserved_cursors(editor);
                     let result = input.replace(editor);
                     match result {
                         Ok(()) => {
@@ -690,7 +691,7 @@ impl SceneClient {
                                 let mut pane = compose.gather_tables_at(editor, scope.leaf, scope.buffer, Some(position), self.measured_tables)?;
                                 pane.viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
                                 if let Some(viewport) = &pane.viewport { pane.top_byte = viewport.position; }
-                                Some(super::compose::EditReceipt { window: scope.window, leaf: scope.leaf.0.0, buffer: scope.buffer.0, epoch, pane, cursors })
+                                Some(super::compose::EditReceipt { window: scope.window, leaf: scope.leaf.0.0, buffer: scope.buffer.0, epoch, pane, cursors, preserved_cursors })
                             });
                             self.finish_input(super::compose::InputReply { id: input.id, accepted: true, edit, ..Default::default() });
                         }

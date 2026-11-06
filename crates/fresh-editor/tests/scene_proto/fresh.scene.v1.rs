@@ -793,6 +793,8 @@ pub struct ComposeEditReceipt {
     pub pane: ::core::option::Option<ComposePane>,
     #[prost(uint64, repeated, tag = "6")]
     pub cursors: ::prost::alloc::vec::Vec<u64>,
+    #[prost(uint64, repeated, tag = "7")]
+    pub preserved_cursors: ::prost::alloc::vec::Vec<u64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeCaret {
@@ -1369,6 +1371,20 @@ pub struct ComposeInput {
     pub replacement_cursor: ::core::option::Option<u64>,
     #[prost(message, repeated, tag = "20")]
     pub replacements: ::prost::alloc::vec::Vec<ComposeReplacementTarget>,
+    #[prost(message, repeated, tag = "21")]
+    pub observed_cursors: ::prost::alloc::vec::Vec<ComposeCursorAnchor>,
+}
+/// Source carets captured with the input's source_revision (or scope revision).
+/// A receipt reports only IDs whose unchanged mapped ranges match the live
+/// caret and selection immediately before the native transaction.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeCursorAnchor {
+    #[prost(uint64, optional, tag = "1")]
+    pub id: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub position: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub anchor: ::core::option::Option<u64>,
 }
 /// Additional captured carets in the same atomic source transaction. An omitted
 /// text uses the primary Paste payload; an explicitly empty text deletes.

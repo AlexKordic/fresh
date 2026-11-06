@@ -490,6 +490,7 @@ message ComposeEditReceipt {
   uint64 epoch = 4;
   ComposePane pane = 5;
   repeated uint64 cursors = 6;
+  repeated uint64 preserved_cursors = 7;
 }
 
 message ComposeCaret {
@@ -820,6 +821,15 @@ message ComposeInput {
   bool text_input = 18;
   optional uint64 replacement_cursor = 19;
   repeated ComposeReplacementTarget replacements = 20;
+  repeated ComposeCursorAnchor observed_cursors = 21;
+}
+// Source carets captured with the input's source_revision (or scope revision).
+// A receipt reports only IDs whose unchanged mapped ranges match the live
+// caret and selection immediately before the native transaction.
+message ComposeCursorAnchor {
+  optional uint64 id = 1;
+  optional uint64 position = 2;
+  optional uint64 anchor = 3;
 }
 // Additional captured carets in the same atomic source transaction. An omitted
 // text uses the primary Paste payload; an explicitly empty text deletes.
