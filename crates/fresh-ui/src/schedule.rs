@@ -496,6 +496,9 @@ pub struct Ui<M> {
     /// by nodes that draw their own affordance — see [`Geom::pointer`].
     pub(crate) pointer: Option<Point>,
     pub(crate) captured: Option<ElementId>,
+    /// Pointer geometry temporarily supplied by another frontend. The layer
+    /// keeps its keyboard/modal policy; only its old hit region is omitted.
+    pub(crate) pointer_excluded: Vec<ElementId>,
     /// The drag the capture is, if it is one ([`crate::Event::start_drag`]).
     pub(crate) drag: Option<crate::hit::Drag>,
     /// The elements a press landed on, which button it was, and which press
@@ -584,6 +587,7 @@ impl<M: 'static> Ui<M> {
             hover: Vec::new(),
             pointer: None,
             captured: None,
+            pointer_excluded: Vec::new(),
             drag: None,
             press: None,
             focus: None,

@@ -120,6 +120,46 @@ impl<M: 'static> Ui<M> {
         Dispatch { msgs: out, claimed }
     }
 
+    /// Dispatch pointer input without the original hit regions of subtrees
+    /// rendered elsewhere by the host. Floating descendants are omitted too.
+    /// Keyboard routing and pointer-blocking modal ownership remain intact.
+    /// The filter is scoped to this dispatch, including when a handler panics.
+    pub fn dispatch_without_pointer_subtrees(
+        &mut self,
+        input: Input,
+        keys: &[crate::key::Key],
+    ) -> Dispatch<M> {
+        if matches!(input, Input::Key(_)) || keys.is_empty() {
+            return self.dispatch(input);
+        }
+        let excluded = keys
+            .iter()
+            .filter_map(|key| self.find_by_key(key))
+            .collect();
+        let previous = std::mem::replace(&mut self.pointer_excluded, excluded);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.dispatch(input)));
+        self.pointer_excluded = previous;
+        match result {
+            Ok(result) => result,
+            Err(error) => std::panic::resume_unwind(error),
+        }
+    }
+
+    fn pointer_excluded(&self, element: ElementId) -> bool {
+        self.pointer_excluded
+            .iter()
+            .any(|&root| self.is_ancestor(root, element))
+    }
+
+    fn drag_excluded(&self) -> bool {
+        self.drag.as_ref().is_some_and(|drag| {
+            drag.lifted_from
+                .iter()
+                .any(|&element| self.pointer_excluded(element))
+        })
+    }
+
     /// **A pointer event a pointer-blocking modal let nothing answer is the
     /// modal's.** `hit_paths` routes nothing below such a layer, so a press
     /// beside it, a wheel over the slack of its own box and a move across
@@ -145,7 +185,11 @@ impl<M: 'static> Ui<M> {
         match input {
             Input::Key(k) => self.dispatch_key(k, out),
             Input::Move { pos, mods } => {
-                if let Some(r) = self.scrollbar_drag {
+                if let Some(r) = self.scrollbar_drag.filter(|&r| {
+                    !self
+                        .element_of(r)
+                        .is_some_and(|element| self.pointer_excluded(element))
+                }) {
                     // A drag in progress owns the pointer.
                     self.scroll_to_pointer(r, pos.y, out);
                     return true;
@@ -266,7 +310,11 @@ impl<M: 'static> Ui<M> {
                 claimed || dismiss_claims || (!dismissed && self.pointer_owned())
             }
             Input::Release { pos, button, mods } => {
-                if self.scrollbar_drag.take().is_some() {
+                if self.scrollbar_drag.take().is_some_and(|r| {
+                    !self
+                        .element_of(r)
+                        .is_some_and(|element| self.pointer_excluded(element))
+                }) {
                     return true;
                 }
                 // **The drop comes first.** The captor's release ends the
@@ -494,6 +542,13 @@ impl<M: 'static> Ui<M> {
     /// Returns whether an opaque hit occurred, which is what stops the search
     /// reaching anything behind.
     fn collect_paths(&self, r: RenderId, p: Point, out: &mut Vec<Vec<RenderId>>) -> bool {
+        if !self.pointer_excluded.is_empty()
+            && self
+                .element_of(r)
+                .is_some_and(|element| self.pointer_excluded(element))
+        {
+            return false;
+        }
         let Some(n) = self.render.get(r) else {
             return false;
         };
@@ -559,7 +614,9 @@ impl<M: 'static> Ui<M> {
     /// otherwise whatever is under the pointer.
     fn route(&self, p: Point) -> Vec<Vec<ElementId>> {
         match self.captured {
-            Some(c) if self.arena.get(c).is_some() => vec![self.path_to(c)],
+            Some(c) if self.arena.get(c).is_some() && !self.pointer_excluded(c) => {
+                vec![self.path_to(c)]
+            }
             _ => self.hit_paths(p),
         }
     }
@@ -787,6 +844,9 @@ impl<M: 'static> Ui<M> {
     /// pointer, which the capture holds on the row being dragged. Nothing
     /// while no drag is held: a bare hover, or a capture that is not a drag.
     fn update_drag_hover(&mut self, pos: Point, mods: Mods, out: &mut Vec<M>) {
+        if self.drag_excluded() {
+            return;
+        }
         let Some(was) = self.drag.as_ref().map(|d| d.under.clone()) else {
             return;
         };
@@ -829,6 +889,9 @@ impl<M: 'static> Ui<M> {
     /// and the tree has no clock to make its own: the host, which does, asks
     /// [`Ui::drag_autoscroll`] and repeats the pointer at its own cadence.
     fn autoscroll_target(&self, pos: Point) -> Option<(RenderId, i32)> {
+        if self.drag_excluded() {
+            return None;
+        }
         let drag = self.drag.as_ref()?;
         for &n in drag.lifted_from.iter().rev() {
             let Some(r) = self.render_for(n) else {
@@ -935,6 +998,14 @@ impl<M: 'static> Ui<M> {
     /// `DragLeave`. What is still under it is handed back to hover by the
     /// caller, once the capture is gone. Reports whether a drag was held.
     fn drop_at(&mut self, pos: Point, mods: Mods, out: &mut Vec<M>) -> bool {
+        if self.drag_excluded() {
+            if let Some(drag) = self.drag.take() {
+                for element in drag.under.into_iter().rev() {
+                    self.fire_at(element, GestureKind::DragLeave, pos, mods, out);
+                }
+            }
+            return false;
+        }
         let Some(drag) = self.drag.take() else {
             return false;
         };

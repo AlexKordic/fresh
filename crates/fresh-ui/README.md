@@ -78,6 +78,14 @@ places a sibling outside the parent. A node that says `clip(true)` bounds what
 its descendants may paint *and* hit to its content rect; `border()` implies it,
 because a frame its own content can paint over is not a frame.
 
+A frontend that draws a keyed surface at different coordinates can route the
+remaining surfaces with `Ui::dispatch_without_pointer_subtrees`. This omits
+the projected subtree's original pointer regions, including floating children,
+captured motion, scrollbars and drops. It retains keyboard focus and modal
+blocking. The exclusion lasts for one dispatch and is restored even if a
+handler panics; ordinary dispatch still uses the original layout. The host
+must separately validate and translate input aimed at its projected surface.
+
 ## Subsystems
 
 | Area | What it does | Source |
