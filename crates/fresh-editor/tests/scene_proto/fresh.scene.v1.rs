@@ -759,6 +759,8 @@ pub struct ComposeSegment {
 /// flags: bold 1, italic 2, underline 4, strikethrough 8, link 16.
 /// Link destinations are parsed metadata, including empty self-links;
 /// receiving them never authorizes fetching or opening a destination.
+/// Oversize/budgeted destinations omit link_target and send their full
+/// UTF-8 byte count plus an optional incomplete tooltip-only preview.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeSpan {
     #[prost(uint64, tag = "1")]
@@ -773,6 +775,10 @@ pub struct ComposeSpan {
     pub content_start: ::core::option::Option<u64>,
     #[prost(string, optional, tag = "6")]
     pub link_target: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag = "7")]
+    pub link_target_bytes: ::core::option::Option<u64>,
+    #[prost(string, optional, tag = "8")]
+    pub link_target_preview: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeImage {

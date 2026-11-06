@@ -9,7 +9,7 @@ use crate::model::event::{BufferId, LeafId};
 use crate::state::ViewMode;
 use fresh_core::compose::{Conceal, Projection, SegmentKind};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::{Arc, Weak};
@@ -27,6 +27,9 @@ pub(crate) use prefixes::Context as ComposeHangingContext;
 
 #[path = "compose_flow.rs"]
 mod flow;
+
+#[path = "compose_links.rs"]
+pub(super) mod links;
 
 #[cfg(test)]
 #[path = "compose_profile.rs"]
@@ -720,6 +723,10 @@ pub(crate) struct ComposeSpan {
     /// Parsed destination for a link span, including an explicitly empty one.
     /// It is metadata, never permission to fetch or open the target.
     pub link_target: Option<Arc<str>>,
+    /// Full parsed size when only a bounded tooltip preview is sent.
+    pub link_target_bytes: Option<usize>,
+    /// An explicitly incomplete destination, never an actionable URI.
+    pub link_target_preview: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -854,6 +861,8 @@ impl Document {
             return None;
         }
         let mut spans = Vec::new();
+        // Repeated reference links share one parsed destination allocation.
+        let mut link_targets: HashSet<Arc<str>> = HashSet::new();
         let mut images = Vec::new();
         let mut image_stack: Vec<ComposeImage> = Vec::new();
         let mut paragraphs = Vec::new();
@@ -968,11 +977,17 @@ impl Document {
                 }) => {
                     flags = 4 | 16;
                     let target = if link_type == pulldown_cmark::LinkType::Email {
-                        format!("mailto:{dest_url}")
+                        std::borrow::Cow::Owned(format!("mailto:{dest_url}"))
                     } else {
-                        dest_url.into_string()
+                        std::borrow::Cow::Borrowed(dest_url.as_ref())
                     };
-                    link_target = Some(target.into());
+                    link_target = Some(if let Some(shared) = link_targets.get(target.as_ref()) {
+                        Arc::clone(shared)
+                    } else {
+                        let shared: Arc<str> = target.as_ref().into();
+                        link_targets.insert(Arc::clone(&shared));
+                        shared
+                    });
                 }
                 Event::Start(Tag::Strong) => flags = 1,
                 Event::Start(Tag::Emphasis) => flags = 2,
@@ -1031,6 +1046,8 @@ impl Document {
                     flags,
                     content_start: None,
                     link_target,
+                    link_target_bytes: None,
+                    link_target_preview: None,
                 });
                 if new_item {
                     let line_end = text[range.start..]
@@ -1970,12 +1987,14 @@ impl ComposePane {
         context: &str,
         tables: Vec<super::compose_tables::Table>,
     ) -> Self {
-        let spans: Vec<_> = doc
+        let mut spans: Vec<_> = doc
             .spans
             .iter()
             .filter(|s| s.start < p.source.end && s.end > p.source.start)
             .cloned()
             .collect();
+        let mut link_metadata_budget = links::SCENE_METADATA_BYTES;
+        links::limit(&mut spans, &mut link_metadata_budget);
         let images: Vec<_> = doc
             .images
             .iter()
@@ -3081,6 +3100,103 @@ mod tests {
             .iter()
             .filter(|span| span.flags & 16 == 0)
             .all(|span| span.link_target.is_none()));
+        assert_eq!(doc.text.as_bytes(), source.as_bytes());
+    }
+
+    #[test]
+    fn large_link_projection_keeps_exact_source_without_duplicating_the_destination() {
+        let target = format!("https://example.invalid/{}", "a".repeat(5 << 20));
+        let source = format!("[payload]({target})\r\n");
+        let doc = Document::parse(source.clone(), 0, 0, 1);
+        let pane = ComposePane::from_projection(
+            Projection::new(&source, 0, &[]).unwrap(),
+            &doc,
+            0,
+            Vec::new(),
+            true,
+            0,
+            "",
+            Vec::new(),
+        );
+        assert_eq!(pane.text.as_bytes(), source.as_bytes());
+        assert_eq!(pane.document_len, source.len());
+        assert!(
+            crate::webui::wire::Message::encoded_len(&pane) < source.len() + (64 << 10),
+            "link metadata must not double a previously valid five-megabyte scene payload"
+        );
+        let link = pane.spans.iter().find(|span| span.flags & 16 != 0).unwrap();
+        assert!(link.link_target.is_none());
+        assert_eq!(link.link_target_bytes, Some(target.len()));
+        assert!(link.link_target_preview.as_ref().unwrap().len() <= 2048);
+        assert_eq!(
+            doc.spans
+                .iter()
+                .find(|span| span.flags & 16 != 0)
+                .unwrap()
+                .link_target
+                .as_deref(),
+            Some(target.as_str())
+        );
+        assert_eq!(doc.text.as_bytes(), source.as_bytes());
+        let mut reply = InputReply {
+            compose: Some(pane.clone()),
+            edit: Some(EditReceipt {
+                window: 1,
+                leaf: 1,
+                buffer: 1,
+                epoch: 1,
+                pane: pane.clone(),
+                cursors: Vec::new(),
+                preserved_cursors: Vec::new(),
+            }),
+            result: Some(EditReceipt {
+                window: 1,
+                leaf: 1,
+                buffer: 1,
+                epoch: 1,
+                pane,
+                cursors: Vec::new(),
+                preserved_cursors: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let mut remaining = 3000;
+        links::limit_reply(&mut reply, &mut remaining);
+        let panes = [
+            reply.compose.as_ref().unwrap(),
+            &reply.edit.as_ref().unwrap().pane,
+            &reply.result.as_ref().unwrap().pane,
+        ];
+        let mut total = 0;
+        for pane in panes {
+            assert_eq!(pane.text.as_bytes(), source.as_bytes());
+            for span in &pane.spans {
+                total += span.link_target.as_ref().map_or(0, |s| s.len())
+                    + span.link_target_preview.as_ref().map_or(0, |s| s.len());
+            }
+        }
+        assert!(total <= 3000);
+        assert_eq!(total + remaining, 3000);
+    }
+
+    #[test]
+    fn repeated_reference_destinations_share_one_full_parsed_allocation() {
+        let target = format!("https://example.invalid/{}", "a".repeat(256 << 10));
+        let source = "[label][id]\n\n".repeat(128) + &format!("[id]: <{target}>\n");
+        let doc = Document::parse(source.clone(), 0, 0, 1);
+        let links: Vec<_> = doc
+            .spans
+            .iter()
+            .filter(|span| span.flags & 16 != 0)
+            .map(|span| span.link_target.as_ref().unwrap())
+            .collect();
+        // The Markdown parser itself limits reference expansion relative to
+        // the source size. Every admitted reference still shares its target.
+        assert!(links.len() >= 2);
+        for link in &links {
+            assert!(Arc::ptr_eq(links[0], link));
+            assert_eq!(link.as_ref(), target);
+        }
         assert_eq!(doc.text.as_bytes(), source.as_bytes());
     }
 }

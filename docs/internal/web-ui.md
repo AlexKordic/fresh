@@ -37,6 +37,17 @@ keep their link font flags but omit destinations: their offsets are local
 measurement coordinates rather than document links. Receiving metadata never
 fetches a resource or follows a link. Older consumers ignore the optional field.
 
+Outgoing tooltip metadata uses at most 2 KiB per destination and 64 KiB across
+a native scene's panes and input replies. A destination that does not fit
+omits `link_target` and carries its full parsed UTF-8 size in
+`link_target_bytes` (field 7), with an optional bounded, incomplete
+`link_target_preview` (field 8). A preview is never a complete or actionable
+URI. The document retains the complete parsed destination and exact source;
+only the optional tooltip metadata is budgeted. Repeated reference links
+share one destination allocation. Native output buffering follows the native
+16 MiB message limit and two outstanding frames, independently of the browser
+bridge's smaller queue cap.
+
 ### Popup annotations for native Compose consumers
 
 The semantic popup projection retains its original `rect` and `content_rect`

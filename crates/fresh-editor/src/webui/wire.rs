@@ -1007,9 +1007,12 @@ proto! {
     /// flags: bold 1, italic 2, underline 4, strikethrough 8, link 16.
     /// Link destinations are parsed metadata, including empty self-links;
     /// receiving them never authorizes fetching or opening a destination.
+    /// Oversize/budgeted destinations omit link_target and send their full
+    /// UTF-8 byte count plus an optional incomplete tooltip-only preview.
     ComposeSpan {
         1 start: uint64, 2 end: uint64, 3 role: uint32, 4 flags: uint32,
         5 content_start: optional uint64, 6 link_target: optional string,
+        7 link_target_bytes: optional uint64, 8 link_target_preview: optional string,
     }
     ComposeImage {
         1 start: uint64, 2 end: uint64, 3 target: string,

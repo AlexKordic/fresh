@@ -470,6 +470,8 @@ message ComposeSegment {
 // flags: bold 1, italic 2, underline 4, strikethrough 8, link 16.
 // Link destinations are parsed metadata, including empty self-links;
 // receiving them never authorizes fetching or opening a destination.
+// Oversize/budgeted destinations omit link_target and send their full
+// UTF-8 byte count plus an optional incomplete tooltip-only preview.
 message ComposeSpan {
   uint64 start = 1;
   uint64 end = 2;
@@ -477,6 +479,8 @@ message ComposeSpan {
   uint32 flags = 4;
   optional uint64 content_start = 5;
   optional string link_target = 6;
+  optional uint64 link_target_bytes = 7;
+  optional string link_target_preview = 8;
 }
 
 message ComposeImage {

@@ -15,6 +15,8 @@ fn link_destination_wire_preserves_unicode_and_distinguishes_an_empty_target_fro
         flags: 20,
         content_start: None,
         link_target: Some("docs/café.md".into()),
+        link_target_bytes: None,
+        link_target_preview: None,
     };
     let mut bytes = Vec::new();
     span.encode(&mut bytes);
@@ -50,4 +52,17 @@ fn link_destination_wire_preserves_unicode_and_distinguishes_an_empty_target_fro
         .unwrap()
         .link_target
         .is_none());
+
+    span.link_target_bytes = Some(5000);
+    span.link_target_preview = Some("docs/café.md".into());
+    bytes.clear();
+    span.encode(&mut bytes);
+    let deferred = pb::ComposeSpan::decode(bytes.as_slice()).unwrap();
+    assert!(deferred.link_target.is_none());
+    assert_eq!(deferred.link_target_bytes, Some(5000));
+    assert_eq!(
+        deferred.link_target_preview.as_deref(),
+        Some("docs/café.md")
+    );
+    assert_eq!(span.encoded_len(), bytes.len());
 }

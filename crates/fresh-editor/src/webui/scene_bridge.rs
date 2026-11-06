@@ -15,7 +15,7 @@ use super::wire::{self, kind, ClientScene, EncodedScene, Field, Reader, Timing, 
 use super::{
     apply_action, apply_kbedit, apply_key, apply_mouse, apply_paste, apply_resize_want,
     apply_settings, apply_widget, BridgePoll, GridFrame, GridHasher, KeyInput, MouseInput,
-    SceneFor, SceneModel, SceneSource, SceneTimes, SettingsClick, WS_OUTBUF_CAP,
+    SceneFor, SceneModel, SceneSource, SceneTimes, SettingsClick,
 };
 use crate::app::Editor;
 use anyhow::Result;
@@ -43,6 +43,30 @@ const SOCKET_BUFFER: libc::c_int = 4 << 20;
 /// present instead of working through every frame in between, each one
 /// older than the last by the time it is shown.
 const FRAMES_AHEAD: u64 = 2;
+
+/// The native protocol accepts 16 MiB messages and permits two outstanding
+/// frames. Its queue must not inherit the browser's smaller 8 MiB cap.
+/// A TLV header uses at most two ten-byte varints.
+const OUTBUF_CAP: usize = (wire::MAX_PAYLOAD + 20) * FRAMES_AHEAD as usize;
+
+#[cfg(test)]
+#[test]
+fn native_output_accepts_a_valid_large_frame_but_still_bounds_a_stalled_client() {
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let mut client = SceneClient::new(1, stream);
+    wire::field::text(&mut client.body, 99, &"x".repeat(9 << 20));
+    assert!(client.body.len() < wire::MAX_PAYLOAD);
+    wire::put_header(&mut client.outbuf, kind::FRAME, client.body.len());
+    client.outbuf.extend_from_slice(&client.body);
+    let (kind, range, _) = wire::read_message(&client.outbuf).unwrap().unwrap();
+    assert_eq!(kind, kind::FRAME);
+    assert_eq!(range.len(), client.body.len());
+    assert!(client.flush().is_ok(),
+        "a valid native payload may exceed the browser's 8 MiB cap");
+    client.outbuf.resize(client.out_start + OUTBUF_CAP + 1, 0);
+    assert!(client.flush().is_err(), "an unread queue remains bounded");
+}
 
 /// How long an app with frames held back may go without reporting before
 /// frames go out regardless, so a lost `Applied` can't freeze its view.
@@ -388,6 +412,17 @@ impl SceneBridge {
                 }
                 timing.build_ms += gather_started.elapsed().as_secs_f64() * 1000.0;
                 let encode_started = Instant::now();
+                // All panes and correlated replies share one tooltip budget.
+                // Their source text and Fresh's parsed destinations are intact.
+                let mut link_metadata_budget = super::compose::links::SCENE_METADATA_BYTES;
+                for pane in &mut model.panes {
+                    if let Some(compose) = &mut pane.compose {
+                        super::compose::links::limit(&mut compose.spans, &mut link_metadata_budget);
+                    }
+                }
+                if let Some(reply) = &mut client.input_reply {
+                    super::compose::links::limit_reply(reply, &mut link_metadata_budget);
+                }
                 let (seq, text) = source.clip.current(editor);
                 rich_encoded.encode(&model, wire::Clipboard { seq, text });
                 rich_encoded.table_reference_hashes(&mut model);
@@ -1137,9 +1172,9 @@ impl SceneClient {
     }
 
     /// Write what the socket takes now; the rest waits for the next pass. An
-    /// app that stops reading past `WS_OUTBUF_CAP` is behind beyond recovery.
+    /// app that stops reading past `OUTBUF_CAP` is behind beyond recovery.
     fn flush(&mut self) -> std::io::Result<()> {
-        if self.outbuf.len() - self.out_start > WS_OUTBUF_CAP {
+        if self.outbuf.len() - self.out_start > OUTBUF_CAP {
             return Err(std::io::Error::other("the app stopped reading"));
         }
         while self.out_start < self.outbuf.len() {

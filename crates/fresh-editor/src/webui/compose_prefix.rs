@@ -254,6 +254,8 @@ pub(super) fn contexts(p: &Projection, spans: &[ComposeSpan], source: &str) -> V
                         flags: *flags,
                         content_start: None,
                         link_target: None,
+                        link_target_bytes: None,
+                        link_target_preview: None,
                     });
                 }
             }
@@ -807,6 +809,8 @@ mod tests {
                 flags: 0,
                 content_start: Some(content),
                 link_target: None,
+                link_target_bytes: None,
+                link_target_preview: None,
             },
             ComposeSpan {
                 start: content,
@@ -815,6 +819,8 @@ mod tests {
                 flags: 1,
                 content_start: None,
                 link_target: None,
+                link_target_bytes: None,
+                link_target_preview: None,
             },
         ];
         let p = Projection::new(
@@ -885,6 +891,8 @@ mod tests {
             flags: 0,
             content_start: Some(302),
             link_target: None,
+            link_target_bytes: None,
+            link_target_preview: None,
         }];
         let source = "x".repeat(300) + text;
         let values = contexts(&p, &spans, &source);
@@ -909,6 +917,8 @@ mod tests {
             flags: 1,
             content_start: None,
             link_target: None,
+            link_target_bytes: None,
+            link_target_preview: None,
         }];
         let mut at = 0;
         for line in text.split_inclusive('\n') {
@@ -919,6 +929,8 @@ mod tests {
                 flags: 0,
                 content_start: Some(at + 2),
                 link_target: None,
+                link_target_bytes: None,
+                link_target_preview: None,
             });
             spans.push(ComposeSpan {
                 start: at + 2,
@@ -927,6 +939,8 @@ mod tests {
                 flags: 2,
                 content_start: None,
                 link_target: None,
+                link_target_bytes: None,
+                link_target_preview: None,
             });
             at += line.len();
         }
@@ -962,6 +976,8 @@ mod tests {
                 flags: 0,
                 content_start: Some(start + 2),
                 link_target: None,
+                link_target_bytes: None,
+                link_target_preview: None,
             }];
             assert_eq!(
                 contexts(&projection, &spans, source)[0].source_line_start,
@@ -977,6 +993,8 @@ mod tests {
             flags: 0,
             content_start: Some(4),
             link_target: None,
+            link_target_bytes: None,
+            link_target_preview: None,
         }];
         assert!(!contexts(&projection, &spans, source)[0].source_line_start);
     }
