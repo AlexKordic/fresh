@@ -113,6 +113,7 @@ use crate::view::scene::Rgb;
 mod wire;
 mod compose;
 mod compose_index;
+mod compose_document;
 mod compose_decorations;
 mod compose_assets;
 mod compose_text;

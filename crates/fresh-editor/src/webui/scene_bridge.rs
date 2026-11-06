@@ -47,10 +47,11 @@ const FRAMES_AHEAD: u64 = 2;
 /// The native protocol accepts 16 MiB messages and permits two outstanding
 /// frames. Its queue must not inherit the browser's smaller 8 MiB cap.
 /// A TLV header uses at most two ten-byte varints.
-/// Reserve one separately acknowledged index chunk and one retirement notice
-/// without borrowing either render frame's allowance.
+/// Each independent document stream reserves one unacknowledged chunk and
+/// one retirement notice without borrowing either render frame's allowance.
 const OUTBUF_CAP: usize = (wire::MAX_PAYLOAD + 20) * FRAMES_AHEAD as usize
-    + (super::compose_index::MAX_PAYLOAD + 20) * 2;
+    + (super::compose_index::MAX_PAYLOAD + 20) * 2
+    + (super::compose_document::MAX_PAYLOAD + 20) * 2;
 
 #[cfg(test)]
 #[test]
@@ -101,6 +102,7 @@ pub struct SceneBridge {
     /// The last push's scene, encoded once for every client.
     encoded: EncodedScene,
     compose: super::compose::ComposeCache,
+    document_budget: super::compose_document::Budget,
     assets: super::compose_assets::Service,
     viewport_clients: HashSet<u64>,
     /// Allocations of the last push, for the next frame's telemetry.
@@ -110,6 +112,7 @@ pub struct SceneBridge {
 /// One connected app.
 struct SceneClient {
     index: super::compose_index::Session,
+    document: super::compose_document::Session,
     id: u64,
     stream: UnixStream,
     /// Bytes read and not yet a whole message.
@@ -181,6 +184,7 @@ impl SceneBridge {
             grid: GridHasher::default(),
             encoded: EncodedScene::default(),
             compose: Default::default(),
+            document_budget: Default::default(),
             assets: Default::default(),
             viewport_clients: HashSet::new(),
             last_push_allocs: None,
@@ -276,6 +280,7 @@ impl SceneBridge {
             }
         }
         out.frame_owed |= self.clients.iter().any(|client| !client.asset_transfers.is_empty() && client.ready());
+        out.frame_owed |= self.clients.iter().any(|client| client.document.wants_prepare(Instant::now()));
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -283,7 +288,9 @@ impl SceneBridge {
                         continue;
                     }
                     tune(&stream);
-                    self.clients.push(SceneClient::new(NEXT_SCENE_CLIENT.fetch_add(1, Ordering::Relaxed), stream));
+                    let mut client = SceneClient::new(NEXT_SCENE_CLIENT.fetch_add(1, Ordering::Relaxed), stream);
+                    client.document = super::compose_document::Session::new(self.document_budget.clone());
+                    self.clients.push(client);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -414,6 +421,8 @@ impl SceneBridge {
                         }
                     }
                 }
+                compose_regions.extend(client.document.prepare(editor, &mut self.compose, client.id,
+                    client.measured_tables, client.paragraph_windows));
                 timing.build_ms += gather_started.elapsed().as_secs_f64() * 1000.0;
                 let encode_started = Instant::now();
                 // All panes and correlated replies share one tooltip budget.
@@ -477,6 +486,7 @@ impl SceneBridge {
     pub fn maintain(&mut self, editor: &mut Editor) -> bool {
         let before = self.clients.len();
         for client in &mut self.clients {
+            client.document.expire(Instant::now());
             if client.hello_sent && client.outbuf.len() - client.out_start <= wire::MAX_PAYLOAD {
                 if let Some(chunk) = client.index.next(editor, &self.compose) {
                     use wire::Message;
@@ -484,6 +494,13 @@ impl SceneBridge {
                     chunk.encode(&mut client.body);
                     debug_assert!(client.body.len() <= super::compose_index::MAX_PAYLOAD);
                     client.queue(kind::COMPOSE_INDEX_CHUNK);
+                }
+                if let Some(chunk) = client.document.next(editor, &self.compose) {
+                    use wire::Message;
+                    client.body.clear();
+                    chunk.encode(&mut client.body);
+                    debug_assert!(client.body.len() <= super::compose_document::MAX_PAYLOAD);
+                    client.queue(kind::COMPOSE_DOCUMENT_CHUNK);
                 }
             }
         }
@@ -530,6 +547,7 @@ impl SceneClient {
     fn new(id: u64, stream: UnixStream) -> Self {
         Self {
             index: Default::default(),
+            document: Default::default(),
             id,
             stream,
             inbuf: Vec::new(),
@@ -1140,6 +1158,10 @@ impl SceneClient {
                     return Err("document navigation requires rich_compose in hello".into());
                 }
                 self.index.handle(super::compose_index::Request::parse(payload).map_err(w)?);
+            }
+            kind::COMPOSE_DOCUMENT_REQUEST => {
+                if !self.rich_compose { return Err("complete document reading requires rich_compose in hello".into()); }
+                self.document.handle(super::compose_document::Request::parse(payload).map_err(w)?);
             }
             kind::APPLIED => {
                 for f in Reader::new(payload) {

@@ -827,6 +827,7 @@ pub(crate) struct ComposePane {
     /// independently prepared offscreen marker lines. Not a wire payload.
     pub format_regions: Vec<Range<usize>>,
     pub editable: Option<bool>,
+    pub decoration_revision: Option<u64>,
 }
 
 struct Document {
@@ -1715,13 +1716,11 @@ pub(crate) struct ComposeCache {
 }
 
 impl ComposeCache {
-    /// A read-only complete document snapshot, independent of this client's
-    /// displayed source window. Main scene gathering prepares the cache.
-    pub(crate) fn semantic_inventory(
+    pub(crate) fn validate_document_source(
         &self,
         editor: &Editor,
         owner: &super::compose_index::Owner,
-    ) -> Result<Option<Arc<semantics::Inventory>>, String> {
+    ) -> Result<(), String> {
         if !(InputTarget {
             id: 0,
             scope: owner.scope(),
@@ -1756,6 +1755,50 @@ impl ComposeCache {
         {
             return Err("Document navigation source changed; request its current revision.".into());
         }
+        Ok(())
+    }
+
+    /// The same fingerprint as a projected pane, without rebuilding its text.
+    /// Source/reveal ownership must be checked while a snapshot waits for ACKs.
+    pub(crate) fn document_selection(
+        &self,
+        editor: &mut Editor,
+        owner: &super::compose_index::Owner,
+    ) -> Option<u64> {
+        let context = format!("{:?}", editor.get_key_context());
+        let window = editor.active_window();
+        let (_, views) = window.buffers.splits()?;
+        let view = views
+            .get(&owner.scope().leaf)?
+            .buffer_state(BufferId(owner.buffer))?;
+        let doc = self.documents.get(&(owner.window, owner.buffer))?;
+        if doc.revision != owner.revision || doc.epoch != owner.epoch {
+            return None;
+        }
+        let mut cursors: Vec<_> = view
+            .cursors
+            .iter()
+            .map(|(id, c)| ComposeSelection {
+                position: c.position,
+                anchor: c.anchor,
+                id: id.0,
+                primary: id == view.cursors.primary_id(),
+                utf16_position: doc.text_index.utf16_at(&doc.text, c.position),
+                utf16_anchor: c.anchor.and_then(|p| doc.text_index.utf16_at(&doc.text, p)),
+            })
+            .collect();
+        cursors.sort_by_key(|c| c.id);
+        Some(selection_fingerprint(&cursors, &context))
+    }
+
+    /// A read-only complete document snapshot, independent of this client's
+    /// displayed source window. Main scene gathering prepares the cache.
+    pub(crate) fn semantic_inventory(
+        &self,
+        editor: &Editor,
+        owner: &super::compose_index::Owner,
+    ) -> Result<Option<Arc<semantics::Inventory>>, String> {
+        self.validate_document_source(editor, owner)?;
         let Some(document) = self
             .documents
             .get(&(owner.window, owner.buffer))
@@ -2061,6 +2104,7 @@ impl ComposeCache {
             projection, doc, revision, cursors, focused, top_byte, &context, tables,
         );
         pane.editable = Some(!state.editing_disabled);
+        pane.decoration_revision = Some(u64::from(state.conceals.version()));
         pane.format_regions.extend(prefixes.regions);
         if !prefixes.contexts.is_empty() {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -2097,6 +2141,13 @@ impl ComposeCache {
         }
         Some(pane)
     }
+}
+
+fn selection_fingerprint(cursors: &[ComposeSelection], context: &str) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    cursors.hash(&mut hash);
+    context.hash(&mut hash);
+    hash.finish()
 }
 
 impl ComposePane {
@@ -2164,15 +2215,13 @@ impl ComposePane {
             })
             .collect();
         let projection_revision = hash.finish();
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
         for cursor in &mut cursors {
             cursor.utf16_position = doc.text_index.utf16_at(&doc.text, cursor.position);
             cursor.utf16_anchor = cursor
                 .anchor
                 .and_then(|p| doc.text_index.utf16_at(&doc.text, p));
         }
-        cursors.hash(&mut hash);
-        context.hash(&mut hash);
+        let selection_revision = selection_fingerprint(&cursors, context);
         let text_context = cursors
             .iter()
             .find(|cursor| cursor.primary)
@@ -2188,7 +2237,7 @@ impl ComposePane {
         Self {
             buffer_revision: revision,
             projection_revision,
-            selection_revision: hash.finish(),
+            selection_revision,
             source_start: p.source.start,
             source_end: p.source.end,
             text: p.text,
@@ -2213,6 +2262,7 @@ impl ComposePane {
             hanging_contexts,
             format_regions,
             editable: None,
+            decoration_revision: None,
         }
     }
 }

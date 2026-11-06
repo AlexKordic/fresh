@@ -37,6 +37,7 @@ pub(crate) mod kind {
     pub const FRAME: u64 = 2;
     pub const ERROR: u64 = 3;
     pub const COMPOSE_INDEX_CHUNK: u64 = 4;
+    pub const COMPOSE_DOCUMENT_CHUNK: u64 = 5;
     pub const CLIENT_HELLO: u64 = 16;
     pub const KEY: u64 = 17;
     pub const MOUSE: u64 = 18;
@@ -53,6 +54,7 @@ pub(crate) mod kind {
     pub const COMPOSE_VIEWPORT_REQUEST: u64 = 29;
     pub const POPUP_POINTER: u64 = 30;
     pub const COMPOSE_INDEX_REQUEST: u64 = 31;
+    pub const COMPOSE_DOCUMENT_REQUEST: u64 = 32;
 }
 
 /// The protocol version a client's hello must name.
@@ -793,6 +795,7 @@ use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewport
 use super::compose_tables::{Measurement as ComposeTableMeasurement, Column as ComposeTableColumn, Sample as ComposeTableSample, Style as ComposeTableStyle};
 use super::compose::{EditReceipt, InputReply};
 use super::compose_index::{Owner as IndexOwner, Part as IndexPart, Chunk as IndexChunk};
+use super::compose_document::Chunk as DocumentChunk;
 use super::compose_navigation::CaretState;
 use crate::view::scene::{
     ContextMenuView, EntryDialogView, FileExplorerView, FileRow, KbConfirm, KbEditDialog, KbRow,
@@ -972,6 +975,7 @@ proto! {
         23 native_newline: uint32, 24 current_projection: bool,
         25 hanging_contexts: repeated ComposeHangingContext,
         26 editable: optional bool,
+        27 decoration_revision: optional uint64,
     }
     /// Measurement-only prefix samples; style ranges are relative display bytes.
     ComposeHangingContext { 1 item_start: uint64, 2 content_start: uint64, 3 text: string,
@@ -1059,6 +1063,14 @@ proto! {
         1 id: uint64, 2 owner: ComposeIndexOwner, 3 total_entries: uint64,
         4 label_bytes: uint64, 5 sequence: uint64, 6 parts: repeated ComposeIndexPart,
         7 done: bool, 8 error: string,
+    }
+    /// Type 5: a bounded binary piece of a complete encoded ComposePane.
+    /// Independent sequence/acknowledgments; never enters the render scene.
+    DocumentChunk as ComposeDocumentChunk {
+        1 id: uint64, 2 owner: ComposeIndexOwner, 3 selection: uint64,
+        4 sequence: uint64, 5 length: uint64, 6 data: bytes,
+        7 done: bool, 8 error: string,
+        9 decoration_revision: uint64,
     }
     /// A line between panes.
     SeparatorModel as Separator { 1 vertical: bool, 2 x: uint32, 3 y: uint32, 4 len: uint32 }
@@ -1305,6 +1317,8 @@ message ServerHello {
   bool compose_source_selections = 5;
   // Complete document navigation inventories, independently streamed as type 4.
   bool compose_semantic_index = 6;
+  // Complete projected text, independently streamed as type 5.
+  bool compose_document_text = 7;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -1385,6 +1399,15 @@ message ComposeIndexRequest {
   ComposeIndexOwner owner = 2;
   bool cancel = 3;
   optional uint64 applied_sequence = 4;
+}
+// Type 32: one owner+selection pair, cancel, or an explicit chunk acknowledgment.
+// The request reads a snapshot; it does not move a viewport or edit source.
+message ComposeDocumentRequest {
+  uint64 id = 1;
+  ComposeIndexOwner owner = 2;
+  bool cancel = 3;
+  optional uint64 applied_sequence = 4;
+  optional uint64 selection_revision = 5;
 }
 // Source carets captured with the input's source_revision (or scope revision).
 // A receipt reports only IDs whose unchanged mapped ranges match the live
@@ -1925,6 +1948,7 @@ impl ClientScene {
         field::uint(out, 4, 1);
         field::uint(out, 5, 1);
         field::uint(out, 6, 1);
+        field::uint(out, 7, 1);
     }
 }
 

@@ -227,6 +227,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     assert!(hello.compose_region_probes, "the server advertises independent region-probe support, including to legacy grid clients");
     assert!(hello.compose_source_selections, "native source selection groups are explicitly advertised");
     assert!(hello.compose_semantic_index, "complete source navigation is explicitly advertised");
+    assert!(hello.compose_document_text, "complete projection reads have their own capability");
     let scene = hello.scene.unwrap();
     assert_eq!((scene.width, scene.height), (Some(u32::from(COLS)), Some(u32::from(ROWS))));
     assert_eq!(scene.rows.len(), usize::from(ROWS), "every row of the grid");
@@ -307,8 +308,87 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_page_motion_keeps_pixel_distance_across_source_windows(&root,&work);
     rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
     rich_semantic_navigation_streams_complete_source_independently_of_frames(&root, &work);
+    rich_document_snapshots_prepare_full_projection_without_moving_the_viewport(&root, &work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
+}
+
+fn rich_document_snapshots_prepare_full_projection_without_moving_the_viewport(root: &std::path::Path, work: &std::path::Path) {
+    let source = "# Complete document\r\n\r\n| Key | Value |\r\n| --- | --- |\r\n| one | two |\r\n\r\n".to_owned()
+        + &"Paragraph with **bold** café 👩🏽‍💻 and a [link](target.md).\r\n\r\n".repeat(2600)
+        + "## Offscreen final heading\r\n\r\n![picture](missing.png)\r\n";
+    let file=work.join("complete-projection.md");std::fs::write(&file,&source).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed,&json!({})); }
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("complete-projection.sock");let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut app=App::connect(&path);app.send(16,pb::ClientHello {version:1,rich_compose:true,measured_tables:true,paragraph_windows:true,..Default::default()});
+    settle_bridge(&mut bridge,&mut ed);ready_scene(&mut bridge,&mut ed,&mut app);
+    let initial=app.panes.iter().find(|p|p.compose.is_some()).unwrap().clone();
+    let anchor=source.find("## Offscreen").unwrap() as u64;
+    let scope=pane_scope(app.window,&initial);
+    viewport_step(&mut bridge,&mut ed,&mut app,pb::ComposeViewportRequest {id:1,scope:Some(scope),
+        position:anchor,epoch:initial.compose.as_ref().unwrap().viewport.as_ref().unwrap().epoch,..Default::default()});
+    let visible=app.panes.iter().find(|p|p.compose.is_some()).unwrap().clone();let c=visible.compose.as_ref().unwrap();
+    assert!(c.source_start>0);
+    let owner=pb::ComposeIndexOwner {window:app.window,leaf:visible.leaf,buffer:visible.buffer.unwrap(),epoch:c.viewport.as_ref().unwrap().epoch,
+        revision:c.buffer_revision,authority:c.asset_authority,document:c.asset_document,length:source.len() as u64};
+    let selection=c.selection_revision;
+    app.send(32,pb::ComposeDocumentRequest {id:1,owner:Some(owner.clone()),selection_revision:Some(selection),..Default::default()});
+    app.stream.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+    fn next(bridge:&mut SceneBridge,ed:&mut fresh::app::Editor,app:&mut App)->pb::ComposeDocumentChunk {
+        let deadline=std::time::Instant::now()+Duration::from_secs(10);
+        loop {
+            assert!(std::time::Instant::now()<deadline,"complete projection did not finish preparing");
+            pass(bridge,ed);
+            if let Some((kind,bytes))=app.receive() {
+                match kind {
+                    5=>{assert!(bytes.len()<=128<<10);return pb::ComposeDocumentChunk::decode(&bytes[..]).unwrap();}
+                    2=>{let frame=pb::Frame::decode(&bytes[..]).unwrap();app.observe(&frame);app.send(26,pb::Applied {seq:frame.seq});}
+                    _=>panic!("unexpected message {kind}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let mut chunk=next(&mut bridge,&mut ed,&mut app);assert!(chunk.error.is_empty(),"{}",chunk.error);assert!(!chunk.done);
+    let mut bytes=Vec::new();let mut count=0;
+    loop {
+        assert!(chunk.error.is_empty(),"{}",chunk.error);assert_eq!(chunk.owner.as_ref(),Some(&owner));assert_eq!(chunk.selection,selection);
+        assert_eq!(chunk.sequence,count);assert!(chunk.data.len()<=64<<10);bytes.extend_from_slice(&chunk.data);
+        assert_eq!(chunk.done,bytes.len()==chunk.length as usize);
+        app.send(32,pb::ComposeDocumentRequest {id:1,applied_sequence:Some(count),..Default::default()});count+=1;
+        if chunk.done {break;}
+        chunk=next(&mut bridge,&mut ed,&mut app);
+    }
+    assert!(count>1);let complete=pb::ComposePane::decode(&bytes[..]).unwrap();
+    assert_eq!(complete.decoration_revision,Some(chunk.decoration_revision));
+    assert_eq!((complete.source_start,complete.source_end,complete.document_len),(0,source.len() as u64,source.len() as u64));
+    assert_eq!(complete.selection_revision,selection);assert_eq!(complete.viewport.unwrap().epoch,owner.epoch);
+    assert!(complete.text.contains("Offscreen final heading"));assert!(complete.text.contains("café 👩🏽‍💻"));
+    assert!(!complete.text.contains("**bold**"));assert!(!complete.text.contains("![picture]"));assert!(complete.text.contains('\u{fffc}'));
+    let current=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert_eq!(current.viewport.as_ref().unwrap().position,anchor);assert!(current.source_start>0,"the complete read must not replace the visible pane");
+    assert_eq!(ed.active_window().focused_view().viewport.top_byte(),0,"the terminal viewport is independent");
+    assert_eq!(std::fs::read(&file).unwrap(),source.as_bytes());
+    app.send(32,pb::ComposeDocumentRequest {id:2,owner:Some(owner.clone()),selection_revision:Some(selection),..Default::default()});
+    assert!(!next(&mut bridge,&mut ed,&mut app).done);
+    app.send(17,pb::Key {key:"ArrowRight".into(),..Default::default()});
+    let retired=next(&mut bridge,&mut ed,&mut app);assert!(retired.done && !retired.error.is_empty() && retired.data.is_empty());
+    assert_eq!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().cursors.iter().find(|c|c.primary).unwrap().position,1,
+        "ordinary input renders while a complete-read chunk awaits its own ACK");
+    let selection=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().selection_revision;
+    app.send(32,pb::ComposeDocumentRequest {id:3,owner:Some(owner),selection_revision:Some(selection),..Default::default()});
+    let chunk=next(&mut bridge,&mut ed,&mut app);assert!(!chunk.done && chunk.error.is_empty());
+    // A formatter-only invalidation must retire a read even though the source
+    // bytes, revision and cursor group still match its captured ownership.
+    {
+        let state=ed.active_window_mut().active_state_mut();
+        state.conceals.clear(&mut state.marker_list);
+    }
+    let retired=next(&mut bridge,&mut ed,&mut app);
+    assert!(retired.done && retired.data.is_empty() && retired.error.contains("formatting changed"),"{}",retired.error);
+    assert_eq!(std::fs::read(&file).unwrap(),source.as_bytes());
 }
 
 fn rich_semantic_navigation_streams_complete_source_independently_of_frames(root: &std::path::Path, work: &std::path::Path) {

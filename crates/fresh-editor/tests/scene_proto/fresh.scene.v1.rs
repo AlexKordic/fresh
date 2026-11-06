@@ -621,6 +621,8 @@ pub struct ComposePane {
     pub hanging_contexts: ::prost::alloc::vec::Vec<ComposeHangingContext>,
     #[prost(bool, optional, tag = "26")]
     pub editable: ::core::option::Option<bool>,
+    #[prost(uint64, optional, tag = "27")]
+    pub decoration_revision: ::core::option::Option<u64>,
 }
 /// Measurement-only prefix samples; style ranges are relative display bytes.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -932,6 +934,29 @@ pub struct ComposeIndexChunk {
     pub done: bool,
     #[prost(string, tag = "8")]
     pub error: ::prost::alloc::string::String,
+}
+/// Type 5: a bounded binary piece of a complete encoded ComposePane.
+/// Independent sequence/acknowledgments; never enters the render scene.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeDocumentChunk {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub owner: ::core::option::Option<ComposeIndexOwner>,
+    #[prost(uint64, tag = "3")]
+    pub selection: u64,
+    #[prost(uint64, tag = "4")]
+    pub sequence: u64,
+    #[prost(uint64, tag = "5")]
+    pub length: u64,
+    #[prost(bytes = "vec", tag = "6")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bool, tag = "7")]
+    pub done: bool,
+    #[prost(string, tag = "8")]
+    pub error: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "9")]
+    pub decoration_revision: u64,
 }
 /// A line between panes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1432,6 +1457,9 @@ pub struct ServerHello {
     /// Complete document navigation inventories, independently streamed as type 4.
     #[prost(bool, tag = "6")]
     pub compose_semantic_index: bool,
+    /// Complete projected text, independently streamed as type 5.
+    #[prost(bool, tag = "7")]
+    pub compose_document_text: bool,
 }
 /// Type 3: why Fresh is closing the connection.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1565,6 +1593,21 @@ pub struct ComposeIndexRequest {
     pub cancel: bool,
     #[prost(uint64, optional, tag = "4")]
     pub applied_sequence: ::core::option::Option<u64>,
+}
+/// Type 32: one owner+selection pair, cancel, or an explicit chunk acknowledgment.
+/// The request reads a snapshot; it does not move a viewport or edit source.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeDocumentRequest {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub owner: ::core::option::Option<ComposeIndexOwner>,
+    #[prost(bool, tag = "3")]
+    pub cancel: bool,
+    #[prost(uint64, optional, tag = "4")]
+    pub applied_sequence: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "5")]
+    pub selection_revision: ::core::option::Option<u64>,
 }
 /// Source carets captured with the input's source_revision (or scope revision).
 /// A receipt reports only IDs whose unchanged mapped ranges match the live

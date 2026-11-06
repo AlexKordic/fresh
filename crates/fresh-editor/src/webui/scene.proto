@@ -375,6 +375,7 @@ message ComposePane {
   bool current_projection = 24;
   repeated ComposeHangingContext hanging_contexts = 25;
   optional bool editable = 26;
+  optional uint64 decoration_revision = 27;
 }
 
 // Measurement-only prefix samples; style ranges are relative display bytes.
@@ -574,6 +575,20 @@ message ComposeIndexChunk {
   repeated ComposeIndexPart parts = 6;
   bool done = 7;
   string error = 8;
+}
+
+// Type 5: a bounded binary piece of a complete encoded ComposePane.
+// Independent sequence/acknowledgments; never enters the render scene.
+message ComposeDocumentChunk {
+  uint64 id = 1;
+  ComposeIndexOwner owner = 2;
+  uint64 selection = 3;
+  uint64 sequence = 4;
+  uint64 length = 5;
+  bytes data = 6;
+  bool done = 7;
+  string error = 8;
+  uint64 decoration_revision = 9;
 }
 
 // A line between panes.
@@ -860,6 +875,8 @@ message ServerHello {
   bool compose_source_selections = 5;
   // Complete document navigation inventories, independently streamed as type 4.
   bool compose_semantic_index = 6;
+  // Complete projected text, independently streamed as type 5.
+  bool compose_document_text = 7;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -940,6 +957,15 @@ message ComposeIndexRequest {
   ComposeIndexOwner owner = 2;
   bool cancel = 3;
   optional uint64 applied_sequence = 4;
+}
+// Type 32: one owner+selection pair, cancel, or an explicit chunk acknowledgment.
+// The request reads a snapshot; it does not move a viewport or edit source.
+message ComposeDocumentRequest {
+  uint64 id = 1;
+  ComposeIndexOwner owner = 2;
+  bool cancel = 3;
+  optional uint64 applied_sequence = 4;
+  optional uint64 selection_revision = 5;
 }
 // Source carets captured with the input's source_revision (or scope revision).
 // A receipt reports only IDs whose unchanged mapped ranges match the live
