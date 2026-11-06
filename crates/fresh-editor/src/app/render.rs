@@ -3494,6 +3494,11 @@ impl Editor {
         size: fresh_ui::Size,
     ) {
         self.lay_out_shell(shell, size);
+        // Input reconciliation clears host anchors just as a rendered frame
+        // does. Reuse the last settled text caret before publishing the new
+        // popup hit regions; otherwise a press relocates a captured popup to
+        // its unanchored fallback before the drag/release arrives.
+        self.publish_popup_carets(ratatui::layout::Rect::new(0, 0, size.w, size.h));
         self.paint_shell();
     }
 

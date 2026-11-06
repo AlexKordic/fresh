@@ -222,6 +222,32 @@ mod tests {
 
     #[cfg(feature = "web")]
     #[test]
+    fn popup_input_relayout_keeps_its_last_settled_caret_anchor() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (mut editor, _root) = editor();
+        let cursor = editor.active_cursors().primary_id();
+        editor.replace_native_texts(vec![(0..0, "Heading\n\nBody\n\ntext".into(), cursor)]).unwrap();
+        let theme = crate::view::theme::Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        let mut popup = Popup::text(vec!["selectable documentation".into()], &theme);
+        popup.focused = true;
+        popup.position = PopupPosition::BelowCursor;
+        editor.active_state_mut().popups.show(popup);
+        let _ = crate::webui::scene_value(&mut editor, 80, 24);
+        let before = editor.popups_view().remove(0);
+        editor.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: before.content_rect.x + 1,
+            row: before.content_rect.y,
+            modifiers: KeyModifiers::NONE,
+        }).unwrap();
+        editor.lay_out_shell_if_stale();
+        let after = editor.popups_view().remove(0);
+        assert_eq!(after.rect, before.rect, "a selection press cannot move the captured popup to an unanchored fallback");
+        assert_eq!(after.content_rect, before.content_rect);
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
     fn a_retained_popup_scroll_invalidates_its_version_without_changing_the_model_offset() {
         use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
         let (mut editor, _root) = editor();
