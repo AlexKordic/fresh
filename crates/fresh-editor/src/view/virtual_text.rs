@@ -189,6 +189,9 @@ pub struct VirtualTextId(pub u64);
 pub struct VirtualTextManager {
     /// Map from virtual text ID to virtual text entry
     texts: HashMap<VirtualTextId, VirtualText>,
+    /// Reverse ownership for marker-indexed per-line clears. Positions remain
+    /// owned by MarkerList, so edits need no second coordinate index.
+    marker_to_id: HashMap<MarkerId, VirtualTextId>,
     /// Next ID to assign
     next_id: u64,
     /// Monotonic version, bumped on every mutation.  Folded into
@@ -204,6 +207,7 @@ impl VirtualTextManager {
     pub fn new() -> Self {
         Self {
             texts: HashMap::new(),
+            marker_to_id: HashMap::new(),
             next_id: 0,
             version: 0,
         }
@@ -229,6 +233,20 @@ impl VirtualTextManager {
     #[inline]
     fn bump_version(&mut self) {
         self.version = self.version.wrapping_add(1);
+    }
+
+    fn insert_text(&mut self, id: VirtualTextId, text: VirtualText) {
+        let marker = text.marker_id;
+        if let Some(previous) = self.texts.insert(id, text) {
+            self.marker_to_id.remove(&previous.marker_id);
+        }
+        self.marker_to_id.insert(marker, id);
+    }
+
+    fn remove_text(&mut self, id: &VirtualTextId) -> Option<VirtualText> {
+        let text = self.texts.remove(id)?;
+        self.marker_to_id.remove(&text.marker_id);
+        Some(text)
     }
 
     /// Add a virtual text entry
@@ -257,7 +275,7 @@ impl VirtualTextManager {
         let id = VirtualTextId(self.next_id);
         self.next_id += 1;
 
-        self.texts.insert(
+        self.insert_text(
             id,
             VirtualText {
                 marker_id,
@@ -319,7 +337,7 @@ impl VirtualTextManager {
         let id = VirtualTextId(self.next_id);
         self.next_id += 1;
 
-        self.texts.insert(
+        self.insert_text(
             id,
             VirtualText {
                 marker_id,
@@ -362,7 +380,7 @@ impl VirtualTextManager {
         let id = VirtualTextId(self.next_id);
         self.next_id += 1;
 
-        self.texts.insert(
+        self.insert_text(
             id,
             VirtualText {
                 marker_id,
@@ -412,7 +430,7 @@ impl VirtualTextManager {
         let id = VirtualTextId(self.next_id);
         self.next_id += 1;
 
-        self.texts.insert(
+        self.insert_text(
             id,
             VirtualText {
                 marker_id,
@@ -507,7 +525,7 @@ impl VirtualTextManager {
         let id = VirtualTextId(self.next_id);
         self.next_id += 1;
 
-        self.texts.insert(
+        self.insert_text(
             id,
             VirtualText {
                 marker_id,
@@ -548,7 +566,7 @@ impl VirtualTextManager {
 
         let mut removed = false;
         for id in to_remove {
-            if let Some(vtext) = self.texts.remove(&id) {
+            if let Some(vtext) = self.remove_text(&id) {
                 marker_list.delete(vtext.marker_id);
                 removed = true;
             }
@@ -579,7 +597,7 @@ impl VirtualTextManager {
         let removed = !markers_to_delete.is_empty();
         for (id, marker_id) in markers_to_delete {
             marker_list.delete(marker_id);
-            self.texts.remove(&id);
+            self.remove_text(&id);
         }
         if removed {
             self.bump_version();
@@ -588,7 +606,7 @@ impl VirtualTextManager {
 
     /// Remove a virtual text entry
     pub fn remove(&mut self, marker_list: &mut MarkerList, id: VirtualTextId) -> bool {
-        if let Some(vtext) = self.texts.remove(&id) {
+        if let Some(vtext) = self.remove_text(&id) {
             marker_list.delete(vtext.marker_id);
             self.bump_version();
             true
@@ -604,6 +622,7 @@ impl VirtualTextManager {
             marker_list.delete(vtext.marker_id);
         }
         self.texts.clear();
+        self.marker_to_id.clear();
         if was_non_empty {
             self.bump_version();
         }
@@ -645,7 +664,7 @@ impl VirtualTextManager {
 
         let count = to_remove.len();
         for id in to_remove {
-            if let Some(vtext) = self.texts.remove(&id) {
+            if let Some(vtext) = self.remove_text(&id) {
                 marker_list.delete(vtext.marker_id);
             }
         }
@@ -750,7 +769,7 @@ impl VirtualTextManager {
 
         let removed = !to_remove.is_empty();
         for id in to_remove {
-            if let Some(vtext) = self.texts.remove(&id) {
+            if let Some(vtext) = self.remove_text(&id) {
                 marker_list.delete(vtext.marker_id);
             }
         }
@@ -771,25 +790,26 @@ impl VirtualTextManager {
         start: usize,
         end: usize,
     ) {
-        let to_remove: Vec<VirtualTextId> = self
-            .texts
-            .iter()
-            .filter_map(|(id, vtext)| {
-                if !vtext.position.is_line() || vtext.namespace.as_ref() != Some(namespace) {
+        if start >= end || self.texts.is_empty() {
+            return;
+        }
+        let to_remove: Vec<VirtualTextId> = marker_list
+            .query_range(start, end)
+            .into_iter()
+            .filter_map(|(marker, position, _)| {
+                if position < start || position >= end {
                     return None;
                 }
-                let pos = marker_list.get_position(vtext.marker_id)?;
-                if pos >= start && pos < end {
-                    Some(*id)
-                } else {
-                    None
-                }
+                let id = self.marker_to_id.get(&marker)?;
+                let text = self.texts.get(id)?;
+                (text.position.is_line() && text.namespace.as_ref() == Some(namespace))
+                    .then_some(*id)
             })
             .collect();
 
         let removed = !to_remove.is_empty();
         for id in to_remove {
-            if let Some(vtext) = self.texts.remove(&id) {
+            if let Some(vtext) = self.remove_text(&id) {
                 marker_list.delete(vtext.marker_id);
             }
         }
@@ -849,7 +869,7 @@ impl VirtualTextManager {
 
         let removed = !to_remove.is_empty();
         for id in to_remove {
-            if let Some(vtext) = self.texts.remove(&id) {
+            if let Some(vtext) = self.remove_text(&id) {
                 marker_list.delete(vtext.marker_id);
             }
         }
@@ -928,6 +948,133 @@ impl Default for VirtualTextManager {
 mod tests {
     use super::*;
     use ratatui::style::Color;
+
+    fn assert_marker_ownership(manager: &VirtualTextManager) {
+        assert_eq!(manager.texts.len(), manager.marker_to_id.len());
+        for (id, text) in &manager.texts {
+            assert_eq!(manager.marker_to_id.get(&text.marker_id), Some(id));
+        }
+    }
+
+    #[test]
+    fn indexed_line_clears_match_live_half_open_ranges_and_preserve_other_owners() {
+        let mut markers = MarkerList::new();
+        markers.set_buffer_size(30_000);
+        let mut manager = VirtualTextManager::new();
+        let wanted = VirtualTextNamespace::from_string("md-list-spacing".into());
+        let other = VirtualTextNamespace::from_string("another-plugin".into());
+        let foreign = markers.create_span(0, 30_000);
+        for index in 0..1500 {
+            let position = index * 17;
+            manager.add_line(
+                &mut markers,
+                position,
+                "spacer".into(),
+                hint_style(),
+                VirtualTextPosition::LineBelow,
+                wanted.clone(),
+                0,
+            );
+            manager.add_line(
+                &mut markers,
+                position,
+                "other".into(),
+                hint_style(),
+                VirtualTextPosition::LineAbove,
+                other.clone(),
+                0,
+            );
+            manager.add(
+                &mut markers,
+                position,
+                "inline".into(),
+                hint_style(),
+                VirtualTextPosition::AfterChar,
+                0,
+            );
+        }
+        markers.adjust_for_insert(1000, 7);
+        markers.adjust_for_delete(12_000, 123);
+        for start in (0..26_000).step_by(97) {
+            let end = start + 97;
+            let expected: std::collections::HashSet<_> = manager
+                .texts
+                .iter()
+                .filter_map(|(id, text)| {
+                    let position = markers.get_position(text.marker_id)?;
+                    (text.position.is_line()
+                        && text.namespace.as_ref() == Some(&wanted)
+                        && start <= position
+                        && position < end)
+                        .then_some(*id)
+                })
+                .collect();
+            let before: std::collections::HashSet<_> = manager.texts.keys().copied().collect();
+            let version = manager.version();
+            manager.clear_lines_in_range(&mut markers, &wanted, start, end);
+            let actual: std::collections::HashSet<_> = manager.texts.keys().copied().collect();
+            assert_eq!(actual, before.difference(&expected).copied().collect());
+            assert_eq!(
+                manager.version(),
+                version.wrapping_add(u32::from(!expected.is_empty()))
+            );
+            assert_marker_ownership(&manager);
+        }
+        assert!(markers.get_position(foreign).is_some());
+        assert!(manager.texts.values().any(|text| text.position.is_inline()));
+        assert!(manager
+            .texts
+            .values()
+            .any(|text| text.namespace.as_ref() == Some(&other)));
+        let version = manager.version();
+        manager.clear_lines_in_range(&mut markers, &other, 100, 100);
+        manager.clear_lines_in_range(&mut markers, &other, 200, 100);
+        assert_eq!(manager.version(), version);
+        manager.clear_namespace(&mut markers, &other);
+        assert_marker_ownership(&manager);
+        manager.clear(&mut markers);
+        assert!(manager.marker_to_id.is_empty());
+        assert!(markers.get_position(foreign).is_some());
+    }
+
+    #[test]
+    fn every_virtual_text_removal_retires_its_marker_ownership() {
+        let mut markers = MarkerList::new();
+        let mut manager = VirtualTextManager::new();
+        let ns = VirtualTextNamespace::from_string("line-owner".into());
+        let line = manager.add_line(
+            &mut markers,
+            10,
+            "line".into(),
+            hint_style(),
+            VirtualTextPosition::LineAbove,
+            ns,
+            0,
+        );
+        assert_marker_ownership(&manager);
+        assert!(manager.remove(&mut markers, line));
+        assert_marker_ownership(&manager);
+        for id in ["one", "prefix-a", "prefix-b", "inline-clear", "range-clear"] {
+            manager.add_with_id(
+                &mut markers,
+                20,
+                id.into(),
+                hint_style(),
+                VirtualTextPosition::BeforeChar,
+                0,
+                id.into(),
+            );
+        }
+        assert!(manager.remove_by_id(&mut markers, "one"));
+        assert_marker_ownership(&manager);
+        manager.remove_by_prefix(&mut markers, "prefix-");
+        assert_marker_ownership(&manager);
+        manager.clear_inline_in_range(&mut markers, "inline-", 20, 21);
+        assert_marker_ownership(&manager);
+        assert_eq!(manager.remove_in_range(&mut markers, 20, 21), 1);
+        assert!(manager.marker_to_id.is_empty());
+        assert!(manager.is_empty());
+    }
 
     fn hint_style() -> Style {
         Style::default().fg(Color::DarkGray)
