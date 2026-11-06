@@ -1099,7 +1099,10 @@ impl Document {
             }
             // Preserve paragraph joins, but do not let an unrelated preceding
             // paragraph pull the requested byte beyond the window's end.
-            let parsed_paragraph = self.paragraphs.iter().find(|r| r.contains(&at));
+            let physical_start = |byte| self.text[..byte].rfind('\n').map_or(0, |n| n + 1);
+            let parsed_paragraph = self.paragraphs.iter().find(|r| {
+                r.contains(&at) || paragraph_windows && physical_start(r.start) <= at && at < r.end
+            });
             let paragraph = parsed_paragraph.map_or_else(
                 || self.text[..at].rfind('\n').map_or(0, |n| n + 1),
                 |r| r.start,
@@ -1111,7 +1114,19 @@ impl Document {
             if paragraph_windows && parsed_paragraph.is_some() {
                 // Include source-owned leading whitespace so Home/Left can
                 // still address it and native hanging layout charges it once.
-                return self.text[..paragraph].rfind('\n').map_or(0, |n| n + 1);
+                return physical_start(paragraph);
+            }
+            if paragraph_windows {
+                let line_start = physical_start(at);
+                let line_end = self.text[at..]
+                    .find('\n')
+                    .map_or(self.text.len(), |n| at + n + 1);
+                if self.text[line_start..line_end]
+                    .bytes()
+                    .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    return line_start;
+                }
             }
             // Tight list paragraphs may omit Paragraph events. Retain their
             // marker context so hanging measurement is repeatable on a page.

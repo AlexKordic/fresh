@@ -365,6 +365,24 @@ mod tests {
     }
 
     #[test]
+    fn physical_indent_and_blank_line_pivots_do_not_expand_a_whole_loose_item() {
+        let text = "100) Opening\r\n\r\n".to_owned()
+            + &"     Later paragraph café 東京.\r\n\r\n".repeat(5000);
+        let doc = Document::parse(text, 0, 0, 1);
+        let anchor = doc.text.rfind("Later").unwrap();
+        let physical = doc.text[..anchor].rfind('\n').unwrap() + 1;
+        for start in [physical, physical - 2] {
+            let window = doc.source_window_policy(0, Some(anchor), Some(start..start + 2), true);
+            assert!(
+                window.start > super::super::WINDOW_BYTES,
+                "a physical flow pivot cannot pull in the opening marker: {window:?}"
+            );
+            assert!(window.end - window.start < super::super::WINDOW_BYTES * 2);
+            assert!(window.start <= start && start < window.end);
+        }
+    }
+
+    #[test]
     fn offscreen_prefixes_keep_a_multiline_first_image_atomic() {
         use crate::app::compose_readiness::Registry;
         use crate::model::event::BufferId;
