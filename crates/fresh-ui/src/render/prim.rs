@@ -514,14 +514,15 @@ pub(crate) fn selected_spans(
 /// mark has no cell, so the answer after its base character is the end of the
 /// whole cluster, which is where a caret goes.
 pub fn byte_of(rows: &[Row], whole: &str, row: usize, col: i32) -> Option<usize> {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
     let r = rows.get(row)?;
     if col < r.indent as i32 {
         return Some(r.src.start);
     }
     let mut at = r.indent as i32;
-    for (i, c) in whole[r.src.clone()].char_indices() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0) as i32;
+    for (i, cluster) in whole[r.src.clone()].grapheme_indices(true) {
+        let cw = UnicodeWidthStr::width(cluster) as i32;
         if cw > 0 && at + cw > col {
             return Some(r.src.start + i);
         }
@@ -2507,6 +2508,20 @@ mod byte_mapping_tests {
         assert_eq!(byte_of(&rows, text, 0, 2), Some(3));
         assert_eq!(byte_of(&rows, text, 0, 3), Some(3));
         assert_eq!(byte_of(&rows, text, 0, 4), Some(6), "past the row's text");
+    }
+
+    #[test]
+    fn a_pointer_addresses_whole_graphemes_with_the_same_width_as_paint() {
+        for cluster in ["👩🏽‍💻", "👨‍👩‍👧", "🇭🇷", "❤️", "e\u{301}"] {
+            let text = format!("a {cluster} z");
+            let rows = rows_of(&text, 20, Wrap::Word);
+            let width = unicode_width::UnicodeWidthStr::width(cluster) as i32;
+            for column in 2..2 + width {
+                assert_eq!(byte_of(&rows, &text, 0, column), Some(2), "{cluster} at column {column}");
+            }
+            assert_eq!(byte_of(&rows, &text, 0, 2 + width), Some(2 + cluster.len()), "{cluster}: its trailing caret follows the entire cluster");
+            assert_eq!(cell_of(&rows, &text, 2 + cluster.len()), (0, (2 + width) as u16));
+        }
     }
 
     #[test]
