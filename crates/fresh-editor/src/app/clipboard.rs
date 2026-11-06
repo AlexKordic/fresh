@@ -1381,11 +1381,10 @@ impl Editor {
 
         // Convert to buffer's line ending format (only used in non-column mode;
         // a single column-paste line never contains an embedded newline).
-        let paste_text_full = match self.active_state().buffer.line_ending() {
-            crate::model::buffer::LineEnding::LF => normalized.clone(),
-            crate::model::buffer::LineEnding::CRLF => normalized.replace('\n', "\r\n"),
-            crate::model::buffer::LineEnding::CR => normalized.replace('\n', "\r"),
-        };
+        let paste_text_full = normalized.replace(
+            '\n',
+            self.active_state().buffer.line_ending().insertion_str(),
+        );
 
         // Get deleted text for each selection
         let cursor_data_with_text: Vec<_> = {
@@ -1495,11 +1494,10 @@ impl Editor {
                 });
             }
             let text = text.replace("\r\n", "\n").replace('\r', "\n");
-            let text = match self.active_state().buffer.line_ending() {
-                crate::model::buffer::LineEnding::LF => text,
-                crate::model::buffer::LineEnding::CRLF => text.replace('\n', "\r\n"),
-                crate::model::buffer::LineEnding::CR => text.replace('\n', "\r"),
-            };
+            let text = text.replace(
+                '\n',
+                self.active_state().buffer.line_ending().insertion_str(),
+            );
             if !text.is_empty() {
                 events.push(Event::Insert {
                     position: range.start,
@@ -2072,6 +2070,43 @@ impl Editor {
             self.clipboard.copy(text);
             self.active_window_mut().status_message =
                 Some(t!("clipboard.yanked", count = len).to_string());
+        }
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+mod native_newline_tests {
+    use super::*;
+    use crate::model::buffer::LineEnding;
+    use crate::model::cursor::Cursor;
+
+    #[test]
+    fn native_insert_and_captured_replacement_keep_cr_buffers_line_model_normalized() {
+        for replacement in [false, true] {
+            let mut editor = crate::webui::build_editor(80, 24, &[], false).unwrap();
+            crate::webui::apply_step(&mut editor, &serde_json::json!({"type":"tail"}));
+            editor
+                .active_state_mut()
+                .buffer
+                .set_line_ending(LineEnding::CR);
+            *editor.active_cursors_mut().primary_mut() = Cursor::new(0);
+            let phrase = "A\r\nB\rC\n".to_string();
+            if replacement {
+                let id = editor.active_cursors().primary_id();
+                editor
+                    .replace_native_texts(vec![(0..0, phrase, id)])
+                    .unwrap();
+            } else {
+                editor.insert_native_text(phrase);
+            }
+            let state = editor.active_state();
+            let actual =
+                String::from_utf8(state.buffer.slice_bytes(0..state.buffer.len())).unwrap();
+            assert_eq!(
+                actual, "A\nB\nC\ntail",
+                "replacement={replacement}: CR is an on-disk policy, not an in-memory separator"
+            );
+            assert_eq!(editor.active_cursors().primary().position, 6);
         }
     }
 }
