@@ -793,6 +793,45 @@ impl Document {
         self.native_table_projection(state, start, end, cursors, objects, revealed, &[])
     }
 
+    fn source_window(&self, top_byte: usize, region: Option<usize>) -> Range<usize> {
+        let mut anchor = region.unwrap_or(top_byte).min(self.text.len());
+        while !self.text.is_char_boundary(anchor) {
+            anchor -= 1;
+        }
+        let context_start = |mut at: usize| {
+            while !self.text.is_char_boundary(at) {
+                at -= 1;
+            }
+            // Preserve paragraph joins, but do not let an unrelated preceding
+            // paragraph pull the requested byte beyond the window's end.
+            self.paragraphs
+                .iter()
+                .find(|r| r.contains(&at))
+                .map_or_else(
+                    || self.text[..at].rfind('\n').map_or(0, |n| n + 1),
+                    |r| r.start,
+                )
+        };
+        let mut start = context_start(if region.is_some() {
+            anchor.saturating_sub(WINDOW_BYTES / 3)
+        } else {
+            anchor
+        });
+        if anchor.saturating_sub(start) >= WINDOW_BYTES {
+            start = context_start(anchor);
+        }
+        let mut end = (start + WINDOW_BYTES)
+            .max(anchor.saturating_add(1))
+            .min(self.text.len());
+        while !self.text.is_char_boundary(end) {
+            end += 1;
+        }
+        if end < self.text.len() {
+            end += self.text[end..].find('\n').map_or(0, |n| n + 1);
+        }
+        start..end
+    }
+
     fn native_table_projection(
         &self,
         state: &crate::state::EditorState,
@@ -1282,26 +1321,8 @@ impl ComposeCache {
         }
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
-        let mut start = region
-            .map_or(top_byte, |anchor| anchor.saturating_sub(WINDOW_BYTES / 3))
-            .min(doc.text.len());
-        while !doc.text.is_char_boundary(start) {
-            start -= 1;
-        }
-        // Start with the entire paragraph whose source contains the anchor.
-        // This preserves Compose's join conceals across hard-wrapped prose.
-        if let Some(paragraph) = doc.paragraphs.iter().find(|r| r.contains(&start)) {
-            start = paragraph.start;
-        } else {
-            start = doc.text[..start].rfind('\n').map_or(0, |n| n + 1);
-        }
-        let mut end = (start + WINDOW_BYTES).min(doc.text.len());
-        while !doc.text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end < doc.text.len() {
-            end += doc.text[end..].find('\n').map_or(0, |n| n + 1);
-        }
+        let window = doc.source_window(top_byte, region);
+        let (mut start, mut end) = (window.start, window.end);
         // Conceal replacements must travel whole. Extend the requested slice
         // rather than clipping a range into an invalid source map.
         use crate::app::compose_readiness::Status;
@@ -1506,6 +1527,38 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_source_window_contains_anchor_after_a_long_preceding_paragraph() {
+        let text = "x".repeat(WINDOW_BYTES + 20_000) + "\n\nwanted\n";
+        let anchor = text.find("wanted").unwrap();
+        let doc = Document::parse(text, 0, 0, 1);
+        let window = doc.source_window(0, Some(anchor));
+        assert!(
+            window.contains(&anchor),
+            "requested byte {anchor} is outside returned source window {window:?}"
+        );
+        assert!(
+            window.start >= anchor,
+            "an unrelated giant paragraph must not expand the requested new paragraph"
+        );
+    }
+
+    #[test]
+    fn requested_source_windows_keep_unicode_joins_and_eof_when_context_exceeds_the_target_size() {
+        let text = "café 👩🏽‍💻 soft line\r\n".repeat(5000) + "end";
+        let doc = Document::parse(text, 0, 0, 1);
+        let anchor = doc.text.rfind("👩🏽‍💻").unwrap();
+        let window = doc.source_window(0, Some(anchor));
+        assert!(window.contains(&anchor));
+        assert_eq!(
+            window.start, 0,
+            "a long joined paragraph retains its own context"
+        );
+        assert!(doc.text.is_char_boundary(window.start) && doc.text.is_char_boundary(window.end));
+        let eof = doc.source_window(0, Some(doc.text.len()));
+        assert_eq!(eof.end, doc.text.len());
+    }
 
     #[test]
     fn measured_table_projection_keeps_image_objects_and_revealed_image_source_disjoint() {
