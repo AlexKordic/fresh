@@ -769,14 +769,22 @@ pub enum PopupContentView {
 mod popup_scene;
 pub use popup_scene::PopupSourceAnchor;
 
+/// A separate retained picture. The wire reuses GridRow's exact cell encoding.
+#[derive(Debug, Clone)]
+pub struct PopupGrid {
+    pub cells: ratatui::buffer::Buffer,
+}
+
 /// A floating popup (completion menu, hover doc, action chooser, …) projected
 /// semantically. `rect`/`content_rect` retain the pipeline's cell geometry.
 /// `source_anchor` additionally identifies source-relative placement in Compose;
 /// the frontend can measure that anchor with its own typography. `instance`
 /// distinguishes lifetimes and `version` fingerprints the current input target.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScenePopup {
+    #[serde(skip)]
+    pub grid: Option<PopupGrid>,
     pub instance: u64,
     pub version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -796,7 +804,13 @@ fn project_popup(
     inner: Rect,
     scroll: usize,
     source_anchor: Option<PopupSourceAnchor>,
-    presentation: &[fresh_ui::Item],
+    geometry: &[(
+        fresh_ui::ElementId,
+        fresh_ui::Rect,
+        fresh_ui::Point,
+        fresh_ui::Point,
+    )],
+    grid: Option<PopupGrid>,
 ) -> ScenePopup {
     use crate::view::popup::{PopupContent, PopupKind};
     let kind = match p.kind {
@@ -839,6 +853,7 @@ fn project_popup(
         },
     };
     let mut view = ScenePopup {
+        grid,
         instance: p.instance,
         version: 0,
         source_anchor,
@@ -850,7 +865,7 @@ fn project_popup(
         scroll_offset: scroll,
         content,
     };
-    view.version = popup_scene::version(&view, p, presentation);
+    view.version = popup_scene::version(&view, p, geometry);
     view
 }
 
@@ -884,16 +899,30 @@ impl Editor {
                 break;
             }
             let (outer, inner) = at(idx);
-            out.push(project_popup(p, outer, inner, p.scroll_offset,
-                self.popup_source_anchor(p), self.popup_presentation(idx)));
+            out.push(project_popup(
+                p,
+                outer,
+                inner,
+                p.scroll_offset,
+                self.popup_source_anchor(p),
+                &self.popup_input_geometry(idx),
+                self.popup_grid(idx, outer),
+            ));
         }
         // The description carries at most the top of the global stack, after
         // the buffer's — so it is the last entry, and only when there is one.
         if total > buffer_n {
             if let Some(p) = self.global_popups.top() {
                 let (outer, inner) = at(buffer_n);
-                out.push(project_popup(p, outer, inner, p.scroll_offset,
-                    self.popup_source_anchor(p), self.popup_presentation(buffer_n)));
+                out.push(project_popup(
+                    p,
+                    outer,
+                    inner,
+                    p.scroll_offset,
+                    self.popup_source_anchor(p),
+                    &self.popup_input_geometry(buffer_n),
+                    self.popup_grid(buffer_n, outer),
+                ));
             }
         }
         out

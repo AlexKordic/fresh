@@ -239,6 +239,8 @@ pub fn key_section(
 /// A popup's content, as the shell describes it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Body {
+    /// Original logical-line UTF-8 bytes, resolved by retained text hit tests.
+    pub selection: Option<crate::view::popup::PopupTextSelection>,
     /// Drawn into the top border. `render_title` already resolved it.
     pub title: Option<String>,
     /// A line of muted text above the content, and a blank one after it.
@@ -495,9 +497,15 @@ pub fn body(b: &Body, i: usize) -> Node<UiMsg> {
             Some(d) => description(d),
             None => col().h(Sizing::Cells(0)),
         },
-        content(&b.content, b.selected_hint.as_deref(), &b.pager)
-            .flex(1)
-            .key(popup_content_key(i)),
+        popup_content(
+            &b.content,
+            b.selected_hint.as_deref(),
+            &b.pager,
+            i,
+            b.selection,
+        )
+        .flex(1)
+        .key(popup_content_key(i)),
     ]);
     // Absorbing *inside* the frame, not around the whole thing: the stacked
     // paths are tried in order and the first that claims ends it, so an absorb
@@ -740,6 +748,16 @@ pub fn content(
     selected_hint: Option<&str>,
     pager: &Rc<fresh_ui::behavior::Pager>,
 ) -> Node<UiMsg> {
+    popup_content(c, selected_hint, pager, 0, None)
+}
+
+fn popup_content(
+    c: &PopupContent,
+    selected_hint: Option<&str>,
+    pager: &Rc<fresh_ui::behavior::Pager>,
+    popup: usize,
+    selection: Option<crate::view::popup::PopupTextSelection>,
+) -> Node<UiMsg> {
     match c {
         // A row per line, not one text node carrying newlines: a viewport
         // measures its child against the window, so a single node reports the
@@ -748,21 +766,26 @@ pub fn content(
         // its children, which is what the window has to be compared against.
         // Each line still wraps on its own, so a long one takes the rows it
         // needs and the sum stays honest.
-        PopupContent::Text(lines) => {
-            fresh_ui::viewport(selectable(col().children(lines.iter().map(|l| {
-                fresh_ui::text(l.clone())
+        PopupContent::Text(lines) => fresh_ui::viewport(selectable(col().children(
+            lines.iter().enumerate().map(|(line, l)| {
+                fresh_ui::text_runs(selection_runs(
+                    vec![Run::themed(l, pair("ui.popup_text_fg", "ui.popup_bg"))],
+                    line,
+                    selection,
+                ))
+                .key(text_line_key(popup, line))
+                .wrap_hanging()
+                .theme(pair("ui.popup_text_fg", "ui.popup_bg"))
+            }),
+        )))
+        .scrollbar(),
+        PopupContent::Markdown(lines) => fresh_ui::viewport(selectable(col().children(
+            lines.iter().enumerate().map(|(line, l)| {
+                fresh_ui::text_runs(selection_runs(styled_runs(l), line, selection))
+                    .key(text_line_key(popup, line))
                     .wrap_hanging()
-                    .theme(pair("ui.popup_text_fg", "ui.popup_bg"))
-            }))))
-            .scrollbar()
-        }
-        PopupContent::Markdown(lines) => fresh_ui::viewport(selectable(
-            col().children(
-                lines
-                    .iter()
-                    .map(|l| fresh_ui::text_runs(styled_runs(l)).wrap_hanging()),
-            ),
-        ))
+            }),
+        )))
         .scrollbar(),
         PopupContent::List { items, selected } => {
             let rows: Rc<Vec<PopupListItem>> = Rc::new(items.clone());
@@ -852,10 +875,79 @@ fn selectable(content: Node<UiMsg>) -> Node<UiMsg> {
         .on(
             fresh_ui::GestureKind::Move,
             Rc::new(|e: &fresh_ui::Event| {
+                if !e.captured {
+                    return None;
+                }
                 let (line, col) = cell(e);
                 Some(UiMsg::Ui(UiFact::PopupTextDrag { line, col }))
             }),
         )
+}
+
+pub(crate) fn text_line_key(popup: usize, line: usize) -> Key {
+    Key::Pair(format!("popup_text:{popup}").into(), line as u64)
+}
+
+fn selection_runs(
+    runs: Vec<Run>,
+    line: usize,
+    selection: Option<crate::view::popup::PopupTextSelection>,
+) -> Vec<Run> {
+    let Some(selection) = selection else {
+        return runs;
+    };
+    let ((first, start), (last, end)) = selection.normalized();
+    if line < first || line > last {
+        return runs;
+    }
+    let (start, end) = (
+        if line == first { start } else { 0 },
+        if line == last { end } else { usize::MAX },
+    );
+    if start >= end {
+        return runs;
+    }
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for run in runs {
+        let text = run.text.as_ref();
+        let boundary = |mut byte: usize| {
+            byte = byte.min(text.len());
+            while !text.is_char_boundary(byte) {
+                byte -= 1;
+            }
+            byte
+        };
+        let a = boundary(start.saturating_sub(offset));
+        let b = boundary(end.saturating_sub(offset));
+        let base = pair("ui.popup_text_fg", "ui.popup_bg");
+        let theme = run
+            .theme
+            .as_ref()
+            .map(|theme| theme.as_str())
+            .unwrap_or(&base);
+        if a > 0 {
+            out.push(Run {
+                text: text[..a].into(),
+                theme: run.theme.clone(),
+            });
+        }
+        if a < b {
+            let ink = Ink::parse(theme)
+                .unwrap_or_else(|| Ink::keys("ui.popup_text_fg", "ui.popup_bg"))
+                .with_fg(Paint::key("ui.popup_selection_fg"))
+                .with_bg(Paint::key("ui.popup_selection_bg"));
+            out.push(Run::themed(&text[a..b], ink.to_string()));
+        }
+        if b < text.len() {
+            out.push(Run {
+                text: text[b..].into(),
+                theme: run.theme.clone(),
+            });
+        }
+        offset += text.len();
+    }
+    out
 }
 
 /// The painter's row ladder, in the painter's own keys.
@@ -1413,6 +1505,7 @@ mod tests {
                     at: CaretAnchor::Caret,
                     size: (30, 8),
                     body: Body {
+                        selection: None,
                         title: None,
                         description: None,
                         content: PopupContent::List { items, selected: 0 },
@@ -1454,6 +1547,7 @@ mod tests {
                     at: CaretAnchor::Caret,
                     size: popup.asked_size(area),
                     body: Body {
+                        selection: None,
                         title: None,
                         description: None,
                         content: popup.content.clone(),

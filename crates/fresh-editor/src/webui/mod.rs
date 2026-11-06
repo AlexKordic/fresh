@@ -118,6 +118,7 @@ mod compose_text;
 mod compose_tables;
 pub(crate) mod compose_navigation;
 pub(crate) mod compose_viewport;
+mod popup_pointer;
 #[cfg(unix)]
 mod scene_bridge;
 #[cfg(unix)]
@@ -779,11 +780,11 @@ impl HostedBridge {
         }
     }
 
-    pub fn maintain(&mut self) -> bool {
+    pub fn maintain(&mut self, editor: &mut Editor) -> bool {
         match self {
             HostedBridge::Web(b) => b.maintain(),
             #[cfg(unix)]
-            HostedBridge::Scene(b) => b.maintain(),
+            HostedBridge::Scene(b) => b.maintain(editor),
         }
     }
 }
@@ -2486,7 +2487,13 @@ impl<'r> SceneModel<'r> {
         // gets pane interiors only and draws the chrome natively.
         let started = Instant::now();
         let (buf, cursor) = match target {
-            SceneFor::App => renderer.render(editor, cols, rows),
+            SceneFor::App => {
+                let previous = editor.suppress_popup_cells;
+                editor.suppress_popup_cells = true;
+                let result = renderer.render(editor, cols, rows);
+                editor.suppress_popup_cells = previous;
+                result
+            }
             SceneFor::Browser => with_chrome_suppressed(editor, |e| renderer.render(e, cols, rows)),
         };
         times.render_ms = started.elapsed().as_secs_f64() * 1000.0;

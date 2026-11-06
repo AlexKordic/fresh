@@ -677,6 +677,7 @@ impl Editor {
             scroll_offset: 0,
             pager: Default::default(),
             text_selection: None,
+            selection_is_source: false,
             accept_key_hint: None,
             // Mark this as the LSP status popup so confirm/cancel routes through
             // handle_lsp_status_action regardless of what else is on screen.
@@ -988,6 +989,7 @@ impl Editor {
             scroll_offset: 0,
             pager: Default::default(),
             text_selection: None,
+            selection_is_source: false,
             accept_key_hint: None,
             resolver: PopupResolver::RemoteIndicator,
             // Explicitly invoked from the status-bar `{remote}` element,
@@ -1067,6 +1069,7 @@ impl Editor {
             scroll_offset: 0,
             pager: Default::default(),
             text_selection: None,
+            selection_is_source: false,
             accept_key_hint: None,
             resolver: PopupResolver::ReadOnly,
             // Explicitly invoked from the status-bar `{read_only}` element, so
@@ -1310,6 +1313,7 @@ impl Editor {
             scroll_offset: 0,
             pager: Default::default(),
             text_selection: None,
+            selection_is_source: false,
             accept_key_hint: None,
             resolver: PopupResolver::Update,
             focused: true,
@@ -1583,6 +1587,7 @@ impl Editor {
             scroll_offset: 0,
             pager: Default::default(),
             text_selection: None,
+            selection_is_source: false,
             accept_key_hint: None,
             resolver: PopupResolver::WorkspaceTrust,
             focused: true,

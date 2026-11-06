@@ -34,8 +34,9 @@ in cells. It additionally carries an `instance` for each shown lifetime, a
 `id`. Showing a clone or replacing a popup gives it a new lifetime. Content,
 scroll, source owner, placement and action-payload changes invalidate its
 version, including updates that leave the visible labels unchanged.
-The fingerprint includes the retained presentation because a component can
-scroll or change hover independently of the popup model's legacy offset.
+The fingerprint includes retained geometry and actual scroll offsets because
+a component can scroll independently of the popup model's legacy offset.
+Hover or selection colors alone do not retire the target.
 
 A cursor-relative popup in a Compose pane has a `source_anchor` naming its
 window, leaf, buffer, buffer lifetime and source revision. Its caret byte
@@ -45,12 +46,27 @@ below with an above fallback, and above. Fixed, centered and status-anchored
 popups carry no source anchor. The annotation uses the focused pane's view,
 including when two panes show the same buffer with different carets.
 
-These annotations do not move the retained UI's cell geometry or change the
-existing browser/TUI pointer path. A host relocating a popup must validate its
-owner and version, translate its input into the retained UI, and omit the
-old hit region for input aimed elsewhere. `fresh-ui` provides the scoped
-`dispatch_without_pointer_subtrees` primitive for that last step; keyboard
-and pointer-modal ownership remain with the retained tree.
+The binary scene carries a separate `PopupGrid` with actual wrapped rows,
+styles, scrolling, selection and close affordances. Its underlying grid omits
+popup paint. Browser JSON and ordinary TUI rendering retain their own paths.
+Native clients negotiate `native_popup_projection` with rich Compose; the
+server advertises support in its hello. `PopupPointer` (message 30) carries
+an issued lifetime/version, mouse operation and signed local cell coordinates.
+The server rejects unissued, closed, scrolled or changed targets without
+document fallback. The event is delivered through
+`dispatch_to_pointer_subtree`; ordinary native mouse input uses
+`dispatch_without_pointer_subtrees` for moved surfaces. Keyboard and higher
+pointer-modal ownership remain with the retained tree.
+Capture also binds the original source owner; owner/lifetime retirement or
+client disconnection cancels retained capture, scrollbar grabs and drag state
+before they can continue from an obsolete coordinate basis.
+
+An ordered `ComposeInput` can wrap the popup pointer without document geometry.
+It returns a captured source receipt after acceptance or terminal cancellation
+for a changed target. This lets native consumers serialize following text
+against the real completion result rather than guessing cursor movement.
+Text selection resolves logical bytes through the retained wrapped rows and
+paints selected runs without losing Markdown emphasis or splitting graphemes.
 
 ## 2. The benchmark — what "VS Code-level polish" decomposes into
 

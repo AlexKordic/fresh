@@ -131,7 +131,7 @@ impl Editor {
 
     /// Dismiss transient popups if present
     /// These popups should be dismissed on scroll or other user actions
-    pub(super) fn dismiss_transient_popups(&mut self) {
+    pub(crate) fn dismiss_transient_popups(&mut self) {
         // Action popups are persistent by design — only buffer-level transient
         // popups (Hover, Signature Help) get auto-dismissed here.
         let is_transient_popup = self

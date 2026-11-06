@@ -29,6 +29,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_SCENE_CLIENT: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+#[path = "scene_bridge_popup_tests.rs"]
+mod popup_tests;
+
 /// The socket's buffers each way: macOS gives a Unix socket 8 KiB, a
 /// fraction of one frame.
 const SOCKET_BUFFER: libc::c_int = 4 << 20;
@@ -93,6 +97,9 @@ struct SceneClient {
     rich_compose: bool,
     measured_tables: bool,
     paragraph_windows: bool,
+    native_popup_projection: bool,
+    popup_targets: HashSet<(u64, u64)>,
+    popup_capture: Option<super::popup_pointer::Capture>,
     /// Measurements already delivered for each visible pane/table identity.
     table_measurements: HashSet<(u64, u64, u64, usize, usize, u64)>,
     last_input: u64,
@@ -200,15 +207,24 @@ impl SceneBridge {
                 Err(reason) => {
                     eprintln!("[scene] client dropped: {reason}");
                     let mut client = self.clients.remove(i);
+                    super::popup_pointer::retire(editor, &mut client.popup_capture);
                     client.fail(&reason);
                     out.resize_dirty = true;
                 }
             }
         }
         let live: HashSet<_> = self.clients.iter().map(|client| client.id).collect();
+        let popups = editor.popups_view();
         for client in &mut self.clients {
-            if let Some(target) = client.pending_input_target.filter(|target| !target.valid(editor)) {
-                client.cancel_input(target.id, "The pending editor action was cancelled because its file or view changed.");
+            super::popup_pointer::reconcile(editor, &popups, &mut client.popup_capture);
+            if let Some(target) = client
+                .pending_input_target
+                .filter(|target| !target.valid(editor))
+            {
+                client.cancel_input(
+                    target.id,
+                    "The pending editor action was cancelled because its file or view changed.",
+                );
                 out.frame_owed = true;
             }
         }
@@ -392,9 +408,18 @@ impl SceneBridge {
                 false
             };
             client.rich_encoded = rich_encoded;
+            super::popup_pointer::reconcile(editor, &model.popups, &mut client.popup_capture);
             // A held scene was never delivered. Keep the previous bases until
             // a real frame/hello establishes the receiver's current pane set.
-            if sent { client.table_measurements = table_measurements; }
+            if sent {
+                client.table_measurements = table_measurements;
+                client.popup_targets = model
+                    .popups
+                    .iter()
+                    .filter(|popup| popup.source_anchor.is_some() && popup.grid.is_some())
+                    .map(|popup| (popup.instance, popup.version))
+                    .collect();
+            }
         }
         compose_regions.sort_by_key(|r| (r.buffer.0, r.leaf.0.0, r.source.start, r.source.end));
         compose_regions.dedup();
@@ -410,12 +435,13 @@ impl SceneBridge {
 
     /// Send what is waiting, without blocking. Returns true when the set of
     /// apps shrank (one stopped reading for too long), so the host refits.
-    pub fn maintain(&mut self) -> bool {
+    pub fn maintain(&mut self, editor: &mut Editor) -> bool {
         let before = self.clients.len();
         self.clients.retain_mut(|c| match c.flush() {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("[scene] client dropped: {e}");
+                super::popup_pointer::retire(editor, &mut c.popup_capture);
                 false
             }
         });
@@ -464,6 +490,9 @@ impl SceneClient {
             rich_compose: false,
             measured_tables: false,
             paragraph_windows: false,
+            native_popup_projection: false,
+            popup_targets: HashSet::new(),
+            popup_capture: None,
             table_measurements: HashSet::new(),
             last_input: 0,
             last_input_reply: None,
@@ -599,6 +628,22 @@ impl SceneClient {
         self.finish_input(super::compose::InputReply { id, cancelled: true, error: error.into(), ..Default::default() });
     }
 
+    fn apply_popup_pointer(&mut self, payload: &[u8], editor: &mut Editor) -> Result<bool, String> {
+        if !self.native_popup_projection {
+            return Err("projected popup input requires its hello capability".into());
+        }
+        let request = super::popup_pointer::Request::parse(payload).map_err(|e| e.to_string())?;
+        if self
+            .popup_targets
+            .contains(&(request.instance, request.version))
+        {
+            Ok(request.apply(editor, &mut self.popup_capture))
+        } else {
+            super::popup_pointer::retire(editor, &mut self.popup_capture);
+            Ok(false)
+        }
+    }
+
     fn handle(
         &mut self,
         k: u64,
@@ -613,7 +658,14 @@ impl SceneClient {
             if k != kind::CLIENT_HELLO {
                 return Err(format!("expected a hello, got message type {k}"));
             }
-            let (mut version, mut telemetry, mut rich_compose, mut measured_tables, mut paragraph_windows) = (0, false, false, false, false);
+            let (
+                mut version,
+                mut telemetry,
+                mut rich_compose,
+                mut measured_tables,
+                mut paragraph_windows,
+                mut native_popup_projection,
+            ) = (0, false, false, false, false, false);
             for f in Reader::new(payload) {
                 match f.map_err(w)? {
                     (1, v) => version = v.uint(),
@@ -621,6 +673,7 @@ impl SceneClient {
                     (3, v) => rich_compose = v.flag(),
                     (4, v) => measured_tables = v.flag(),
                     (5, v) => paragraph_windows = v.flag(),
+                    (6, v) => native_popup_projection = v.flag(),
                     _ => {}
                 }
             }
@@ -634,6 +687,10 @@ impl SceneClient {
             self.measured_tables = measured_tables;
             if paragraph_windows && !rich_compose { return Err("paragraph windows require rich_compose".into()); }
             self.paragraph_windows = paragraph_windows;
+            if native_popup_projection && !rich_compose {
+                return Err("native popup projection requires rich_compose".into());
+            }
+            self.native_popup_projection = native_popup_projection;
             out.frame_owed = true;
             return Ok(());
         }
@@ -739,6 +796,30 @@ impl SceneClient {
                 });
                 if self.pending_input_target.is_some_and(|target| !target.valid(editor)) {
                     self.cancel_input(input.id, "The pending editor action was cancelled because its file or view changed.");
+                    out.frame_owed = true;
+                    return Ok(());
+                }
+                if input.kind == kind::POPUP_POINTER {
+                    if input.position.is_some() || input.layout.is_some() || input.region.is_some()
+                    {
+                        return Err("popup pointer must not carry document geometry".into());
+                    }
+                    if self.apply_popup_pointer(input.payload, editor)? {
+                        out.mutated = true;
+                        self.navigation.clear();
+                        let result = self.input_result(editor, compose, &input);
+                        self.finish_input(super::compose::InputReply {
+                            id: input.id,
+                            accepted: true,
+                            result,
+                            ..Default::default()
+                        });
+                    } else {
+                        self.cancel_input(
+                            input.id,
+                            "The popup changed or closed. Retry the popup action.",
+                        );
+                    }
                     out.frame_owed = true;
                     return Ok(());
                 }
@@ -881,9 +962,19 @@ impl SceneClient {
                 apply_key(editor, input);
                 out.mutated = true;
             }
+            kind::POPUP_POINTER => {
+                out.mutated |= self.apply_popup_pointer(payload, editor)?;
+                out.frame_owed = true;
+            }
             kind::MOUSE => {
                 if let Some(input) = mouse(payload).map_err(w)? {
+                    if matches!(input.kind, MouseEventKind::Down(_)) {
+                        super::popup_pointer::retire(editor, &mut self.popup_capture);
+                    }
+                    let previous = editor.projected_popup_pointer;
+                    editor.projected_popup_pointer = self.native_popup_projection;
                     apply_mouse(editor, input);
+                    editor.projected_popup_pointer = previous;
                 }
                 out.mutated = true;
             }
@@ -1080,7 +1171,7 @@ impl SceneClient {
 }
 
 /// A `Mouse` message as the event it names; `None` for an unknown kind.
-fn mouse(payload: &[u8]) -> Result<Option<MouseInput>, WireError> {
+pub(super) fn mouse(payload: &[u8]) -> Result<Option<MouseInput>, WireError> {
     let (mut kind, mut button) = (0, 0);
     let mut input = MouseInput {
         kind: MouseEventKind::Moved,

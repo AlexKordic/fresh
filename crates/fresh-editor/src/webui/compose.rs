@@ -635,6 +635,9 @@ impl<'a> Input<'a> {
     }
 
     pub fn pointer(&self, editor: &mut Editor) -> bool {
+        if !editor.native_compose_pointer_allowed() {
+            return false;
+        }
         let (Some(scope), Some(mut position)) = (&self.scope, self.position) else {
             return false;
         };
@@ -658,6 +661,7 @@ impl<'a> Input<'a> {
         {
             return false;
         }
+        editor.dismiss_transient_popups();
         editor.focus_split(scope.leaf, scope.buffer);
         if let Some(start) = self.attachment_start.filter(|_| self.count < 2) {
             editor

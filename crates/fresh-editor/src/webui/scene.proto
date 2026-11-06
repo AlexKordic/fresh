@@ -165,6 +165,7 @@ message ScenePopup {
   uint64 instance = 8;
   uint64 version = 9;
   PopupSourceAnchor source_anchor = 10;
+  PopupGrid grid = 11;
 }
 
 message FileRow {
@@ -729,6 +730,10 @@ message GridRow {
   repeated uint32 run_bytes = 3;
   repeated uint64 run_styles = 4;
 }
+// A popup's own retained cells, before overlap with other surfaces.
+message PopupGrid {
+  repeated GridRow rows = 1;
+}
 message PaneUpdate {
   uint32 index = 1;
   Pane pane = 2;
@@ -803,6 +808,8 @@ message ServerHello {
   Frame scene = 2;
   // Supports independent source-region probes without moving the reading anchor.
   bool compose_region_probes = 3;
+  // Separate retained popup pictures and owner-scoped projected pointer input.
+  bool native_popup_projection = 4;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -818,6 +825,16 @@ message ClientHello {
   bool measured_tables = 4;
   // Accept offscreen prefix samples and complete paragraph windows.
   bool paragraph_windows = 5;
+  // Use explicit source anchors for popup placement; requires rich_compose.
+  bool native_popup_projection = 6;
+}
+// Type 30: a pointer in a projected popup's local cells. Never document input.
+message PopupPointer {
+  uint64 instance = 1;
+  uint64 version = 2;
+  Mouse mouse = 3;
+  sint32 column = 4;
+  sint32 row = 5;
 }
 // A pane identity and the exact source/projection the client interacted with.
 message ComposeScope {

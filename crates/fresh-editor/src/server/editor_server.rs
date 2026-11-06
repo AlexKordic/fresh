@@ -857,7 +857,7 @@ impl EditorServer {
         // Heartbeat/flush here rather than in the render path: reaping a
         // half-open browser frees a size constraint, and the refit below is
         // where that gets acted on.
-        let reaped = bridge.maintain();
+        let reaped = bridge.maintain(editor);
         // The `/resize` HTTP route resizes the editor directly. The refit is
         // the authority on the shared grid, so note the drift and force the
         // capture backend and the editor back into agreement afterwards.

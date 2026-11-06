@@ -1720,6 +1720,7 @@ pub(crate) fn convert_popup_data_to_popup(
         scroll_offset: 0,
         pager: Default::default(),
         text_selection: None,
+        selection_is_source: false,
         accept_key_hint: None,
         resolver,
         focused,

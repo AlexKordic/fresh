@@ -125,7 +125,7 @@ fn pass(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor) {
     if poll.mutated || poll.frame_owed || poll.resize_dirty || changed {
         bridge.push_scene(ed, COLS, ROWS);
     }
-    bridge.maintain();
+    bridge.maintain(ed);
 }
 
 fn ready_scene(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor, app: &mut App) -> pb::Frame {
@@ -1692,7 +1692,7 @@ fn rich_input_intents_rebase_and_cancel_when_the_view_changes(root: &std::path::
     bridge.poll(&mut ed, &mut cols, &mut rows);
     assert!(bridge.is_busy(), "the cancellation/retry race must not disconnect the client");
     bridge.push_scene(&mut ed, COLS, ROWS);
-    bridge.maintain();
+    bridge.maintain(&mut ed);
     let cancelled = rich_reply(&mut bridge, &mut ed, &mut app, &mut scope, 6).input_reply.unwrap();
     assert!(cancelled.cancelled && !cancelled.accepted);
     assert!(!cancelled.error.is_empty());

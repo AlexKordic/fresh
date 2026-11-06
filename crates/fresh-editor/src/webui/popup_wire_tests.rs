@@ -10,6 +10,7 @@ use prost::Message as ProstMessage;
 #[test]
 fn popup_source_owner_and_duplicate_label_row_ids_survive_the_wire() {
     let view = ScenePopup {
+        grid: None,
         instance: 41,
         version: 42,
         kind: "completion",

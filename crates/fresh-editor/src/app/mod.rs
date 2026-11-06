@@ -17,9 +17,9 @@ pub(crate) mod chrome;
 pub(crate) mod click_geometry;
 mod click_handlers;
 mod clipboard;
-mod composite_buffer_actions;
 #[cfg(feature = "web")]
 pub(crate) mod compose_readiness;
+mod composite_buffer_actions;
 pub mod confirm_dialog;
 mod dabbrev_actions;
 mod diagnostic_jumps;
@@ -1208,6 +1208,10 @@ pub struct Editor {
     /// hide. The TUI/GUI leave it `false` and draw chrome to cells as before.
     /// See docs/internal/web-ui.md.
     pub(crate) suppress_chrome_cells: bool,
+    /// Native scene draws semantic popups from separate retained pictures.
+    pub(crate) suppress_popup_cells: bool,
+    /// Scoped to native scene input; old source-popup hit regions are omitted.
+    pub(crate) projected_popup_pointer: bool,
     /// The status bar's elements for the frame being rendered.
     ///
     /// Kept because reading a rectangle

@@ -1023,9 +1023,15 @@ impl Editor {
         self.paint_shell();
 
         let palette = self.shell_palette();
-        let paints = match self.suppress_chrome_cells {
-            true => crate::view::shell::fold::Paints::HostsOnly,
-            false => crate::view::shell::fold::Paints::All,
+        let popup_keys: Vec<_> = (0..self.popup_counts().1)
+            .map(crate::view::shell::popup::popup_key)
+            .collect();
+        let paints = if self.suppress_chrome_cells {
+            crate::view::shell::fold::Paints::HostsOnly
+        } else if self.suppress_popup_cells {
+            crate::view::shell::fold::Paints::Except(&popup_keys)
+        } else {
+            crate::view::shell::fold::Paints::All
         };
         let ui = self
             .shell_ui
@@ -3866,6 +3872,7 @@ impl Editor {
             at: CaretAnchor::for_kind(p.kind),
             size: p.asked_size(chrome),
             body: Body {
+                selection: p.source_selection(),
                 title: p.render_title(),
                 description: p.description.clone(),
                 content: p.content.clone(),

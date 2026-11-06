@@ -160,7 +160,7 @@ pub fn fold_all(
     buf: &mut Buffer,
     palette: &dyn Palette,
     host: &mut dyn HostPainter,
-    paints: Paints,
+    paints: Paints<'_>,
     provenance: Option<&mut dyn ProvenanceSink>,
 ) {
     match provenance {
@@ -195,9 +195,13 @@ pub fn fold_all(
 /// so the pass that fed the web its pane cells had to be a second, separate
 /// call to the split renderer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Paints {
+pub enum Paints<'a> {
     All,
     HostsOnly,
+    /// Host draws these retained subtrees at another location.
+    Except(&'a [fresh_ui::Key]),
+    /// A standalone picture of one keyed subtree, with its original clipping.
+    Only(&'a fresh_ui::Key),
 }
 
 /// [`fold`], restricted to one band. See [`Band`].
@@ -207,7 +211,7 @@ pub fn fold_band(
     palette: &dyn Palette,
     host: &mut dyn HostPainter,
     band: Band,
-    paints: Paints,
+    paints: Paints<'_>,
     mut provenance: Option<&mut dyn ProvenanceSink>,
 ) {
     let frame = buf.area;
@@ -221,7 +225,36 @@ pub fn fold_band(
         Band::Background => spec.in_flow(),
         Band::Overlay => spec.layers(),
     };
-    for item in items {
+    let base = if band == Band::Overlay {
+        spec.layers_from.min(spec.items.len())
+    } else {
+        0
+    };
+    let ranges: Vec<_> = match paints {
+        Paints::Except(keys) => keys
+            .iter()
+            .filter_map(|key| {
+                spec.index
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, r)| r.clone())
+            })
+            .collect(),
+        Paints::Only(key) => spec
+            .index
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, r)| vec![r.clone()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    for (offset, item) in items.iter().enumerate() {
+        let selected = ranges.iter().any(|r| r.contains(&(base + offset)));
+        if matches!(paints, Paints::Except(_)) && selected
+            || matches!(paints, Paints::Only(_)) && !selected
+        {
+            continue;
+        }
         if paints == Paints::HostsOnly && !matches!(item.draw, Draw::Host(_)) {
             continue;
         }

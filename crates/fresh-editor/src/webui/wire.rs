@@ -46,6 +46,7 @@ pub(crate) mod kind {
     pub const COMPOSE_INPUT: u64 = 27;
     pub const COMPOSE_ASSET: u64 = 28;
     pub const COMPOSE_VIEWPORT_REQUEST: u64 = 29;
+    pub const POPUP_POINTER: u64 = 30;
 }
 
 /// The protocol version a client's hello must name.
@@ -782,10 +783,10 @@ use super::compose_navigation::CaretState;
 use crate::view::scene::{
     ContextMenuView, EntryDialogView, FileExplorerView, FileRow, KbConfirm, KbEditDialog, KbRow,
     KbSearchView, KeybindingEditorView, MapEntryView, MenuEntry, MenuItemView, PaletteView,
-    PopupContentView, PopupItemView, PopupSourceAnchor, PopupSpanView, RectView, ScenePopup, SearchOptionView,
-    SearchOptionsView, SettingControlView, SettingItemView, SettingsCategoryView,
-    SettingsSearchResultView, SettingsView, StatusSegment, StatusView, SuggestionView, TabBarView,
-    TabView, TrustDialogView, TrustOptionView,
+    PopupContentView, PopupGrid, PopupItemView, PopupSourceAnchor, PopupSpanView, RectView,
+    ScenePopup, SearchOptionView, SearchOptionsView, SettingControlView, SettingItemView,
+    SettingsCategoryView, SettingsSearchResultView, SettingsView, StatusSegment, StatusView,
+    SuggestionView, TabBarView, TabView, TrustDialogView, TrustOptionView,
 };
 
 /// A frame's timing, for the front end's latency telemetry (telemetry on).
@@ -870,6 +871,7 @@ proto! {
         1 kind: string, 2 title: optional string, 3 description: optional string,
         4 rect: Rect, 5 content_rect: Rect, 6 scroll_offset: uint64, 7 content: PopupContent,
         8 instance: uint64, 9 version: uint64, 10 source_anchor: maybe PopupSourceAnchor,
+        11 grid: maybe PopupGrid,
     }
     FileRow { 1 name: string, 2 depth: uint64, 3 is_dir: bool, 4 expanded: bool }
     FileExplorerView {
@@ -1178,6 +1180,10 @@ message GridRow {
   repeated uint32 run_bytes = 3;
   repeated uint64 run_styles = 4;
 }
+// A popup's own retained cells, before overlap with other surfaces.
+message PopupGrid {
+  repeated GridRow rows = 1;
+}
 message PaneUpdate {
   uint32 index = 1;
   Pane pane = 2;
@@ -1252,6 +1258,8 @@ message ServerHello {
   Frame scene = 2;
   // Supports independent source-region probes without moving the reading anchor.
   bool compose_region_probes = 3;
+  // Separate retained popup pictures and owner-scoped projected pointer input.
+  bool native_popup_projection = 4;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -1267,6 +1275,16 @@ message ClientHello {
   bool measured_tables = 4;
   // Accept offscreen prefix samples and complete paragraph windows.
   bool paragraph_windows = 5;
+  // Use explicit source anchors for popup placement; requires rich_compose.
+  bool native_popup_projection = 6;
+}
+// Type 30: a pointer in a projected popup's local cells. Never document input.
+message PopupPointer {
+  uint64 instance = 1;
+  uint64 version = 2;
+  Mouse mouse = 3;
+  sint32 column = 4;
+  sint32 row = 5;
 }
 // A pane identity and the exact source/projection the client interacted with.
 message ComposeScope {
@@ -1618,6 +1636,21 @@ fn cell_style(cell: &Cell) -> u64 {
     color(cell.fg) | color(cell.bg) << 25 | flags << 50
 }
 
+impl Message for PopupGrid {
+    fn encoded_len(&self) -> usize {
+        let mut out = Vec::new();
+        self.encode(&mut out);
+        out.len()
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        let mut row = RowScratch::default();
+        for index in 0..usize::from(self.cells.area.height) {
+            row.write(out, 1, &self.cells, index);
+        }
+    }
+}
+
 impl RowScratch {
     /// Write row `row` of `buf` as a `GridRow` in field `tag`.
     fn write(&mut self, out: &mut Vec<u8>, tag: u32, buf: &Buffer, row: usize) {
@@ -1827,6 +1860,7 @@ impl ClientScene {
         field::uint(out, 1, u64::from(VERSION));
         field::raw_bytes(out, 2, &frame);
         field::uint(out, 3, 1);
+        field::uint(out, 4, 1);
     }
 }
 

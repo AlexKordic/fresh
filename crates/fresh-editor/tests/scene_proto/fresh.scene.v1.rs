@@ -259,6 +259,8 @@ pub struct ScenePopup {
     pub version: u64,
     #[prost(message, optional, tag = "10")]
     pub source_anchor: ::core::option::Option<PopupSourceAnchor>,
+    #[prost(message, optional, tag = "11")]
+    pub grid: ::core::option::Option<PopupGrid>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileRow {
@@ -1213,6 +1215,12 @@ pub struct GridRow {
     #[prost(uint64, repeated, tag = "4")]
     pub run_styles: ::prost::alloc::vec::Vec<u64>,
 }
+/// A popup's own retained cells, before overlap with other surfaces.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PopupGrid {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<GridRow>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PaneUpdate {
     #[prost(uint32, tag = "1")]
@@ -1341,6 +1349,9 @@ pub struct ServerHello {
     /// Supports independent source-region probes without moving the reading anchor.
     #[prost(bool, tag = "3")]
     pub compose_region_probes: bool,
+    /// Separate retained popup pictures and owner-scoped projected pointer input.
+    #[prost(bool, tag = "4")]
+    pub native_popup_projection: bool,
 }
 /// Type 3: why Fresh is closing the connection.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1364,6 +1375,23 @@ pub struct ClientHello {
     /// Accept offscreen prefix samples and complete paragraph windows.
     #[prost(bool, tag = "5")]
     pub paragraph_windows: bool,
+    /// Use explicit source anchors for popup placement; requires rich_compose.
+    #[prost(bool, tag = "6")]
+    pub native_popup_projection: bool,
+}
+/// Type 30: a pointer in a projected popup's local cells. Never document input.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PopupPointer {
+    #[prost(uint64, tag = "1")]
+    pub instance: u64,
+    #[prost(uint64, tag = "2")]
+    pub version: u64,
+    #[prost(message, optional, tag = "3")]
+    pub mouse: ::core::option::Option<Mouse>,
+    #[prost(sint32, tag = "4")]
+    pub column: i32,
+    #[prost(sint32, tag = "5")]
+    pub row: i32,
 }
 /// A pane identity and the exact source/projection the client interacted with.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

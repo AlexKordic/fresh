@@ -276,6 +276,8 @@ pub struct Popup {
 
     /// Text selection for copy/paste (None if no selection)
     pub text_selection: Option<PopupTextSelection>,
+    /// Retained text hit testing supplies original-line UTF-8 bytes.
+    pub(crate) selection_is_source: bool,
 
     /// Key hint shown right-aligned on the selected item (e.g. "(Tab)")
     pub accept_key_hint: Option<String>,
@@ -321,6 +323,7 @@ impl Popup {
             scroll_offset: 0,
             pager: Default::default(),
             text_selection: None,
+            selection_is_source: false,
             accept_key_hint: None,
             resolver: PopupResolver::None,
             focused: false,
@@ -354,6 +357,7 @@ impl Popup {
             scroll_offset: 0,
             pager: Default::default(),
             text_selection: None,
+            selection_is_source: false,
             accept_key_hint: None,
             resolver: PopupResolver::None,
             focused: false,
@@ -379,6 +383,7 @@ impl Popup {
             scroll_offset: 0,
             pager: Default::default(),
             text_selection: None,
+            selection_is_source: false,
             accept_key_hint: None,
             resolver: PopupResolver::None,
             focused: false,
@@ -611,6 +616,7 @@ impl Popup {
 
     /// Start text selection at position (used for mouse click)
     pub fn start_selection(&mut self, line: usize, col: usize) {
+        self.selection_is_source = false;
         self.text_selection = Some(PopupTextSelection {
             start: (line, col),
             end: (line, col),
@@ -622,6 +628,23 @@ impl Popup {
         if let Some(ref mut sel) = self.text_selection {
             sel.end = (line, col);
         }
+    }
+
+    pub(crate) fn start_source_selection(&mut self, line: usize, byte: usize) {
+        self.start_selection(line, byte);
+        self.selection_is_source = true;
+    }
+
+    pub(crate) fn extend_source_selection(&mut self, line: usize, byte: usize) {
+        if self.selection_is_source {
+            self.extend_selection(line, byte);
+        }
+    }
+
+    pub(crate) fn source_selection(&self) -> Option<PopupTextSelection> {
+        self.selection_is_source
+            .then_some(self.text_selection)
+            .flatten()
     }
 
     /// Clear text selection
@@ -705,7 +728,26 @@ impl Popup {
         }
 
         let ((start_line, start_col), (end_line, end_col)) = sel.normalized();
-        let lines = self.get_text_lines();
+        let lines = if self.selection_is_source {
+            match &self.content {
+                PopupContent::Text(lines) => lines.clone(),
+                PopupContent::Markdown(lines) => {
+                    lines.iter().map(|line| line.plain_text()).collect()
+                }
+                PopupContent::List { items, .. } => {
+                    items.iter().map(|item| item.text.clone()).collect()
+                }
+            }
+        } else {
+            self.get_text_lines()
+        };
+        let boundary = |text: &str, mut byte: usize| {
+            byte = byte.min(text.len());
+            while !text.is_char_boundary(byte) {
+                byte -= 1;
+            }
+            byte
+        };
 
         if start_line >= lines.len() {
             return None;
@@ -713,14 +755,14 @@ impl Popup {
 
         if start_line == end_line {
             let line = &lines[start_line];
-            let end_col = end_col.min(line.len());
-            let start_col = start_col.min(end_col);
+            let end_col = boundary(line, end_col);
+            let start_col = boundary(line, start_col.min(end_col));
             Some(line[start_col..end_col].to_string())
         } else {
             let mut result = String::new();
             // First line from start_col to end
             let first_line = &lines[start_line];
-            result.push_str(&first_line[start_col.min(first_line.len())..]);
+            result.push_str(&first_line[boundary(first_line, start_col)..]);
             result.push('\n');
             // Middle lines (full)
             for line in lines.iter().take(end_line).skip(start_line + 1) {
@@ -730,7 +772,7 @@ impl Popup {
             // Last line from start to end_col
             if end_line < lines.len() {
                 let last_line = &lines[end_line];
-                result.push_str(&last_line[..end_col.min(last_line.len())]);
+                result.push_str(&last_line[..boundary(last_line, end_col)]);
             }
             Some(result)
         }
@@ -770,6 +812,21 @@ impl Popup {
 
         // Find the link at the column position
         line.link_at_column(relative_col).map(|s| s.to_string())
+    }
+
+    pub(crate) fn link_at_source_position(&self, line: usize, byte: usize) -> Option<String> {
+        let PopupContent::Markdown(lines) = &self.content else {
+            return None;
+        };
+        let mut start = 0;
+        for span in &lines.get(line)?.spans {
+            let end = start + span.text.len();
+            if start <= byte && byte < end {
+                return span.link_url.clone();
+            }
+            start = end;
+        }
+        None
     }
 
     /// Calculate the actual content height based on the popup content

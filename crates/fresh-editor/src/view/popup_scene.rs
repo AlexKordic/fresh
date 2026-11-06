@@ -28,10 +28,63 @@ pub struct PopupSourceAnchor {
 }
 
 impl Editor {
-    pub(super) fn popup_presentation(&self, index: usize) -> &[fresh_ui::Item] {
-        self.shell_ui.as_ref().map_or(&[], |ui| {
-            ui.spec()
-                .items_for(&crate::view::shell::popup::popup_key(index))
+    pub(crate) fn source_popup_keys(&self) -> Vec<fresh_ui::Key> {
+        let (buffer, total) = self.popup_counts();
+        let mut keys: Vec<_> = self
+            .active_state()
+            .popups
+            .all()
+            .iter()
+            .take(buffer)
+            .enumerate()
+            .filter(|(_, popup)| self.popup_source_anchor(popup).is_some())
+            .map(|(index, _)| crate::view::shell::popup::popup_key(index))
+            .collect();
+        if total > buffer
+            && self
+                .global_popups
+                .top()
+                .is_some_and(|popup| self.popup_source_anchor(popup).is_some())
+        {
+            keys.push(crate::view::shell::popup::popup_key(buffer));
+        }
+        keys
+    }
+
+    pub(super) fn popup_grid(
+        &self,
+        index: usize,
+        outer: ratatui::layout::Rect,
+    ) -> Option<super::PopupGrid> {
+        use crate::view::shell::{fold, popup};
+        let ui = self.shell_ui.as_ref()?;
+        let key = popup::popup_key(index);
+        if outer.is_empty() || ui.spec().items_for(&key).is_empty() {
+            return None;
+        }
+        let mut cells = ratatui::buffer::Buffer::empty(outer);
+        fold::fold_all(
+            ui.spec(),
+            &mut cells,
+            &self.shell_palette(),
+            &mut fold::SkipHosts,
+            fold::Paints::Only(&key),
+            None,
+        );
+        Some(super::PopupGrid { cells })
+    }
+
+    pub(super) fn popup_input_geometry(
+        &self,
+        index: usize,
+    ) -> Vec<(
+        fresh_ui::ElementId,
+        fresh_ui::Rect,
+        fresh_ui::Point,
+        fresh_ui::Point,
+    )> {
+        self.shell_ui.as_ref().map_or_else(Vec::new, |ui| {
+            ui.pointer_geometry_in_subtree(&crate::view::shell::popup::popup_key(index))
         })
     }
 
@@ -74,7 +127,16 @@ impl Editor {
 /// Event-time fingerprint, not a security credential. A new lifetime, owner,
 /// placement, source, content, scroll or keyboard policy invalidates old input.
 /// `version` itself is excluded so refreshing a descriptor stays idempotent.
-pub(super) fn version(popup: &ScenePopup, model: &Popup, presentation: &[fresh_ui::Item]) -> u64 {
+pub(super) fn version(
+    popup: &ScenePopup,
+    model: &Popup,
+    geometry: &[(
+        fresh_ui::ElementId,
+        fresh_ui::Rect,
+        fresh_ui::Point,
+        fresh_ui::Point,
+    )],
+) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     popup.instance.hash(&mut hash);
     popup.kind.hash(&mut hash);
@@ -99,7 +161,7 @@ pub(super) fn version(popup: &ScenePopup, model: &Popup, presentation: &[fresh_u
     // Scroll and hover can live in retained components rather than in Popup.
     // Hash their actual arranged picture too: checking only scroll_offset
     // would accept an old row after the component's window moved.
-    format!("{presentation:?}").hash(&mut hash);
+    geometry.hash(&mut hash);
     hash.finish().max(1)
 }
 
@@ -226,23 +288,31 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let (mut editor, _root) = editor();
         let cursor = editor.active_cursors().primary_id();
-        editor.replace_native_texts(vec![(0..0, "Heading\n\nBody\n\ntext".into(), cursor)]).unwrap();
-        let theme = crate::view::theme::Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        editor
+            .replace_native_texts(vec![(0..0, "Heading\n\nBody\n\ntext".into(), cursor)])
+            .unwrap();
+        let theme =
+            crate::view::theme::Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
         let mut popup = Popup::text(vec!["selectable documentation".into()], &theme);
         popup.focused = true;
         popup.position = PopupPosition::BelowCursor;
         editor.active_state_mut().popups.show(popup);
         let _ = crate::webui::scene_value(&mut editor, 80, 24);
         let before = editor.popups_view().remove(0);
-        editor.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: before.content_rect.x + 1,
-            row: before.content_rect.y,
-            modifiers: KeyModifiers::NONE,
-        }).unwrap();
+        editor
+            .handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: before.content_rect.x + 1,
+                row: before.content_rect.y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
         editor.lay_out_shell_if_stale();
         let after = editor.popups_view().remove(0);
-        assert_eq!(after.rect, before.rect, "a selection press cannot move the captured popup to an unanchored fallback");
+        assert_eq!(
+            after.rect, before.rect,
+            "a selection press cannot move the captured popup to an unanchored fallback"
+        );
         assert_eq!(after.content_rect, before.content_rect);
     }
 
@@ -289,6 +359,7 @@ mod tests {
 
     fn popup() -> ScenePopup {
         ScenePopup {
+            grid: None,
             instance: 1,
             version: 0,
             source_anchor: Some(PopupSourceAnchor {

@@ -171,6 +171,8 @@ pub(crate) struct EventFacts {
     /// pointer and not where, and the hover reactions anchor tooltips to the
     /// cell.
     pub at: (u16, u16),
+    /// Signed retained coordinates, including captured motion outside a popup.
+    pub point: fresh_ui::Point,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1687,6 +1689,47 @@ impl Editor {
     /// tree declines reaches the legacy path exactly as before. A surface
     /// starts taking its own input the moment it stops being a `Host`.
     pub(crate) fn shell_dispatch(&mut self, input: fresh_ui::Input) -> Dispatched {
+        self.shell_dispatch_pointer_scope(input, None)
+    }
+
+    fn popup_text_source(&self, point: fresh_ui::Point) -> Option<(usize, usize)> {
+        let index = self.popup_counts().1.checked_sub(1)?;
+        let ui = self.shell_ui.as_ref()?;
+        let (element, byte) =
+            ui.text_hit_in_subtree(&crate::view::shell::popup::popup_content_key(index), point)?;
+        let fresh_ui::Key::Pair(namespace, line) = ui.key_of(element)? else {
+            return None;
+        };
+        if namespace.as_ref() != format!("popup_text:{index}") {
+            return None;
+        }
+        Some((usize::try_from(line).ok()?, byte))
+    }
+
+    pub(crate) fn native_compose_pointer_allowed(&mut self) -> bool {
+        self.apply_settled_shell_messages();
+        self.lay_out_shell_if_stale();
+        self.apply_settled_shell_messages();
+        self.menu_state.active_menu.is_none()
+            && !self
+                .shell_ui
+                .as_ref()
+                .is_some_and(|ui| ui.pointer_is_modal())
+    }
+
+    pub(crate) fn shell_dispatch_popup(
+        &mut self,
+        input: fresh_ui::Input,
+        index: usize,
+    ) -> Dispatched {
+        self.shell_dispatch_pointer_scope(input, Some(crate::view::shell::popup::popup_key(index)))
+    }
+
+    fn shell_dispatch_pointer_scope(
+        &mut self,
+        input: fresh_ui::Input,
+        only: Option<fresh_ui::Key>,
+    ) -> Dispatched {
         // **The previous frame's settle is applied before this input is
         // routed, never after it.**
         //
@@ -1714,18 +1757,27 @@ impl Editor {
         // `Editor::shell_description_stale`.
         self.lay_out_shell_if_stale();
         self.apply_settled_shell_messages();
+        let excluded = if self.projected_popup_pointer && only.is_none() {
+            self.source_popup_keys()
+        } else {
+            Vec::new()
+        };
         let Some(mut ui) = self.shell_ui.take() else {
             return Dispatched::default();
         };
         // Snapshotted before a single message is applied. See [`EventFacts`].
         let facts = EventFacts {
+            point: input.position().unwrap_or_default(),
             menu_open_before: self.menu_state.active_menu,
             at: input
                 .position()
                 .map(|p| (p.x.max(0) as u16, p.y.max(0) as u16))
                 .unwrap_or_default(),
         };
-        let result = ui.dispatch(input);
+        let result = match only {
+            Some(key) => ui.dispatch_to_pointer_subtree(input, &key),
+            None => ui.dispatch_without_pointer_subtrees(input, &excluded),
+        };
         // **What this dispatch itself queued, drained before `needs_frame` is
         // asked.**
         //
@@ -3023,11 +3075,15 @@ impl Editor {
             // still here: the library says where selecting is meaningful and
             // holds no selection model.
             UiFact::PopupTextPress { line, col } => {
-                let link = self
-                    .active_state()
-                    .popups
+                let source = self.popup_text_source(ev.point);
+                let popup = self
+                    .global_popups
                     .top()
-                    .and_then(|p| p.link_at_position(col, line));
+                    .or_else(|| self.active_state().popups.top());
+                let link = popup.and_then(|popup| match source {
+                    Some((line, byte)) => popup.link_at_source_position(line, byte),
+                    None => popup.link_at_position(col, line),
+                });
                 if let Some(url) = link {
                     #[cfg(feature = "runtime")]
                     match open::that(&url) {
@@ -3038,13 +3094,20 @@ impl Editor {
                     let _ = url;
                     return;
                 }
-                if let Some(popup) = self.active_state_mut().popups.top_mut() {
-                    popup.start_selection(line, col);
+                if let Some(popup) = self.topmost_popup_mut() {
+                    match source {
+                        Some((line, byte)) => popup.start_source_selection(line, byte),
+                        None => popup.start_selection(line, col),
+                    }
                 }
             }
             UiFact::PopupTextDrag { line, col } => {
-                if let Some(popup) = self.active_state_mut().popups.top_mut() {
-                    popup.extend_selection(line, col);
+                let source = self.popup_text_source(ev.point);
+                if let Some(popup) = self.topmost_popup_mut() {
+                    match source {
+                        Some((line, byte)) => popup.extend_source_selection(line, byte),
+                        None => popup.extend_selection(line, col),
+                    }
                 }
             }
             // The list row knew its own index; both of these used to be a

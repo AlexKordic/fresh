@@ -734,6 +734,8 @@ impl Editor {
             async_message_backlog: std::collections::VecDeque::new(),
             full_redraw_requested: false,
             suppress_chrome_cells: false,
+            suppress_popup_cells: false,
+            projected_popup_pointer: false,
             shell_frame_status_bar: None,
             shell_hover: None,
             shell_store: shell_store.clone(),
