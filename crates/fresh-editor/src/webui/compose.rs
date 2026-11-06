@@ -717,6 +717,9 @@ pub(crate) struct ComposeSpan {
     /// First content on an item's opening line, after its list/task marker.
     /// Other spans and empty items omit this source-byte anchor.
     pub content_start: Option<usize>,
+    /// Parsed destination for a link span, including an explicitly empty one.
+    /// It is metadata, never permission to fetch or open the target.
+    pub link_target: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -903,6 +906,7 @@ impl Document {
             }
             let mut role = 0;
             let mut flags = 0;
+            let mut link_target = None;
             match event {
                 Event::Start(Tag::Heading { level, .. }) => {
                     role = level as u32;
@@ -957,7 +961,19 @@ impl Document {
                 Event::Start(Tag::BlockQuote(_)) => role = 9,
                 Event::Start(Tag::List(_)) => role = 10,
                 Event::Start(Tag::Item) => role = 13,
-                Event::Start(Tag::Link { .. }) => flags = 4 | 16,
+                Event::Start(Tag::Link {
+                    link_type,
+                    dest_url,
+                    ..
+                }) => {
+                    flags = 4 | 16;
+                    let target = if link_type == pulldown_cmark::LinkType::Email {
+                        format!("mailto:{dest_url}")
+                    } else {
+                        dest_url.into_string()
+                    };
+                    link_target = Some(target.into());
+                }
                 Event::Start(Tag::Strong) => flags = 1,
                 Event::Start(Tag::Emphasis) => flags = 2,
                 Event::Start(Tag::Strikethrough) => flags = 8,
@@ -1014,6 +1030,7 @@ impl Document {
                     role,
                     flags,
                     content_start: None,
+                    link_target,
                 });
                 if new_item {
                     let line_end = text[range.start..]
@@ -2966,6 +2983,10 @@ mod tests {
             "[a **link**](https://example.test)"
         );
         assert_eq!(links[0].flags & 4, 4);
+        assert_eq!(
+            links[0].link_target.as_deref(),
+            Some("https://example.test")
+        );
         assert!(doc
             .spans
             .iter()
@@ -3016,5 +3037,50 @@ mod tests {
         assert_eq!(image.title, "caption");
         assert!(image.block);
         assert_eq!(&text[image.start..image.end], "![an *image*][pic]");
+    }
+
+    #[test]
+    fn parsed_link_destinations_preserve_escapes_references_unicode_and_empty_targets() {
+        let source = concat!(
+            "[**café 東京**](https://example.invalid/a_(b)?q=a&amp;b=c \"Title\")\r\n\r\n",
+            "[angle](<docs/a b.md>) [escaped](docs/a\\(b\\).md)\r\n\r\n",
+            "[reference][id] [collapsed][] [shortcut]\r\n\r\n",
+            "[id]: <docs/reference.md> 'Title'\r\n",
+            "[collapsed]: ../sibling.md\r\n",
+            "[shortcut]: https://example.invalid/shortcut\r\n\r\n",
+            "<https://example.invalid/auto> <user@example.invalid> [self]()\r\n\r\n",
+            "`[inert](no.md)` ![image](image.png) [malformed](\r\n\r\n",
+            "```md\r\n[also inert](no.md)\r\n```\r\n",
+        );
+        let doc = Document::parse(source.into(), 0, 0, 1);
+        let links: Vec<_> = doc
+            .spans
+            .iter()
+            .filter(|span| span.flags & 16 != 0)
+            .collect();
+        assert_eq!(
+            links
+                .iter()
+                .map(|span| span.link_target.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("https://example.invalid/a_(b)?q=a&b=c"),
+                Some("docs/a b.md"),
+                Some("docs/a(b).md"),
+                Some("docs/reference.md"),
+                Some("../sibling.md"),
+                Some("https://example.invalid/shortcut"),
+                Some("https://example.invalid/auto"),
+                Some("mailto:user@example.invalid"),
+                Some(""),
+            ]
+        );
+        assert!(source[links[0].start..links[0].end].starts_with("[**café 東京**]"));
+        assert!(doc
+            .spans
+            .iter()
+            .filter(|span| span.flags & 16 == 0)
+            .all(|span| span.link_target.is_none()));
+        assert_eq!(doc.text.as_bytes(), source.as_bytes());
     }
 }

@@ -253,6 +253,7 @@ pub(super) fn contexts(p: &Projection, spans: &[ComposeSpan], source: &str) -> V
                         role: *role,
                         flags: *flags,
                         content_start: None,
+                        link_target: None,
                     });
                 }
             }
@@ -805,6 +806,7 @@ mod tests {
                 role: 13,
                 flags: 0,
                 content_start: Some(content),
+                link_target: None,
             },
             ComposeSpan {
                 start: content,
@@ -812,6 +814,7 @@ mod tests {
                 role: 0,
                 flags: 1,
                 content_start: None,
+                link_target: None,
             },
         ];
         let p = Projection::new(
@@ -852,6 +855,26 @@ mod tests {
     }
 
     #[test]
+    fn prefix_samples_keep_link_fonts_without_document_destinations() {
+        let source = "- [café 東京](docs/target.md) body\n";
+        let doc = Document::parse(source.into(), 0, 0, 1);
+        let projection = Projection::new(source, 0, &[]).unwrap();
+        let samples = contexts(&projection, &doc.spans, source);
+        assert!(doc
+            .spans
+            .iter()
+            .any(|span| span.link_target.as_deref() == Some("docs/target.md")));
+        assert!(samples
+            .iter()
+            .flat_map(|sample| &sample.spans)
+            .any(|span| span.flags & 16 != 0));
+        assert!(samples
+            .iter()
+            .flat_map(|sample| &sample.spans)
+            .all(|span| span.link_target.is_none()));
+    }
+
+    #[test]
     fn source_offsets_are_global_and_empty_or_multiline_prefixes_are_not_invented() {
         let text = "- An item\n\n";
         let p = Projection::new(text, 300, &[]).unwrap();
@@ -861,6 +884,7 @@ mod tests {
             role: 13,
             flags: 0,
             content_start: Some(302),
+            link_target: None,
         }];
         let source = "x".repeat(300) + text;
         let values = contexts(&p, &spans, &source);
@@ -884,6 +908,7 @@ mod tests {
             role: 0,
             flags: 1,
             content_start: None,
+            link_target: None,
         }];
         let mut at = 0;
         for line in text.split_inclusive('\n') {
@@ -893,6 +918,7 @@ mod tests {
                 role: 13,
                 flags: 0,
                 content_start: Some(at + 2),
+                link_target: None,
             });
             spans.push(ComposeSpan {
                 start: at + 2,
@@ -900,6 +926,7 @@ mod tests {
                 role: 0,
                 flags: 2,
                 content_start: None,
+                link_target: None,
             });
             at += line.len();
         }
@@ -934,6 +961,7 @@ mod tests {
                 role: 13,
                 flags: 0,
                 content_start: Some(start + 2),
+                link_target: None,
             }];
             assert_eq!(
                 contexts(&projection, &spans, source)[0].source_line_start,
@@ -948,6 +976,7 @@ mod tests {
             role: 13,
             flags: 0,
             content_start: Some(4),
+            link_target: None,
         }];
         assert!(!contexts(&projection, &spans, source)[0].source_line_start);
     }

@@ -757,7 +757,9 @@ pub struct ComposeSegment {
 /// role: body 0, headings 1-6, inline code 7, table 8, quote 9,
 /// list 10, paragraph 11, code block 12, list item 13, thematic rule 14.
 /// flags: bold 1, italic 2, underline 4, strikethrough 8, link 16.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+/// Link destinations are parsed metadata, including empty self-links;
+/// receiving them never authorizes fetching or opening a destination.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeSpan {
     #[prost(uint64, tag = "1")]
     pub start: u64,
@@ -769,6 +771,8 @@ pub struct ComposeSpan {
     pub flags: u32,
     #[prost(uint64, optional, tag = "5")]
     pub content_start: ::core::option::Option<u64>,
+    #[prost(string, optional, tag = "6")]
+    pub link_target: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeImage {

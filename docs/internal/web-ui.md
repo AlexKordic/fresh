@@ -26,6 +26,17 @@ Strengths to preserve through any of the work below:
 - **DOM hygiene** — when nothing changed, no frame arrives at all (the server diffs before pushing, §3.1), so the DOM is never touched; scroll positions of natively-scrolled panels survive rebuilds; wheel events over natively-scrolled chrome are deliberately not forwarded.
 - The **gutter/text split** in the bridge output, which exists precisely so a future native selection/copy layer can cover code without line numbers.
 
+### Parsed link destinations
+
+Rich Compose spans carry an optional parser-owned `link_target` (field 6).
+Presence distinguishes an empty self-link from an older scene without link
+metadata. References, escapes, entities and email autolinks are resolved by
+the existing Markdown parser; destinations retain literal Unicode bytes.
+Targets are shared between native pane projections. Prefix measurement samples
+keep their link font flags but omit destinations: their offsets are local
+measurement coordinates rather than document links. Receiving metadata never
+fetches a resource or follows a link. Older consumers ignore the optional field.
+
 ### Popup annotations for native Compose consumers
 
 The semantic popup projection retains its original `rect` and `content_rect`

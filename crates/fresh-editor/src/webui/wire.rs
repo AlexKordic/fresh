@@ -27,6 +27,10 @@ use std::fmt;
 #[path = "popup_wire_tests.rs"]
 mod popup_wire_tests;
 
+#[cfg(test)]
+#[path = "compose_link_wire_tests.rs"]
+mod compose_link_wire_tests;
+
 /// What a message is, its `type` on the wire.
 pub(crate) mod kind {
     pub const SERVER_HELLO: u64 = 1;
@@ -261,6 +265,13 @@ impl Text for str {
 }
 
 impl Text for String {
+    #[inline]
+    fn text(&self) -> &str {
+        self
+    }
+}
+
+impl Text for std::sync::Arc<str> {
     #[inline]
     fn text(&self) -> &str {
         self
@@ -994,7 +1005,12 @@ proto! {
     /// role: body 0, headings 1-6, inline code 7, table 8, quote 9,
     /// list 10, paragraph 11, code block 12, list item 13, thematic rule 14.
     /// flags: bold 1, italic 2, underline 4, strikethrough 8, link 16.
-    ComposeSpan { 1 start: uint64, 2 end: uint64, 3 role: uint32, 4 flags: uint32, 5 content_start: optional uint64 }
+    /// Link destinations are parsed metadata, including empty self-links;
+    /// receiving them never authorizes fetching or opening a destination.
+    ComposeSpan {
+        1 start: uint64, 2 end: uint64, 3 role: uint32, 4 flags: uint32,
+        5 content_start: optional uint64, 6 link_target: optional string,
+    }
     ComposeImage {
         1 start: uint64, 2 end: uint64, 3 target: string,
         4 alt: string, 5 title: string, 6 block: bool, 7 rendered: bool, 8 source_preview: bool,
