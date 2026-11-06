@@ -69,10 +69,13 @@ fn profile_rich_compose_document_workloads() {
             let started = Instant::now();
             let pending = Document::pending(text.clone(), revision, 0, 1);
             source_context_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-            drop(pending);
-            let input = text.clone();
             let started = Instant::now();
-            let parsed = Document::parse(input, revision, 0, 1);
+            // Mirror the worker's prepared immutable input. Document::parse
+            // also builds the UTF-16 index, which would count that work twice
+            // and mislabel it as semantic parsing in these separate stages.
+            let parsed =
+                Document::parse_shared(pending.text, pending.text_index, revision, 0, 1, None)
+                    .unwrap();
             parse_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             document = Some(parsed);
         }
@@ -127,7 +130,9 @@ fn profile_rich_compose_document_workloads() {
             .map(|c| c.samples.len())
             .sum();
         let mut bytes = Vec::new();
+        let encoding_started = Instant::now();
         pane.encode(&mut bytes);
+        let encoding_ms = encoding_started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(bytes.len(), pane.encoded_len());
         if let Some(path) = &output {
             std::fs::write(path.join(format!("{name}.pb")), &bytes).unwrap();
@@ -140,6 +145,7 @@ fn profile_rich_compose_document_workloads() {
             "case": name, "source_bytes": text.len(), "background_parse_threshold": BACKGROUND_PARSE_BYTES,
             "semantic_parse_uses_worker": text.len() > BACKGROUND_PARSE_BYTES,
             "parse_ms": parse_ms, "source_context_ms": source_context_ms, "projection_ms": projection_ms,
+            "encoding_ms": encoding_ms,
             "source_window_bytes": window.len(), "pane_bytes": wire_bytes,
             "pane_without_measurements_bytes": pane.encoded_len(),
             "semantic_spans": doc.spans.len(), "images": doc.images.len(), "table_samples": samples,
@@ -153,6 +159,7 @@ fn profile_rich_compose_document_workloads() {
         std::fs::write(path.join("backend.json"), serde_json::to_vec_pretty(&serde_json::json!({
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "scope": "native parser/projection/encoding only; excludes plugin formatting and event-loop latency",
+            "parse_scope": "semantic parse of a prepared immutable source and UTF-16 index; preparation is reported separately",
             "rss_scope": "process high-water mark since start, including input fixtures and prior cases",
             "cases": reports,
         })).unwrap()).unwrap();
