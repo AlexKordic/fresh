@@ -1,4 +1,5 @@
 /// <reference path="./lib/fresh.d.ts" />
+import { Utf8Offsets } from "./lib/utf8_offsets.ts";
 // Markdown Compose Mode Plugin
 // Provides compose mode for Markdown documents with:
 // - Soft wrapping at a configurable width
@@ -1390,11 +1391,16 @@ function extractTextFromTokens(tokens: ViewTokenWire[]): string {
 // The after_insert/after_delete hooks clear affected byte ranges.
 // and soft wrapping.
 
-/**
- * Convert a char offset within lineContent to a buffer byte offset.
- * Handles UTF-8 multi-byte characters correctly.
- */
+// Only populated during one lines_changed hook; never retained by a buffer.
+let activeByteOffsets: Map<number, { text: string; index?: Utf8Offsets }> | null = null;
+
+/** Convert a UTF-16 source offset to an absolute UTF-8 buffer byte offset. */
 function charToByte(lineContent: string, charOffset: number, lineByteStart: number): number {
+  const cached = activeByteOffsets?.get(lineByteStart);
+  if (cached?.text === lineContent) {
+    const offset = (cached.index ??= new Utf8Offsets(lineContent)).at(charOffset);
+    if (offset !== null) return lineByteStart + offset;
+  }
   return lineByteStart + editor.utf8ByteLength(lineContent.slice(0, charOffset));
 }
 
@@ -2845,7 +2851,7 @@ function processFlowBlock(
       // layout, so a fold can never land somewhere no conceal ends.
       const layout = colWidths ? tableRowLayout(lineContent, colWidths) : null;
       for (const charPos of layout?.breakChars ?? []) {
-        const breakBytePos = byteStart + editor.utf8ByteLength(lineContent.slice(0, charPos));
+        const breakBytePos = charToByte(lineContent, charPos, byteStart);
         editor.addSoftBreak(
           bufferId, "md-wrap", breakBytePos, 0,
           "unless-cursor-in", byteStart, byteEnd,
@@ -2950,10 +2956,8 @@ function processFlowBlock(
     const prev = block.lines[li - 1];
     const line = block.lines[li];
     const prevText = lineText(prev).replace(/\s+$/, "");
-    const joinStart = prev.byte_start + editor.utf8ByteLength(prevText);
-    const text = lineText(line);
-    const joinEnd = line.byte_start
-      + editor.utf8ByteLength(text.slice(0, block.contentStart[li]));
+    const joinStart = charToByte(prev.content, prevText.length, prev.byte_start);
+    const joinEnd = charToByte(line.content, block.contentStart[li], line.byte_start);
     editor.addConceal(
       bufferId, "md-syntax", joinStart, joinEnd, " ",
     );
@@ -2969,11 +2973,9 @@ function processFlowBlock(
       // rather than opening the next one. Anchoring at the join instead put
       // its replacement space at the head of the row below — a stray leading
       // column — and left the row above with no separator for the caret.
-      breakBytePos = line.byte_start
-        + editor.utf8ByteLength(lineText(line).slice(0, block.contentStart[cell.li]));
+      breakBytePos = charToByte(line.content, block.contentStart[cell.li], line.byte_start);
     } else {
-      const text = lineText(line);
-      breakBytePos = line.byte_start + editor.utf8ByteLength(text.slice(0, cell.ci));
+      breakBytePos = charToByte(line.content, cell.ci, line.byte_start);
     }
     if (quotePrefix) {
       editor.addSoftBreak(
@@ -3134,222 +3136,234 @@ editor.on("lines_changed", (data) => {
   // left the document literal until an edit or a scroll happened to produce
   // another batch (#2968). The payload cannot lag what it was built from.
   if (!data.is_composing_in_any_split) return;
-  // Cursor reveal/conceal decisions are NOT made here: every emitted
-  // decoration carries an activation scope and the renderer evaluates it
-  // per frame against each split's own cursors. This handler runs only
-  // when content changes — cursor movement re-renders with the existing
-  // markers, so navigating never rebuilds anything.
-
-  // Column widths for every table row in this batch (uniform per table, via the
-  // grow-only memo). If a wider row scrolled into view and grew a table's
-  // columns, force a refresh so already-visible rows re-render at the new width.
-  const tableWidthsGrew = computeRowWidths(data.buffer_id, data.lines);
-
-  // Line-number → line, for local first/last-row classification of borders.
-  const byLineNum = new Map<number, LineInfoLike>();
-  for (const line of data.lines) byLineNum.set(line.line_number, line);
-
-  // Buffer end byte, so a table whose last row is the final line of the buffer
-  // (no following line in the batch, ever) still closes its frame. Without this
-  // `isLast` can never be true at end-of-buffer and the bottom border is missing.
-  const bufEnd = editor.getBufferLength(data.buffer_id);
-
-  // The page measure, read once for the batch rather than per line — the
-  // conceal pass needs it for the thematic-break rule and the list indent, and
-  // it can't change within a single render.
-  const batchViewport = editor.getViewport();
-  const measure = effectiveComposeWidth(batchViewport ? batchViewport.width : 80);
-
-  // The batch's flow blocks, computed before the per-line pass because the
-  // conceal pass needs to know which lines are continuations: their leading
-  // indent and `>` run are inside a join conceal, so the per-line decorations
-  // that would otherwise render them must stand down.
-  const verbatim = verbatimStates(data.lines);
-  const blocks = groupFlowBlocks(data.lines, measure, verbatim);
-  const joined = new Set<number>();
-  for (const block of blocks) {
-    for (let i = 1; i < block.lines.length; i++) joined.add(block.lines[i].byte_start);
-  }
-
-  // Per line: clear+rebuild conceals and the table border frame — all anchored
-  // to this one line. No whole-table rebuild, no stored row model; borders for
-  // lines not in this batch keep riding their auto-shift markers. Soft breaks
-  // are the one pass that is per *block* rather than per line (see
-  // `processFlowBlock`), and they run below, after every line's clear.
-  // Columns each fenced line's BLOCK is indented by, keyed by line start.
-  //
-  // A fenced block inside a list item is indented to the item's content column,
-  // and its frame belongs there too. The indent is the OPENING delimiter's: a
-  // body line's own leading whitespace is code, not block indent, so a
-  // `    if x:` inside the block must not push the frame right for that row
-  // alone. Computed once here because two passes need it — the rails and border
-  // below, and the code rows' soft breaks after them — and they have to agree
-  // about the box's width or a row will break where the frame does not end.
-  //
-  // Absent when the opening delimiter is not in this batch, which a block whose
-  // body spans a blank line can be re-offered without. Those rows render as
-  // they did before the frame learned about indents, rather than at a guess.
-  const blockIndents = new Map<number, number>();
-  {
-    let indent: number | null = null;
+  // A long line can have thousands of markup/wrap positions. Re-encoding
+  // every growing prefix is quadratic. Keep lazy indexes only for this hook,
+  // keyed by source-line start; short rows keep their original conversion.
+  const previousByteOffsets = activeByteOffsets;
+  activeByteOffsets = new Map();
+  try {
     for (const line of data.lines) {
-      if (line.region === "open") indent = leadingIndent(line.content);
-      if (isCodeRegion(line.region) && indent !== null) {
-        blockIndents.set(line.byte_start, indent);
+      if (line.content.length >= 4096) activeByteOffsets.set(line.byte_start, { text: line.content });
+    }
+    // Cursor reveal/conceal decisions are NOT made here: every emitted
+    // decoration carries an activation scope and the renderer evaluates it
+    // per frame against each split's own cursors. This handler runs only
+    // when content changes — cursor movement re-renders with the existing
+    // markers, so navigating never rebuilds anything.
+
+    // Column widths for every table row in this batch (uniform per table, via the
+    // grow-only memo). If a wider row scrolled into view and grew a table's
+    // columns, force a refresh so already-visible rows re-render at the new width.
+    const tableWidthsGrew = computeRowWidths(data.buffer_id, data.lines);
+
+    // Line-number → line, for local first/last-row classification of borders.
+    const byLineNum = new Map<number, LineInfoLike>();
+    for (const line of data.lines) byLineNum.set(line.line_number, line);
+
+    // Buffer end byte, so a table whose last row is the final line of the buffer
+    // (no following line in the batch, ever) still closes its frame. Without this
+    // `isLast` can never be true at end-of-buffer and the bottom border is missing.
+    const bufEnd = editor.getBufferLength(data.buffer_id);
+
+    // The page measure, read once for the batch rather than per line — the
+    // conceal pass needs it for the thematic-break rule and the list indent, and
+    // it can't change within a single render.
+    const batchViewport = editor.getViewport();
+    const measure = effectiveComposeWidth(batchViewport ? batchViewport.width : 80);
+
+    // The batch's flow blocks, computed before the per-line pass because the
+    // conceal pass needs to know which lines are continuations: their leading
+    // indent and `>` run are inside a join conceal, so the per-line decorations
+    // that would otherwise render them must stand down.
+    const verbatim = verbatimStates(data.lines);
+    const blocks = groupFlowBlocks(data.lines, measure, verbatim);
+    const joined = new Set<number>();
+    for (const block of blocks) {
+      for (let i = 1; i < block.lines.length; i++) joined.add(block.lines[i].byte_start);
+    }
+
+    // Per line: clear+rebuild conceals and the table border frame — all anchored
+    // to this one line. No whole-table rebuild, no stored row model; borders for
+    // lines not in this batch keep riding their auto-shift markers. Soft breaks
+    // are the one pass that is per *block* rather than per line (see
+    // `processFlowBlock`), and they run below, after every line's clear.
+    // Columns each fenced line's BLOCK is indented by, keyed by line start.
+    //
+    // A fenced block inside a list item is indented to the item's content column,
+    // and its frame belongs there too. The indent is the OPENING delimiter's: a
+    // body line's own leading whitespace is code, not block indent, so a
+    // `    if x:` inside the block must not push the frame right for that row
+    // alone. Computed once here because two passes need it — the rails and border
+    // below, and the code rows' soft breaks after them — and they have to agree
+    // about the box's width or a row will break where the frame does not end.
+    //
+    // Absent when the opening delimiter is not in this batch, which a block whose
+    // body spans a blank line can be re-offered without. Those rows render as
+    // they did before the frame learned about indents, rather than at a guess.
+    const blockIndents = new Map<number, number>();
+    {
+      let indent: number | null = null;
+      for (const line of data.lines) {
+        if (line.region === "open") indent = leadingIndent(line.content);
+        if (isCodeRegion(line.region) && indent !== null) {
+          blockIndents.set(line.byte_start, indent);
+        }
+        if (line.region === "close") indent = null;
       }
-      if (line.region === "close") indent = null;
-    }
-  }
-
-  for (const line of data.lines) {
-    // Clear this row's border range first (covers a row that stopped being a
-    // table row, e.g. its pipes were deleted, and stale frames left a few bytes
-    // off by the async lag).
-    clearRowBorders(data.buffer_id, line.byte_start, line.byte_end);
-    // Same clear-then-rebuild for the code block's side rails, so a line that
-    // stops being code loses them. Re-added below only for `body` lines — the
-    // delimiter rows draw their own corners as part of the border conceal.
-    clearCodeRails(data.buffer_id, line.byte_start, line.byte_end);
-    if (line.region === "body") {
-      emitCodeRails(
-        data.buffer_id, line.content, line.byte_start, measure,
-        blockIndents.get(line.byte_start) ?? 0,
-      );
-    }
-    // Same range-scoped clear-then-rebuild as the borders, so a line that stops
-    // being a list item loses its spacer.
-    editor.clearVirtualLinesInRange(
-      data.buffer_id, LIST_SPACING_NS,
-      line.byte_start, Math.max(line.byte_end, line.byte_start + 1),
-    );
-
-    processLineConceals(data.buffer_id, line.content, line.byte_start, line.byte_end, measure, line.region, line.line_number, joined.has(line.byte_start));
-
-    // Blank row after each list item, so items read as discrete entries.
-    //
-    // Deliberately decided from this line ALONE, not from its neighbours. The
-    // obvious rule — "a spacer above an item whose predecessor is also an
-    // item" — needs two lines, and an edit-sized `lines_changed` batch
-    // contains only the lines the edit touched. The spacer would then be
-    // cleared (this line is in the batch) but not re-derivable (its neighbour
-    // isn't), so editing inside a list silently dropped its spacing and never
-    // got it back: unlike the table frame, there is no later batch that
-    // restores it, because `lines_changed` is edge-triggered on ranges it
-    // hasn't seen.
-    //
-    // Anchoring below every item is line-local, so clear-and-rebuild is always
-    // a complete decision. The cost is one blank row after a list's final item
-    // as well as between items, which reads as ordinary block separation.
-    //
-    // Inside a fence none of this applies: `- foo` in a shell block is not a
-    // list item and `| a | b |` in a code sample is not a table row, so both
-    // the spacer and the frame are skipped (the clears above already ran, so a
-    // line that becomes code loses whichever it had).
-    if (!isCodeRegion(line.region) && isListItemContent(line.content)) {
-      editor.addVirtualLine(
-        data.buffer_id, line.byte_start, "",
-        listSpacingOptions, false, LIST_SPACING_NS, 0,
-      );
     }
 
-    if (!isCodeRegion(line.region) && isTableRowContent(line.content)) {
-      const widths = currentRowWidths.get(line.byte_start) ?? [];
-      let isFirst: boolean, isSep: boolean, prevIsSep: boolean, isLast: boolean;
-      if (line.table) {
-        // The engine placed this row in its table (see `TableLine`). Every
-        // edge is then a property of the line itself, so the frame is the same
-        // whether the batch is a whole viewport or the one line an edit
-        // touched — which is the entire point.
-        isFirst = line.table.role === "header";
-        isSep = line.table.role === "delimiter";
-        // The delimiter row already renders as `├─┼─┤` from its own pipes, so
-        // the first data row must not draw a second one above itself.
-        prevIsSep = line.table.first_row;
-        isLast = line.table.last;
-      } else {
-        // No answer from the engine — the grammar doesn't scope this as a
-        // table (it is inside a blockquote, say, or interrupts a paragraph),
-        // or the buffer is too large to resolve the state. Fall back to the
-        // batch-local rules: a row is first if it's the buffer's line 0 or its
-        // previous line is present in this batch and is NOT a table row; last
-        // if its next line is present and not a table row. When a neighbour is
-        // off-screen we conservatively treat the row as mid-table, so a tall
-        // table scrolled past its top/bottom never draws a spurious frame edge
-        // — it redraws when that neighbour re-enters a batch.
-        const prev = byLineNum.get(line.line_number - 1);
-        const next = byLineNum.get(line.line_number + 1);
-        isFirst = line.line_number === 0 || (prev !== undefined && !isTableRowContent(prev.content));
-        // Last if the next line is present and not a table row, OR this row is
-        // the final line of the buffer (no next line exists at all — distinct
-        // from a next line merely off-screen, which we treat as mid-table).
-        isLast =
-          (next !== undefined && !isTableRowContent(next.content)) ||
-          (next === undefined && line.byte_end >= bufEnd);
-        isSep = isSepRowContent(line.content);
-        prevIsSep = prev !== undefined && isSepRowContent(prev.content);
+    for (const line of data.lines) {
+      // Clear this row's border range first (covers a row that stopped being a
+      // table row, e.g. its pipes were deleted, and stale frames left a few bytes
+      // off by the async lag).
+      clearRowBorders(data.buffer_id, line.byte_start, line.byte_end);
+      // Same clear-then-rebuild for the code block's side rails, so a line that
+      // stops being code loses them. Re-added below only for `body` lines — the
+      // delimiter rows draw their own corners as part of the border conceal.
+      clearCodeRails(data.buffer_id, line.byte_start, line.byte_end);
+      if (line.region === "body") {
+        emitCodeRails(
+          data.buffer_id, line.content, line.byte_start, measure,
+          blockIndents.get(line.byte_start) ?? 0,
+        );
       }
-      emitRowBorders(data.buffer_id, line.byte_start, widths, isFirst, isSep, prevIsSep, isLast);
-    }
-  }
-
-  // Soft breaks, and the joins that make a run of source lines flow as one
-  // block. Deliberately a second pass: a join conceal is anchored in the line
-  // ABOVE the continuation it belongs to, and the per-line pass above clears
-  // conceals by range — so emitting joins inside that loop would have the next
-  // line's clear delete the join just added.
-  for (const block of blocks) {
-    processFlowBlock(data.buffer_id, block, measure, blockIndents);
-  }
-
-  // Publish this batch's heading marks. Range-scoped to the batch's byte span
-  // so headings outside it — the rest of the document, marked by the pre-scan
-  // at compose time — keep their marks; see HEADING_MARKER_NS. Emitted even
-  // when the batch has no headings, so a line that stops being one loses its
-  // mark.
-  if (data.lines.length > 0) {
-    const batchStart = data.lines[0].byte_start;
-    const batchEnd = data.lines[data.lines.length - 1].byte_end;
-    const headingMarkers: ScrollbarMarker[] = [];
-    // False once any `#` line in the batch could not be told apart from a
-    // comment inside a fence (see `verbatimStates`). The whole republish is then
-    // skipped rather than replacing the pre-scan's marks with a guess — an
-    // out-of-date mark beats a wrong one, and the next batch that can see a
-    // fence boundary refreshes the range.
-    let classified = true;
-    for (let i = 0; i < data.lines.length; i++) {
-      const line = data.lines[i];
-      const level = headingLevel(lineText(line));
-      if (level === 0 || level > HEADING_MARKER_MAX_LEVEL) continue;
-      // `# ...` inside a fenced block is a comment in the block's language,
-      // and inside front matter it is a YAML comment. Neither is a heading.
-      if (verbatim[i] === null) { classified = false; continue; }
-      if (verbatim[i]) continue;
-      headingMarkers.push({
-        // Byte offsets, not line numbers: they are exact regardless of file
-        // size, and the editor anchors them so later edits shift the marks.
-        position: line.byte_start,
-        color: headingMarkerColor(level),
-        priority: 10 - level, // shallower headings win a shared track cell
-      });
-    }
-    if (classified) {
-      editor.setScrollbarMarkersInRange(
-        data.buffer_id, HEADING_MARKER_NS,
-        batchStart, Math.max(batchEnd, batchStart + 1),
-        headingMarkers,
+      // Same range-scoped clear-then-rebuild as the borders, so a line that stops
+      // being a list item loses its spacer.
+      editor.clearVirtualLinesInRange(
+        data.buffer_id, LIST_SPACING_NS,
+        line.byte_start, Math.max(line.byte_end, line.byte_start + 1),
       );
+
+      processLineConceals(data.buffer_id, line.content, line.byte_start, line.byte_end, measure, line.region, line.line_number, joined.has(line.byte_start));
+
+      // Blank row after each list item, so items read as discrete entries.
+      //
+      // Deliberately decided from this line ALONE, not from its neighbours. The
+      // obvious rule — "a spacer above an item whose predecessor is also an
+      // item" — needs two lines, and an edit-sized `lines_changed` batch
+      // contains only the lines the edit touched. The spacer would then be
+      // cleared (this line is in the batch) but not re-derivable (its neighbour
+      // isn't), so editing inside a list silently dropped its spacing and never
+      // got it back: unlike the table frame, there is no later batch that
+      // restores it, because `lines_changed` is edge-triggered on ranges it
+      // hasn't seen.
+      //
+      // Anchoring below every item is line-local, so clear-and-rebuild is always
+      // a complete decision. The cost is one blank row after a list's final item
+      // as well as between items, which reads as ordinary block separation.
+      //
+      // Inside a fence none of this applies: `- foo` in a shell block is not a
+      // list item and `| a | b |` in a code sample is not a table row, so both
+      // the spacer and the frame are skipped (the clears above already ran, so a
+      // line that becomes code loses whichever it had).
+      if (!isCodeRegion(line.region) && isListItemContent(line.content)) {
+        editor.addVirtualLine(
+          data.buffer_id, line.byte_start, "",
+          listSpacingOptions, false, LIST_SPACING_NS, 0,
+        );
+      }
+
+      if (!isCodeRegion(line.region) && isTableRowContent(line.content)) {
+        const widths = currentRowWidths.get(line.byte_start) ?? [];
+        let isFirst: boolean, isSep: boolean, prevIsSep: boolean, isLast: boolean;
+        if (line.table) {
+          // The engine placed this row in its table (see `TableLine`). Every
+          // edge is then a property of the line itself, so the frame is the same
+          // whether the batch is a whole viewport or the one line an edit
+          // touched — which is the entire point.
+          isFirst = line.table.role === "header";
+          isSep = line.table.role === "delimiter";
+          // The delimiter row already renders as `├─┼─┤` from its own pipes, so
+          // the first data row must not draw a second one above itself.
+          prevIsSep = line.table.first_row;
+          isLast = line.table.last;
+        } else {
+          // No answer from the engine — the grammar doesn't scope this as a
+          // table (it is inside a blockquote, say, or interrupts a paragraph),
+          // or the buffer is too large to resolve the state. Fall back to the
+          // batch-local rules: a row is first if it's the buffer's line 0 or its
+          // previous line is present in this batch and is NOT a table row; last
+          // if its next line is present and not a table row. When a neighbour is
+          // off-screen we conservatively treat the row as mid-table, so a tall
+          // table scrolled past its top/bottom never draws a spurious frame edge
+          // — it redraws when that neighbour re-enters a batch.
+          const prev = byLineNum.get(line.line_number - 1);
+          const next = byLineNum.get(line.line_number + 1);
+          isFirst = line.line_number === 0 || (prev !== undefined && !isTableRowContent(prev.content));
+          // Last if the next line is present and not a table row, OR this row is
+          // the final line of the buffer (no next line exists at all — distinct
+          // from a next line merely off-screen, which we treat as mid-table).
+          isLast =
+            (next !== undefined && !isTableRowContent(next.content)) ||
+            (next === undefined && line.byte_end >= bufEnd);
+          isSep = isSepRowContent(line.content);
+          prevIsSep = prev !== undefined && isSepRowContent(prev.content);
+        }
+        emitRowBorders(data.buffer_id, line.byte_start, widths, isFirst, isSep, prevIsSep, isLast);
+      }
     }
-  }
 
-  // One whole-viewport re-fire when an edit left a delimiter-shaped line
-  // behind: every line below it may have crossed into or out of a block, and
-  // those lines are not in this batch (see `fenceEditArmed`). Disarmed first,
-  // so the refresh's own batch — which contains the same line — cannot re-arm.
-  const fenceEdit = fenceEditArmed.delete(data.buffer_id)
-    && data.lines.some((l) => looksLikeFence(l.content));
+    // Soft breaks, and the joins that make a run of source lines flow as one
+    // block. Deliberately a second pass: a join conceal is anchored in the line
+    // ABOVE the continuation it belongs to, and the per-line pass above clears
+    // conceals by range — so emitting joins inside that loop would have the next
+    // line's clear delete the join just added.
+    for (const block of blocks) {
+      processFlowBlock(data.buffer_id, block, measure, blockIndents);
+    }
 
-  if (tableWidthsGrew || fenceEdit) {
-    editor.refreshLines(data.buffer_id);
+    // Publish this batch's heading marks. Range-scoped to the batch's byte span
+    // so headings outside it — the rest of the document, marked by the pre-scan
+    // at compose time — keep their marks; see HEADING_MARKER_NS. Emitted even
+    // when the batch has no headings, so a line that stops being one loses its
+    // mark.
+    if (data.lines.length > 0) {
+      const batchStart = data.lines[0].byte_start;
+      const batchEnd = data.lines[data.lines.length - 1].byte_end;
+      const headingMarkers: ScrollbarMarker[] = [];
+      // False once any `#` line in the batch could not be told apart from a
+      // comment inside a fence (see `verbatimStates`). The whole republish is then
+      // skipped rather than replacing the pre-scan's marks with a guess — an
+      // out-of-date mark beats a wrong one, and the next batch that can see a
+      // fence boundary refreshes the range.
+      let classified = true;
+      for (let i = 0; i < data.lines.length; i++) {
+        const line = data.lines[i];
+        const level = headingLevel(lineText(line));
+        if (level === 0 || level > HEADING_MARKER_MAX_LEVEL) continue;
+        // `# ...` inside a fenced block is a comment in the block's language,
+        // and inside front matter it is a YAML comment. Neither is a heading.
+        if (verbatim[i] === null) { classified = false; continue; }
+        if (verbatim[i]) continue;
+        headingMarkers.push({
+          // Byte offsets, not line numbers: they are exact regardless of file
+          // size, and the editor anchors them so later edits shift the marks.
+          position: line.byte_start,
+          color: headingMarkerColor(level),
+          priority: 10 - level, // shallower headings win a shared track cell
+        });
+      }
+      if (classified) {
+        editor.setScrollbarMarkersInRange(
+          data.buffer_id, HEADING_MARKER_NS,
+          batchStart, Math.max(batchEnd, batchStart + 1),
+          headingMarkers,
+        );
+      }
+    }
+
+    // One whole-viewport re-fire when an edit left a delimiter-shaped line
+    // behind: every line below it may have crossed into or out of a block, and
+    // those lines are not in this batch (see `fenceEditArmed`). Disarmed first,
+    // so the refresh's own batch — which contains the same line — cannot re-arm.
+    const fenceEdit = fenceEditArmed.delete(data.buffer_id)
+      && data.lines.some((l) => looksLikeFence(l.content));
+
+    if (tableWidthsGrew || fenceEdit) {
+      editor.refreshLines(data.buffer_id);
+    }
+  } finally {
+    activeByteOffsets = previousByteOffsets;
   }
 });
 // after_insert / after_delete: conceals and borders need no work — an edit
