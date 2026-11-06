@@ -1310,6 +1310,9 @@ pub struct ServerHello {
     pub version: u32,
     #[prost(message, optional, tag = "2")]
     pub scene: ::core::option::Option<Frame>,
+    /// Supports independent source-region probes without moving the reading anchor.
+    #[prost(bool, tag = "3")]
+    pub compose_region_probes: bool,
 }
 /// Type 3: why Fresh is closing the connection.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

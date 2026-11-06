@@ -785,6 +785,8 @@ message Frame {
 message ServerHello {
   uint32 version = 1;
   Frame scene = 2;
+  // Supports independent source-region probes without moving the reading anchor.
+  bool compose_region_probes = 3;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {

@@ -224,6 +224,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     assert_eq!(kind, 1);
     let hello = pb::ServerHello::decode(&payload[..]).unwrap();
     assert_eq!(hello.version, 1);
+    assert!(hello.compose_region_probes, "the server advertises independent region-probe support, including to legacy grid clients");
     let scene = hello.scene.unwrap();
     assert_eq!((scene.width, scene.height), (Some(u32::from(COLS)), Some(u32::from(ROWS))));
     assert_eq!(scene.rows.len(), usize::from(ROWS), "every row of the grid");
