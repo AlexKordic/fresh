@@ -76,7 +76,7 @@ pub(super) struct Band {
 /// A parser-owned neighbor survives replacing the source window which held
 /// the motion's origin. Pixel line numbers do not survive that replacement.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Destination {
+pub(super) struct CellDestination {
     table: usize,
     row: usize,
     column: Option<u32>,
@@ -196,7 +196,7 @@ pub(super) fn valid_source(line: &Line, tables: &[super::super::compose_tables::
 impl Layout {
     pub(super) fn resume_cell(
         &self,
-        destination: Destination,
+        destination: CellDestination,
         goal: f64,
         tables: &[super::super::compose_tables::Table],
     ) -> Result<usize, Need> {
@@ -221,14 +221,14 @@ impl Layout {
                     tables,
                 )
             });
-        result.map_err(|need| need.destination(destination))
+        result.map_err(|need| need.destination(Destination::Cell(destination)))
     }
 
     fn band_for(&self, line: usize) -> &Band {
         self.bands.iter().find(|b| b.lines.contains(&line)).unwrap()
     }
 
-    fn table_row<'a>(
+    pub(super) fn table_row<'a>(
         &self,
         cell: &Cell,
         tables: &'a [super::super::compose_tables::Table],
@@ -288,7 +288,7 @@ impl Layout {
         Ok(found)
     }
 
-    fn enter(
+    pub(super) fn enter(
         &self,
         band: &Band,
         preferred: Option<u32>,
@@ -360,7 +360,7 @@ impl Layout {
             };
             if let Some(start) = neighbor {
                 return self.resume_cell(
-                    Destination {
+                    CellDestination {
                         table: cell.table,
                         row: start,
                         column: cell.column.or(preferred),
@@ -370,18 +370,25 @@ impl Layout {
                     tables,
                 );
             }
-            // Leave the whole table, not a sibling column whose source happens
-            // to precede/follow this cell in the serialized line order.
-            let edge = self
-                .lines
+            // Table bounds remain authoritative when a short cell's origin
+            // is absent from the measurement beyond a taller sibling.
+            let table = tables
                 .iter()
-                .filter(|l| l.cell.as_ref().is_some_and(|c| c.table == cell.table))
-                .map(|l| l.number);
-            if backwards {
-                edge.min().unwrap()
-            } else {
-                edge.max().unwrap()
+                .find(|t| t.start == cell.table)
+                .ok_or_else(|| Need::region(cell.row))?;
+            if (backwards && table.start == 0)
+                || (!backwards && self.source_end == self.document_len && self.at_end(row))
+            {
+                return Ok(row);
             }
+            return self.resume(
+                Destination::Source {
+                    edge: if backwards { table.start } else { table.end },
+                    backwards,
+                },
+                goal,
+                tables,
+            );
         } else {
             line.number
         };
@@ -392,10 +399,24 @@ impl Layout {
         };
         let Some(wanted) = wanted else {
             if backwards && self.source_start > 0 {
-                return Err(Need::region(self.source_start - 1));
+                return self.resume(
+                    Destination::Source {
+                        edge: self.source_start,
+                        backwards,
+                    },
+                    goal,
+                    tables,
+                );
             }
             if !backwards && self.source_end < self.document_len {
-                return Err(Need::region(self.source_end));
+                return self.resume(
+                    Destination::Source {
+                        edge: self.source_end,
+                        backwards,
+                    },
+                    goal,
+                    tables,
+                );
             }
             return Ok(row);
         };
@@ -410,6 +431,32 @@ impl Layout {
                     self.band_for(row).bottom + 0.1
                 })
             })?;
+        let target_line = &self.lines[target];
+        if !backwards
+            && self.source_end < self.document_len
+            && target_line.source_start == self.source_end
+        {
+            return self.resume(
+                Destination::Source {
+                    edge: self.source_end,
+                    backwards,
+                },
+                goal,
+                tables,
+            );
+        }
+        if let Some(cell) = &target_line.cell {
+            return self.resume_cell(
+                CellDestination {
+                    table: cell.table,
+                    row: cell.row,
+                    column: None,
+                    backwards,
+                },
+                goal,
+                tables,
+            );
+        }
         self.enter(self.band_for(target), None, goal, backwards, tables)
     }
 
@@ -865,23 +912,123 @@ mod tests {
         target.source_start = 40;
         target.bands = bands(&target.lines, target.height).unwrap();
         assert_eq!(
-            target.resume_cell(destination, 130.0, &tables).unwrap(),
+            target.resume(destination, 130.0, &tables).unwrap(),
             1,
             "the origin need not remain measurable in the next source window"
         );
         // The desired column exists, but its leading part is absent.
         target.lines[1].cell.as_mut().unwrap().part = 1;
         target.lines[1].cell.as_mut().unwrap().parts = 2;
-        let need = target.resume_cell(destination, 130.0, &tables).unwrap_err();
+        let need = target.resume(destination, 130.0, &tables).unwrap_err();
         assert!(need.y.is_some() && need.destination.is_some());
         target.lines[1].cell.as_mut().unwrap().part = 0;
         assert_eq!(
             target
-                .resume_cell(need.destination.unwrap(), 130.0, &tables)
+                .resume(need.destination.unwrap(), 130.0, &tables)
                 .unwrap(),
             1,
             "another measurement must resume the same logical destination"
         );
+    }
+
+    #[test]
+    fn source_window_boundaries_retain_table_exit_and_prose_entry_destinations() {
+        let (mut table, tables) = fixture();
+        table.lines = table.lines[1..6].to_vec();
+        for line in &mut table.lines {
+            line.number -= 1;
+        }
+        table.source_start = 10;
+        table.source_end = 80;
+        table.total_lines = 5;
+        table.bands = bands(&table.lines, table.height).unwrap();
+        let (full, _) = fixture();
+        for (row, motion, probe) in [(2, Motion::Up, 9), (4, Motion::Down, 80)] {
+            let need = table
+                .target_row(row, motion, 130.0, &tables, None)
+                .unwrap_err();
+            assert_eq!(need.region, Some(probe));
+            assert!(
+                need.destination.is_some(),
+                "table exit must survive losing its origin window"
+            );
+            let index = if probe == 9 { 0 } else { 6 };
+            let mut prose = Layout {
+                id: 2,
+                page_height: 40.0,
+                source_start: if index == 0 { 0 } else { 80 },
+                source_end: if index == 0 { 10 } else { 100 },
+                document_len: 100,
+                lines: vec![full.lines[index].clone()],
+                total_lines: 1,
+                height: 100.0,
+                style_revision: 1,
+                bands: Vec::new(),
+            };
+            prose.lines[0].number = 0;
+            prose.bands = bands(&prose.lines, prose.height).unwrap();
+            assert_eq!(
+                prose.resume(need.destination.unwrap(), 130.0, &[]).unwrap(),
+                0,
+                "the destination flow is measurable without the table's origin"
+            );
+        }
+        for (index, motion, start, end, probe) in
+            [(0, Motion::Down, 0, 10, 10), (6, Motion::Up, 80, 100, 79)]
+        {
+            let mut prose = Layout {
+                id: 2,
+                page_height: 40.0,
+                source_start: start,
+                source_end: end,
+                document_len: 100,
+                lines: vec![full.lines[index].clone()],
+                total_lines: 1,
+                height: 100.0,
+                style_revision: 1,
+                bands: Vec::new(),
+            };
+            prose.lines[0].number = 0;
+            prose.bands = bands(&prose.lines, prose.height).unwrap();
+            let need = prose.target_row(0, motion, 130.0, &[], None).unwrap_err();
+            assert_eq!(need.region, Some(probe));
+            assert!(
+                need.destination.is_some(),
+                "prose entry must survive losing its origin window"
+            );
+            let wanted = if matches!(motion, Motion::Down) { 2 } else { 4 };
+            assert_eq!(
+                table
+                    .resume(need.destination.unwrap(), 130.0, &tables)
+                    .unwrap(),
+                wanted,
+                "entry chooses the intended column and first/last wrapped part"
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_source_window_cannot_use_its_empty_eof_line_as_the_next_line() {
+        let (mut layout, _) = fixture();
+        layout.lines.truncate(1);
+        let mut eof = layout.lines[0].clone();
+        eof.number = 1;
+        eof.y = 10.0;
+        eof.source_start = 10;
+        eof.source_end = 10;
+        eof.start.source = 10;
+        eof.end.source = 10;
+        eof.stops = vec![eof.start];
+        layout.lines.push(eof);
+        layout.total_lines = 2;
+        layout.source_end = 10;
+        layout.height = 20.0;
+        layout.bands = bands(&layout.lines, layout.height).unwrap();
+        let need = layout
+            .target_row(0, Motion::Down, 130.0, &[], None)
+            .unwrap_err();
+        assert_eq!(need.region, Some(10));
+        assert!(need.destination.is_some());
     }
 
     #[test]

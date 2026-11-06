@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 #[path = "compose_navigation_cells.rs"]
 mod cells;
+#[path = "compose_navigation_edges.rs"]
+mod edges;
 #[path = "compose_navigation_pending.rs"]
 mod pending;
 
@@ -610,7 +612,13 @@ fn classify(action: &Action) -> Option<(Motion, bool)> {
 struct Need {
     region: Option<usize>,
     y: Option<f64>,
-    destination: Option<cells::Destination>,
+    destination: Option<Destination>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Destination {
+    Cell(cells::CellDestination),
+    Source { edge: usize, backwards: bool },
 }
 
 impl Need {
@@ -629,7 +637,7 @@ impl Need {
         }
     }
 
-    fn destination(mut self, destination: cells::Destination) -> Self {
+    fn destination(mut self, destination: Destination) -> Self {
         self.destination = Some(destination);
         self
     }

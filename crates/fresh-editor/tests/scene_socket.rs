@@ -278,6 +278,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_native_code_frames_reveal_and_edit_parser_owned_source(&root,&work);
     rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(&root,&work);
     rich_table_motion_crosses_disjoint_source_windows(&root,&work);
+    rich_table_edges_cross_disjoint_source_windows(&root,&work);
     rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
@@ -519,6 +520,79 @@ fn rich_table_motion_crosses_disjoint_source_windows(root:&std::path::Path,work:
     assert_eq!(ed.active_window().active_cursors().primary().anchor,Some(origin as usize));
     assert_eq!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().viewport.as_ref().unwrap().position,origin_row);
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+}
+
+fn rich_table_edges_cross_disjoint_source_windows(root:&std::path::Path,work:&std::path::Path) {
+    let original="| Left | Right |\n| --- | --- |\n| tiny | ".to_owned()+&"x".repeat(90_000)+" |\n\nTail **café**\n";
+    let row=original.find("| tiny").unwrap() as u64;
+    let short=original.find("tiny").unwrap() as u64;
+    let edge=original.find("\n\nTail").unwrap() as u64+1;
+    for backwards in [false,true] {
+        let file=work.join(format!("table-edge-{backwards}.md")); std::fs::write(&file,&original).unwrap();
+        let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+        for _ in 0..12 {apply_step(&mut ed,&json!({}));}
+        apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+        let path=root.join(format!("table-edge-{backwards}.sock")); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+        let mut app=App::connect(&path);
+        app.send(16,pb::ClientHello {version:1,rich_compose:true,measured_tables:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+        let initial=ready_scene(&mut bridge,&mut ed,&mut app);
+        let pane=initial.panes.iter().find_map(|p|p.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+        let mut scope=pane_scope(initial.window_id.unwrap(),pane);
+        if backwards {
+            let epoch=pane.compose.as_ref().unwrap().viewport.as_ref().unwrap().epoch;
+            viewport_step(&mut bridge,&mut ed,&mut app,pb::ComposeViewportRequest {id:1,scope:Some(scope.clone()),position:edge,epoch,..Default::default()});
+            scope=pane_scope(app.window,app.panes.iter().find(|p|p.compose.is_some()).unwrap());
+        }
+        let origin=if backwards {edge} else {short}; let destination=if backwards {short} else {edge};
+        rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some(origin),..Default::default()});
+        let shown=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+        let viewport=shown.viewport.as_ref().unwrap().position;
+        let geometry=|id:u64,compose:&pb::ComposePane| {
+            let mut result=pb::ComposeLayout {id,page_height:100.0,source_start:compose.source_start,source_end:compose.source_end,
+                document_len:compose.document_len,total_lines:3,height:3000.0,style_revision:1,..Default::default()};
+            if let Some(table)=compose.tables.iter().find(|t|t.rows.iter().any(|r|r.start==row)) {
+                let source=table.rows.iter().find(|r|r.start==row).unwrap();
+                result.total_lines=2;
+                for column in 0..2 {
+                    let cell=&source.cells[column]; let x=column as f64*100.0;
+                    let point=if column==0 {short} else {cell.start+1};
+                    let stop=pb::ComposeStop {source:point,x:x+10.0,affinity:0};
+                    result.lines.push(pb::ComposeLine {number:column as u64,y:8.0,height:20.0,source_start:cell.start,source_end:cell.end,
+                        stops:vec![stop.clone()],start:Some(stop.clone()),end:Some(stop),
+                        cell:Some(pb::ComposeCellLine {table_start:table.start,row_start:row,column:Some(column as u32),part:0,parts:1,x,width:80.0,row_y:0.0,row_height:3000.0})});
+                }
+            } else {
+                let stop=pb::ComposeStop {source:edge,x:10.0,affinity:0};
+                result.lines=vec![pb::ComposeLine {number:0,y:0.0,height:20.0,source_start:edge,source_end:edge+1,
+                    stops:vec![stop.clone()],start:Some(stop.clone()),end:Some(stop),cell:None}];
+            }
+            result
+        };
+        let action=|layout:Option<pb::ComposeLayout>|pb::ComposeInput {id:2,kind:21,layout_id:layout.as_ref().map_or(0,|l|l.id),layout,
+            payload:pb::Action {name:if backwards {"select_up"} else {"select_down"}.into(),..Default::default()}.encode_to_vec(),..Default::default()};
+        let first=geometry(301,shown);
+        let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(Some(first))).input_reply.unwrap();
+        let probe=if backwards {edge-1} else {edge};
+        assert!(reply.needs_layout && !reply.accepted); assert_eq!(reply.need_region,Some(probe));
+        assert_eq!(ed.active_window().active_cursors().primary().position as u64,origin);
+        let mut request=action(None); request.region=Some(probe);
+        let mut reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,request).input_reply.unwrap();
+        for _ in 0..10 {
+            if reply.compose.as_ref().is_some_and(|c|c.ready!=Some(false)) {break;}
+            settle_bridge(&mut bridge,&mut ed); reply=rich_reply(&mut bridge,&mut ed,&mut app,&mut scope,2).input_reply.unwrap();
+        }
+        let measured=reply.compose.as_ref().unwrap(); assert!(measured.ready!=Some(false));
+        if !backwards {assert!(origin<measured.source_start,"leaving the tall row excludes the old source cursor");}
+        let target=geometry(302,measured);
+        assert!(target.lines.iter().all(|line|origin<line.source_start || origin>line.source_end),
+            "the new geometry must finish the motion without the old cursor, even if source context includes its blank line");
+        let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(Some(target))).input_reply.unwrap();
+        assert!(reply.accepted,"table edge motion: backwards={backwards}, region={:?}, y={:?}, error={}",reply.need_region,reply.need_y,reply.error);
+        assert_eq!(ed.active_window().active_cursors().primary().position as u64,destination);
+        assert_eq!(ed.active_window().active_cursors().primary().anchor,Some(origin as usize));
+        assert_eq!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().viewport.as_ref().unwrap().position,viewport);
+        assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    }
 }
 
 fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,work:&std::path::Path) {

@@ -15,8 +15,8 @@ struct Origin {
 
 #[derive(Clone, Copy)]
 enum Progress {
-    Cell {
-        destination: cells::Destination,
+    Destination {
+        destination: Destination,
         goal: f64,
         column: Option<(usize, u32)>,
     },
@@ -53,14 +53,14 @@ impl InputContext {
             Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown
         );
         let result = if let Some(
-            step @ Progress::Cell {
+            step @ Progress::Destination {
                 destination,
                 goal,
                 column,
             },
         ) = progress
         {
-            match layout.resume_cell(destination, goal, &self.tables) {
+            match layout.resume(destination, goal, &self.tables) {
                 Ok(row) => {
                     let stop = layout.nearest(row, goal);
                     Memory {
@@ -105,7 +105,7 @@ impl InputContext {
                                 id,
                                 CursorPlan {
                                     origin,
-                                    progress: Progress::Cell {
+                                    progress: Progress::Destination {
                                         destination,
                                         goal,
                                         column,
