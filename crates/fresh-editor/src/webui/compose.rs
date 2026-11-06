@@ -777,6 +777,7 @@ struct Document {
     images: Vec<ComposeImage>,
     paragraphs: Vec<Range<usize>>,
     item_paragraphs: HashMap<usize, usize>,
+    prefix_cache: prefixes::Cache,
     underlines: Vec<(Range<usize>, Range<usize>)>,
     heading_openers: Vec<Range<usize>>,
     code: Vec<CodeBlock>,
@@ -814,6 +815,7 @@ impl Document {
             images: Vec::new(),
             paragraphs: Vec::new(),
             item_paragraphs: HashMap::new(),
+            prefix_cache: Default::default(),
             underlines: Vec::new(),
             heading_openers: Vec::new(),
             code: Vec::new(),
@@ -1045,6 +1047,7 @@ impl Document {
             images,
             paragraphs,
             item_paragraphs,
+            prefix_cache: Default::default(),
             underlines,
             heading_openers,
             code,
@@ -1226,6 +1229,22 @@ impl Document {
         tables: &[super::compose_tables::Table],
         active: Vec<(Range<usize>, Option<&str>)>,
     ) -> Option<Projection> {
+        let conceals = self.native_conceals(start, end, cursors, objects, revealed, tables, active);
+        Projection::new(self.text.get(start..end)?, start, &conceals).ok()
+    }
+
+    /// Borrow the exact presentation inputs without allocating projected text.
+    /// Source and semantic spans belong to this immutable parsed Document.
+    fn native_conceals<'a>(
+        &'a self,
+        start: usize,
+        end: usize,
+        cursors: &[usize],
+        objects: &[Range<usize>],
+        revealed: &[Range<usize>],
+        tables: &[super::compose_tables::Table],
+        active: Vec<(Range<usize>, Option<&'a str>)>,
+    ) -> Vec<Conceal<'a>> {
         let mut overrides: Vec<_> = objects
             .iter()
             .cloned()
@@ -1501,14 +1520,7 @@ impl Document {
                 });
             }
         }
-        crate::view::conceal::ConcealManager::project_resolved_ranges(
-            &self.text[start..end],
-            start,
-            &active,
-            &overrides,
-            &revealed,
-        )
-        .ok()
+        crate::view::conceal::ConcealManager::resolve_ranges(&active, &overrides, &revealed)
     }
 }
 
@@ -1771,7 +1783,7 @@ impl ComposeCache {
                 break;
             }
         }
-        let raw = doc.text.get(start..end)?;
+        doc.text.get(start..end)?;
         let objects: Vec<_> = doc
             .images
             .iter()
@@ -1860,7 +1872,7 @@ impl ComposeCache {
             )?
         } else {
             // Never publish a partially applied replacement/conceal map.
-            Projection::new(raw, start, &[]).ok()?
+            Projection::new(doc.text.get(start..end)?, start, &[]).ok()?
         };
         let mut pane = ComposePane::from_projection(
             projection, doc, revision, cursors, focused, top_byte, &context, tables,

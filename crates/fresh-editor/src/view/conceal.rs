@@ -424,10 +424,23 @@ impl ConcealManager {
         overrides: &[fresh_core::compose::Conceal<'_>],
         revealed: &[Range<usize>],
     ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
-        use fresh_core::compose::{Conceal, Projection, ProjectionError};
+        use fresh_core::compose::{Projection, ProjectionError};
         let _source_end = source_start
             .checked_add(source.len())
             .ok_or(ProjectionError::CoordinateOverflow)?;
+        let conceals = Self::resolve_ranges(ranges, overrides, revealed);
+        Projection::new(source, source_start, &conceals)
+    }
+
+    /// Exact projection inputs after grid precedence and native reveal/override
+    /// resolution. Keeping this separate lets consumers reuse derived semantic
+    /// samples without rebuilding the full projected text or its segment map.
+    pub(crate) fn resolve_ranges<'a>(
+        ranges: &[(Range<usize>, Option<&'a str>)],
+        overrides: &[fresh_core::compose::Conceal<'a>],
+        revealed: &[Range<usize>],
+    ) -> Vec<fresh_core::compose::Conceal<'a>> {
+        use fresh_core::compose::Conceal;
         let mut covered = None;
         let mut conceals: Vec<_> = ranges
             .iter()
@@ -462,7 +475,7 @@ impl ConcealManager {
             })
             .collect();
         conceals.extend(overrides.iter().cloned());
-        Projection::new(source, source_start, &conceals)
+        conceals
     }
 
     /// Earliest conceal in `start..end` whose cursor-dependent activation

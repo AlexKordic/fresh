@@ -5,6 +5,10 @@ use super::{ComposeSpan, Document};
 use fresh_core::compose::{Affinity, Projection};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[path = "compose_prefix_cache.rs"]
+mod cache;
+pub(super) use cache::Cache;
+
 #[derive(Clone, Debug, Hash)]
 pub(crate) struct Context {
     pub item_start: usize,
@@ -29,7 +33,7 @@ pub(super) struct Prepared {
 /// window to every earlier paragraph of its list item. Whole initial physical
 /// lines and atomic replacements remain deliberate exceptions, not hard bounds.
 pub(super) fn prepare(
-    doc: &Document,
+    doc: &mut Document,
     state: &crate::state::EditorState,
     readiness: &mut crate::app::compose_readiness::Registry,
     buffer: crate::model::event::BufferId,
@@ -40,6 +44,7 @@ pub(super) fn prepare(
 ) -> Prepared {
     use crate::app::compose_readiness::Status;
     let mut result = Prepared::default();
+    let mut cache = std::mem::take(&mut doc.prefix_cache);
     for item in doc.spans.iter().filter(|item| {
         item.role == 13
             && item.start < window.start
@@ -126,9 +131,14 @@ pub(super) fn prepare(
         } else {
             Vec::new()
         };
-        let Some(projection) =
-            doc.project_native(start, end, cursors, &objects, &revealed, &tables, active)
-        else {
+        let conceals =
+            doc.native_conceals(start, end, cursors, &objects, &revealed, &tables, active);
+        if let Some(mut context) = cache.get(&(start..end), item.start, body, &conceals) {
+            context.source_line_start = physical_start(&doc.text, window.start);
+            result.contexts.push(context);
+            continue;
+        }
+        let Ok(projection) = Projection::new(&doc.text[start..end], start, &conceals) else {
             result.failed = true;
             continue;
         };
@@ -142,6 +152,7 @@ pub(super) fn prepare(
             .into_iter()
             .find(|context| context.item_start == item.start)
         {
+            cache.insert(start..end, &conceals, &context);
             context.source_line_start = physical_start(&doc.text, window.start);
             result.contexts.push(context);
         } else {
@@ -150,6 +161,7 @@ pub(super) fn prepare(
     }
     result.regions.sort_by_key(|range| (range.start, range.end));
     result.regions.dedup();
+    doc.prefix_cache = cache;
     result
 }
 
@@ -261,6 +273,196 @@ mod tests {
     use super::*;
     use fresh_core::compose::Conceal;
 
+    fn cache_fixture() -> (Document, crate::state::EditorState) {
+        let text = "1) **Opening** café\r\n\r\n   Later paragraph.\r\n\r\n   Last paragraph.\r\n";
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            std::sync::Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(text.len());
+        let doc = Document::parse(text.into(), 0, 0, state.marker_list.instance_id());
+        (doc, state)
+    }
+
+    fn sample(doc: &mut Document, state: &crate::state::EditorState, cursors: &[usize]) -> Context {
+        let start = doc.text.find("Later").unwrap();
+        let end = doc.text.len();
+        let prepared = prepare(
+            doc,
+            state,
+            &mut crate::app::compose_readiness::Registry::default(),
+            crate::model::event::BufferId(3),
+            false,
+            false,
+            start..end,
+            cursors,
+        );
+        assert!(!prepared.failed && !prepared.pending);
+        prepared.contexts.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn prefix_cache_tracks_effective_reveal_and_header_changes_without_global_invalidation() {
+        use crate::view::overlay::OverlayNamespace;
+        use fresh_core::api::MarkerActivation;
+        let (mut doc, mut state) = cache_fixture();
+        let namespace = OverlayNamespace::from_string("prefix-cache-test".into());
+        let open = doc.text.find("**").unwrap();
+        let close = doc.text.rfind("**").unwrap();
+        for at in [open, close] {
+            state.conceals.add_with_activation(
+                &mut state.marker_list,
+                namespace.clone(),
+                at..at + 2,
+                None,
+                Some(MarkerActivation {
+                    if_cursor_in: false,
+                    scope_start: open,
+                    scope_end: close + 2,
+                }),
+            );
+        }
+        let first = sample(&mut doc, &state, &[40]);
+        assert_eq!(first.text, "1) O");
+        let moved = sample(&mut doc, &state, &[45]);
+        assert_eq!(format!("{first:?}"), format!("{moved:?}"));
+        assert_eq!(doc.prefix_cache.hits, 1);
+        // Reveal changes a presentation input, even without marker mutation.
+        let revealed = sample(&mut doc, &state, &[open + 2]);
+        assert_eq!(revealed.text, "1) *");
+        assert_eq!(doc.prefix_cache.hits, 1);
+        assert_eq!(sample(&mut doc, &state, &[45]).text, first.text);
+        assert_eq!(doc.prefix_cache.hits, 2);
+        // Unrelated plugin metadata does not invalidate the opening line.
+        let later = doc.text.find("Later").unwrap();
+        state.conceals.add(
+            &mut state.marker_list,
+            namespace.clone(),
+            later..later + 1,
+            None,
+        );
+        assert_eq!(sample(&mut doc, &state, &[45]).text, first.text);
+        assert_eq!(doc.prefix_cache.hits, 3);
+        // A different replacement in that line must miss and use new content.
+        state.conceals.add(
+            &mut state.marker_list,
+            namespace.clone(),
+            open + 2..open + 3,
+            Some("É".into()),
+        );
+        assert_eq!(sample(&mut doc, &state, &[45]).text, "1) É");
+        assert_eq!(doc.prefix_cache.hits, 3);
+        state
+            .conceals
+            .clear_namespace(&namespace, &mut state.marker_list);
+        for at in [open, close] {
+            state
+                .conceals
+                .add(&mut state.marker_list, namespace.clone(), at..at + 2, None);
+        }
+        let source = doc.text.replace("Opening", "Changed");
+        let mut revised = Document::parse(source, 1, 0, doc.epoch);
+        assert_eq!(sample(&mut revised, &state, &[45]).text, "1) C");
+        assert_eq!(revised.prefix_cache.hits, 0);
+        let mut replaced = Document::parse((*doc.text).clone(), 0, 0, doc.epoch + 1);
+        assert_eq!(sample(&mut replaced, &state, &[45]).text, "1) O");
+        assert_eq!(replaced.prefix_cache.hits, 0);
+    }
+
+    #[test]
+    fn oversized_prefix_bypasses_cache_without_truncating_or_changing_presentation() {
+        use crate::view::overlay::OverlayNamespace;
+        let (mut doc, mut state) = cache_fixture();
+        let replacement = "x".repeat(1024 * 1024 + 1);
+        state.conceals.add(
+            &mut state.marker_list,
+            OverlayNamespace::from_string("prefix-cache-test".into()),
+            0..2,
+            Some(replacement.clone()),
+        );
+        let first = sample(&mut doc, &state, &[]);
+        let again = sample(&mut doc, &state, &[]);
+        assert_eq!(first.text, replacement + " *");
+        assert_eq!(format!("{first:?}"), format!("{again:?}"));
+        assert_eq!(doc.prefix_cache.hits, 0);
+        assert_eq!(doc.prefix_cache.allocated_bytes(), 0);
+    }
+
+    #[test]
+    #[ignore = "resource profile; set FC_COMPOSE_PREFIX_PROFILE_OUTPUT to export timings"]
+    fn profile_offscreen_prefix_reuse() {
+        use crate::view::overlay::OverlayNamespace;
+        use std::time::Instant;
+        let unit = "**Opening** café 👩🏽‍💻 東京 with complete source context. ";
+        let opening = "100) ".to_owned() + &unit.repeat(4000) + "\r\n";
+        let text = opening.clone() + "\r\n" + &"     Later paragraph.\r\n\r\n".repeat(1600);
+        let mut state = crate::state::EditorState::new(
+            80,
+            24,
+            1 << 20,
+            std::sync::Arc::new(crate::model::filesystem::StdFileSystem),
+        );
+        state.marker_list.set_buffer_size(text.len());
+        let namespace = OverlayNamespace::from_string("prefix-cache-profile".into());
+        for (at, _) in opening.match_indices("**") {
+            state
+                .conceals
+                .add(&mut state.marker_list, namespace.clone(), at..at + 2, None);
+        }
+        let mut doc = Document::parse(text, 1, 0, state.marker_list.instance_id());
+        let start = doc.text.rfind("Later").unwrap();
+        let end = doc.text.len();
+        let mut readiness = crate::app::compose_readiness::Registry::default();
+        let mut run = |doc: &mut Document, step: usize| {
+            let cursor = start + step % 4;
+            let prepared = prepare(
+                doc,
+                &state,
+                &mut readiness,
+                crate::model::event::BufferId(3),
+                false,
+                false,
+                cursor..end,
+                &[cursor],
+            );
+            assert!(!prepared.failed && !prepared.pending);
+            assert_eq!(prepared.contexts[0].text, "100) O");
+            prepared.contexts.into_iter().next().unwrap()
+        };
+        let expected = format!("{:?}", run(&mut doc, 0));
+        let mut cold_ms = Vec::new();
+        let mut warm_ms = Vec::new();
+        // Interleave the two paths to avoid attributing a warm process's work
+        // to a historical revision. Both use exactly this build and resolver.
+        for iteration in 0..25 {
+            doc.prefix_cache = Default::default();
+            let started = Instant::now();
+            let cold = run(&mut doc, iteration);
+            cold_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(format!("{cold:?}"), expected);
+            let started = Instant::now();
+            let warm = run(&mut doc, iteration + 1);
+            warm_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(format!("{warm:?}"), expected);
+            assert_eq!(doc.prefix_cache.hits, 1);
+        }
+        let report = serde_json::json!({
+            "profile": if cfg!(debug_assertions) { "debug" } else { "optimized" },
+            "scope": "same-build offscreen prepare including active conceal query and native resolution; supplied completed decorations; excludes plugin, parser, wire, native shaping and event-loop latency",
+            "comparison": "interleaved empty-cache and warm-cache calls with changing visible start/cursor and identical effective opening-line inputs",
+            "source_bytes": doc.text.len(), "opening_line_bytes": opening.len(),
+            "conceals": state.conceals.len(),
+            "retained_cache_allocation_bytes": doc.prefix_cache.allocated_bytes(),
+            "cold_ms": cold_ms, "warm_ms": warm_ms,
+        });
+        println!("COMPOSE_PREFIX_PROFILE {report}");
+        if let Some(path) = std::env::var_os("FC_COMPOSE_PREFIX_PROFILE_OUTPUT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn paragraph_windows_keep_source_indentation_and_independently_require_a_certified_marker() {
         use crate::app::compose_readiness::{Registry, Status};
@@ -288,7 +490,7 @@ mod tests {
         state
             .conceals
             .add(&mut state.marker_list, namespace, close..close + 2, None);
-        let doc = Document::parse(text, 0, 0, state.marker_list.instance_id());
+        let mut doc = Document::parse(text, 0, 0, state.marker_list.instance_id());
         let anchor = doc.text.rfind("Paragraph").unwrap();
         let legacy = doc.source_window(0, Some(anchor));
         let window = doc.source_window_policy(0, Some(anchor), None, true);
@@ -305,7 +507,7 @@ mod tests {
         readiness.complete(&batch, true);
         assert_eq!(readiness.status(id, window.clone()), Status::Ready);
         let waiting = prepare(
-            &doc,
+            &mut doc,
             &state,
             &mut readiness,
             id,
@@ -321,21 +523,89 @@ mod tests {
         assert!(head.end < window.start);
         let batch = readiness.begin(1, id, &[(head.start, head.end)]).unwrap();
         readiness.complete(&batch, true);
-        let ready = prepare(&doc, &state, &mut readiness, id, true, false, window, &[]);
-        assert!(!ready.pending && !ready.failed);
-        assert_eq!(ready.contexts[0].text, "1) O");
-        assert!(ready.contexts[0].source_line_start);
-        assert!(ready.contexts[0].spans.iter().any(|span| span.flags == 1));
-        // A replaced marker owner cannot borrow the earlier completion.
-        readiness.track(id, state.marker_list.instance_id() + 1, 0);
-        let replacement = prepare(
-            &doc,
+        let ready = prepare(
+            &mut doc,
             &state,
             &mut readiness,
             id,
             true,
             false,
-            anchor..doc.text.len(),
+            window.clone(),
+            &[],
+        );
+        assert!(!ready.pending && !ready.failed);
+        assert_eq!(ready.contexts[0].text, "1) O");
+        assert!(ready.contexts[0].source_line_start);
+        assert!(ready.contexts[0].spans.iter().any(|span| span.flags == 1));
+        assert_eq!(doc.prefix_cache.hits, 0);
+        // Moving the visible slice cannot freeze its physical-line-start flag.
+        let source_end = doc.text.len();
+        let again = prepare(
+            &mut doc,
+            &state,
+            &mut readiness,
+            id,
+            true,
+            false,
+            anchor..source_end,
+            &[anchor],
+        );
+        assert!(!again.pending && !again.failed);
+        assert_eq!(doc.prefix_cache.hits, 1);
+        assert_eq!(again.contexts[0].text, ready.contexts[0].text);
+        assert!(!again.contexts[0].source_line_start);
+        // Even a warm cache cannot certify work in flight or a failed refresh.
+        let batch = readiness.begin(1, id, &[(head.start, head.end)]).unwrap();
+        let waiting = prepare(
+            &mut doc,
+            &state,
+            &mut readiness,
+            id,
+            true,
+            false,
+            window.clone(),
+            &[],
+        );
+        assert!(waiting.pending && waiting.contexts.is_empty());
+        assert_eq!(doc.prefix_cache.hits, 1);
+        readiness.complete(&batch, false);
+        let failed = prepare(
+            &mut doc,
+            &state,
+            &mut readiness,
+            id,
+            true,
+            false,
+            window.clone(),
+            &[],
+        );
+        assert!(failed.failed && failed.contexts.is_empty());
+        assert_eq!(doc.prefix_cache.hits, 1);
+        let batch = readiness.begin(1, id, &[(head.start, head.end)]).unwrap();
+        readiness.complete(&batch, true);
+        let recovered = prepare(
+            &mut doc,
+            &state,
+            &mut readiness,
+            id,
+            true,
+            false,
+            window,
+            &[],
+        );
+        assert!(!recovered.pending && !recovered.failed);
+        assert_eq!(doc.prefix_cache.hits, 2);
+        // A replaced marker owner cannot borrow the earlier completion.
+        readiness.track(id, state.marker_list.instance_id() + 1, 0);
+        let source_end = doc.text.len();
+        let replacement = prepare(
+            &mut doc,
+            &state,
+            &mut readiness,
+            id,
+            true,
+            false,
+            anchor..source_end,
             &[],
         );
         assert!(replacement.pending && replacement.contexts.is_empty());
@@ -407,7 +677,7 @@ mod tests {
         use std::sync::Arc;
         let text = "1) ![first\n   image](image.png)\n\n".to_owned()
             + &"   Later paragraph words.\n\n".repeat(4000);
-        let doc = Document::parse(text, 0, 0, 1);
+        let mut doc = Document::parse(text, 0, 0, 1);
         let mut state = crate::state::EditorState::new(
             80,
             24,
@@ -418,7 +688,7 @@ mod tests {
         let anchor = doc.text.rfind("Later").unwrap();
         let window = doc.source_window_policy(0, Some(anchor), None, true);
         let result = prepare(
-            &doc,
+            &mut doc,
             &state,
             &mut Registry::default(),
             BufferId(3),
@@ -439,7 +709,7 @@ mod tests {
         use crate::view::overlay::OverlayNamespace;
         use std::sync::Arc;
         let text = "Before\n1) Opening\n\n".to_owned() + &"   Later paragraph.\n\n".repeat(5000);
-        let doc = Document::parse(text, 0, 0, 1);
+        let mut doc = Document::parse(text, 0, 0, 1);
         let item = doc.spans.iter().find(|span| span.role == 13).unwrap();
         let mut state = crate::state::EditorState::new(
             80,
@@ -458,7 +728,7 @@ mod tests {
         let anchor = doc.text.rfind("Later").unwrap();
         let window = doc.source_window_policy(0, Some(anchor), None, true);
         let result = prepare(
-            &doc,
+            &mut doc,
             &state,
             &mut Registry::default(),
             BufferId(3),
