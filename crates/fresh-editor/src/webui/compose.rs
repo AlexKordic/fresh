@@ -1853,13 +1853,17 @@ impl ComposeCache {
                 );
             }
         }
-        let tables = if measured_tables && status != Status::Failed {
+        // A ready body is not a coherent rich presentation while a required
+        // offscreen marker is still missing. Keep the same source fallback
+        // as failed formatting until all required prefix contexts are ready.
+        let source_fallback = status == Status::Failed || prefixes.pending;
+        let tables = if measured_tables && !source_fallback {
             doc.tables
                 .snapshot(&doc.text, start..end, &cursor_positions)
         } else {
             Vec::new()
         };
-        let projection = if status != Status::Failed && doc.parsed {
+        let projection = if !source_fallback && doc.parsed {
             let active = doc.decorations.active(&(start..end), &cursor_positions);
             doc.project_native(
                 start,
@@ -1898,10 +1902,8 @@ impl ComposeCache {
         pane.ready = Some(status != Status::Pending && (doc.parsed || doc.parse_error.is_some()));
         // The raw source/index is sufficient for receipts, but semantic
         // geometry must wait for the worker before accepting measured actions.
-        pane.current_projection = status != Status::Failed
-            && !prefixes.pending
-            && (doc.parsed || doc.parse_error.is_some());
-        if status == Status::Failed {
+        pane.current_projection = !source_fallback && (doc.parsed || doc.parse_error.is_some());
+        if source_fallback {
             for image in &mut pane.images {
                 image.rendered = false;
                 image.source_preview = false;
@@ -2035,6 +2037,114 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_offscreen_prefix_uses_complete_source_until_its_context_is_certified() {
+        use crate::app::compose_readiness::Status;
+        let root = tempfile::tempdir().unwrap();
+        let mut editor = Editor::for_test(
+            crate::config::Config::default(),
+            80,
+            24,
+            Some(root.path().into()),
+            crate::config_io::DirectoryContext::for_testing(root.path()),
+            crate::view::color_support::ColorCapability::TrueColor,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let source = "100) **Parent**\n\n".to_owned()
+            + &"     Child **word** ![tiny](tiny.png)\n\n".repeat(1100);
+        assert!(source.len() < BACKGROUND_PARSE_BYTES);
+        let anchor = source.rfind("Child").unwrap();
+        let cursor = editor.active_cursors().primary_id();
+        editor
+            .replace_native_texts(vec![(0..0, source.clone(), cursor)])
+            .unwrap();
+        editor.active_cursors_mut().primary_mut().position = anchor;
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        // This queue makes the normal readiness path active without starting
+        // a plugin thread that could complete the controlled batch for us.
+        editor.plugin_manager_mut().test_inject_command(
+            fresh_core::api::PluginCommand::SetStatus {
+                message: "controlled formatter".into(),
+            },
+        );
+        let leaf = editor.active_window().effective_active_split();
+        let buffer = editor.active_buffer();
+        let state = editor.active_window_mut().active_state_mut();
+        let epoch = state.marker_list.instance_id();
+        let revision = state.buffer.version();
+        let doc = Document::parse(source.clone(), revision, 0, epoch);
+        let window = doc.source_window_policy(0, Some(anchor), None, true);
+        assert!(window.start > source.find("Parent").unwrap());
+        let namespace =
+            crate::view::overlay::OverlayNamespace::from_string("prefix-ready-test".into());
+        let open = source.find("**").unwrap();
+        let close = source.find("**\n").unwrap();
+        for at in [open, close] {
+            state
+                .conceals
+                .add(&mut state.marker_list, namespace.clone(), at..at + 2, None);
+        }
+        let readiness = &mut editor.active_window_mut().compose_readiness;
+        readiness.track(buffer, epoch, revision);
+        let visible = readiness
+            .begin(1, buffer, &[(window.start, window.end)])
+            .unwrap();
+        readiness.complete(&visible, true);
+        assert_eq!(readiness.status(buffer, window.clone()), Status::Ready);
+        let mut cache = ComposeCache::default();
+        let pending = cache
+            .gather_tables_at(&mut editor, leaf, buffer, Some(anchor), true, true)
+            .unwrap();
+        assert_eq!(pending.ready, Some(false));
+        assert!(!pending.current_projection);
+        assert!(
+            pending.segments.iter().all(|segment| segment.kind == 0),
+            "uncertified prefix context must not expose a partial rich projection"
+        );
+        assert_eq!(
+            pending.text,
+            source[pending.source_start..pending.source_end]
+        );
+        assert!(!pending.images.is_empty());
+        assert!(pending
+            .images
+            .iter()
+            .all(|image| !image.rendered && !image.source_preview));
+        assert!(pending.tables.is_empty());
+        let header = pending
+            .format_regions
+            .iter()
+            .find(|range| range.start == 0)
+            .unwrap();
+        let readiness = &mut editor.active_window_mut().compose_readiness;
+        let batch = readiness
+            .begin(1, buffer, &[(header.start, header.end)])
+            .unwrap();
+        readiness.complete(&batch, true);
+        let complete = cache
+            .gather_tables_at(&mut editor, leaf, buffer, Some(anchor), true, true)
+            .unwrap();
+        assert_eq!(complete.ready, Some(true));
+        assert!(complete.current_projection);
+        assert!(complete.segments.iter().any(|segment| segment.kind != 0));
+        assert!(complete.images.iter().any(|image| image.rendered));
+        assert!(complete
+            .hanging_contexts
+            .iter()
+            .any(|context| context.text == "100) P"));
+        let state = editor.active_window().active_state();
+        assert_eq!(
+            state.buffer.slice_bytes(0..state.buffer.len()),
+            source.as_bytes()
+        );
+    }
 
     #[test]
     fn complete_table_font_inputs_are_deduplicated_stable_across_windows_and_independent_of_reveal()
