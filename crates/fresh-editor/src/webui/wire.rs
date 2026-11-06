@@ -939,7 +939,7 @@ proto! {
         20 text_context: maybe ComposeTextContext,
         21 text_chunks: repeated ComposeTextChunk,
         22 tables: repeated ComposeTable,
-        23 native_newline: uint32,
+        23 native_newline: uint32, 24 current_projection: bool,
     }
     /// Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.
     ComposeTable { 1 start: uint64, 2 end: uint64, 3 alignments: repeated uint32, 4 rows: repeated ComposeTableRow,

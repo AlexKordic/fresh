@@ -778,7 +778,7 @@ impl SceneClient {
                     let region = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision).or(viewport.map(|v| v.position));
                     compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.navigation.context(scope))
                 });
-                if current.as_ref().is_some_and(|pane| pane.ready == Some(false)) {
+                if current.as_ref().is_some_and(|pane| pane.ready == Some(false) && !pane.current_projection) {
                     self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
                     out.frame_owed = true;
                     return Ok(());

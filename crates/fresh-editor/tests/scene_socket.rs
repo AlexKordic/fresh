@@ -92,7 +92,7 @@ impl App {
         if let Some(count)=frame.pane_len {self.panes.resize(count as usize,pb::Pane::default());}
         for update in &frame.panes {
             if let Some(pane)=&update.pane {
-                if let Some(compose) = pane.compose.as_ref().filter(|c|c.ready == Some(false)) {
+                if let Some(compose) = pane.compose.as_ref().filter(|c|c.ready == Some(false) && !c.current_projection) {
                     assert!(compose.segments.iter().all(|s|s.kind == 0), "pending formatting cannot expose partial conceal/replacement maps");
                     assert!(compose.images.iter().all(|image|!image.rendered && !image.source_preview));
                     assert_eq!(compose.source_end-compose.source_start, compose.text.len() as u64);
@@ -857,6 +857,8 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     assert_eq!(receipt.cursors,vec![0],"explicit native edits retain their exact edited cursor set");
     assert_eq!(receipt.preserved_cursors,vec![0,secondary.0 as u64],"unchanged carets are separately proven against captured source anchors");
     let accepted=receipt.pane.as_ref().unwrap();
+    assert!(accepted.current_projection,"native edit receipts keep a coherent current-source projection while formatting catches up");
+    assert!(!accepted.text.starts_with("# "),"the unchanged heading keeps its completed conceal instead of flashing raw Markdown");
     assert_eq!(accepted.native_newline,2,"immutable edit receipts include the insertion policy for dependent native previews");
     assert_eq!(accepted.text_context.as_ref().unwrap().text,original.replacen("café","東京",1));
     assert_eq!(accepted.buffer_revision,ed.active_window().active_state().buffer.version());

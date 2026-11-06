@@ -164,12 +164,35 @@ impl CoordMap {
         range: std::ops::Range<usize>,
         from_version: u64,
     ) -> Option<std::ops::Range<usize>> {
+        self.map_retained_range(range, from_version, false)
+    }
+
+    /// A frozen decoration also depends on the text at its boundaries. Unlike
+    /// an editing selection, it cannot keep its meaning after typing exactly
+    /// at either edge. Used only for retaining completed presentation data.
+    pub fn map_untouched_range(
+        &self,
+        range: std::ops::Range<usize>,
+        from_version: u64,
+    ) -> Option<std::ops::Range<usize>> {
+        self.map_retained_range(range, from_version, true)
+    }
+
+    fn map_retained_range(
+        &self,
+        range: std::ops::Range<usize>,
+        from_version: u64,
+        strict_edges: bool,
+    ) -> Option<std::ops::Range<usize>> {
         if range.start > range.end || from_version < self.min_mappable {
             return None;
         }
         let mut range = range;
         for delta in self.deltas.iter().filter(|d| d.version > from_version) {
             let end = delta.pos.checked_add(delta.removed)?;
+            if strict_edges && delta.pos <= range.end && end >= range.start {
+                return None;
+            }
             if range.is_empty() {
                 if delta.pos < range.start && range.start < end {
                     return None;
@@ -447,5 +470,26 @@ mod tests {
             "inside the span: net insert shifts by +4"
         );
         assert_eq!(g.map(9, 0), Some(9), "before the span: unchanged");
+    }
+}
+
+#[cfg(test)]
+mod retained_presentation_tests {
+    use super::*;
+    #[test]
+    fn frozen_scopes_reject_boundary_edits_while_editing_ranges_keep_their_edge_policy() {
+        for at in [10, 15, 20] {
+            let mut coordinates = CoordMap::default();
+            coordinates.record_insert(5, at, 1);
+            assert!(coordinates.map_untouched_range(10..20, 4).is_none());
+            if at != 15 {
+                assert!(coordinates.map_unchanged_range(10..20, 4).is_some());
+            }
+        }
+        let mut coordinates = CoordMap::default();
+        coordinates.record_insert(5, 2, 3);
+        assert_eq!(coordinates.map_untouched_range(10..20, 4), Some(13..23));
+        coordinates.record_delete(6, 25, 2);
+        assert_eq!(coordinates.map_untouched_range(13..23, 5), Some(13..23));
     }
 }

@@ -226,7 +226,7 @@ impl Scope {
             && pane.buffer_revision == self.revision
             && pane.projection_revision == self.projection
             && pane.selection_revision == self.selection
-            && pane.ready != Some(false)
+            && (pane.ready != Some(false) || pane.current_projection)
     }
 }
 
@@ -734,6 +734,7 @@ pub(crate) struct ComposePane {
     pub tables: Vec<super::compose_tables::Table>,
     /// Native insertion separator: 0 unknown, 1 LF (including CR disk files), 2 CRLF.
     pub native_newline: u32,
+    pub current_projection: bool,
 }
 
 struct Document {
@@ -745,9 +746,11 @@ struct Document {
     images: Vec<ComposeImage>,
     paragraphs: Vec<Range<usize>>,
     underlines: Vec<(Range<usize>, Range<usize>)>,
+    heading_openers: Vec<Range<usize>>,
     code: Vec<CodeBlock>,
     tables: super::compose_tables::Tables,
     used: u64,
+    decorations: super::compose_decorations::Snapshot,
 }
 
 struct CodeBlock {
@@ -763,6 +766,7 @@ impl Document {
         let mut image_stack: Vec<ComposeImage> = Vec::new();
         let mut paragraphs = Vec::new();
         let mut underlines = Vec::new();
+        let mut heading_openers = Vec::new();
         let mut code: Vec<CodeBlock> = Vec::new();
         let mut active_code = None;
         let mut tables = super::compose_tables::Tables::default();
@@ -804,6 +808,31 @@ impl Document {
             match event {
                 Event::Start(Tag::Heading { level, .. }) => {
                     role = level as u32;
+                    // The parser establishes heading ownership. Strip only
+                    // its ATX opener; a literal hash in prose/code is untouched.
+                    let raw = &text[range.clone()];
+                    let lead = raw
+                        .bytes()
+                        .take_while(|b| matches!(b, b' ' | b'\t'))
+                        .count();
+                    let hashes = raw[lead..].bytes().take_while(|b| *b == b'#').count();
+                    if (1..=6).contains(&hashes) {
+                        let after = lead + hashes;
+                        let space = raw[after..]
+                            .bytes()
+                            .take_while(|b| matches!(b, b' ' | b'\t'))
+                            .count();
+                        // A setext heading may begin with a literal #word.
+                        // Only ATX syntax allows the marker followed by space/EOL.
+                        if space > 0
+                            || raw
+                                .as_bytes()
+                                .get(after)
+                                .is_none_or(|b| matches!(b, b'\r' | b'\n'))
+                        {
+                            heading_openers.push(range.start..range.start + after + space);
+                        }
+                    }
                     if let Some(underline) = heading_underline(&text, &range) {
                         let line_start = text[..range.start].rfind('\n').map_or(0, |n| n + 1);
                         underlines.push((line_start..range.end, underline));
@@ -894,6 +923,25 @@ impl Document {
             }
         }
         tables.finish(&text, &spans, &images);
+        let outline = spans
+            .iter()
+            .map(|span| super::compose_decorations::Semantic {
+                source: span.start..span.end,
+                role: span.role,
+                flags: span.flags,
+                content: span.content_start,
+            })
+            .chain(
+                images
+                    .iter()
+                    .map(|image| super::compose_decorations::Semantic {
+                        source: image.start..image.end,
+                        role: 15,
+                        flags: 0,
+                        content: None,
+                    }),
+            )
+            .collect();
         Self {
             revision,
             epoch,
@@ -903,9 +951,11 @@ impl Document {
             images,
             paragraphs,
             underlines,
+            heading_openers,
             code,
             tables,
             used,
+            decorations: super::compose_decorations::Snapshot::new(revision, outline),
         }
     }
 
@@ -1001,6 +1051,7 @@ impl Document {
         start..end
     }
 
+    #[cfg(test)]
     fn native_table_projection(
         &self,
         state: &crate::state::EditorState,
@@ -1010,6 +1061,22 @@ impl Document {
         objects: &[Range<usize>],
         revealed: &[Range<usize>],
         tables: &[super::compose_tables::Table],
+    ) -> Option<Projection> {
+        let active = state
+            .conceals
+            .query_viewport(start, end, &state.marker_list, cursors);
+        self.project_native(start, end, cursors, objects, revealed, tables, active)
+    }
+
+    fn project_native(
+        &self,
+        start: usize,
+        end: usize,
+        cursors: &[usize],
+        objects: &[Range<usize>],
+        revealed: &[Range<usize>],
+        tables: &[super::compose_tables::Table],
+        active: Vec<(Range<usize>, Option<&str>)>,
     ) -> Option<Projection> {
         let mut overrides: Vec<_> = objects
             .iter()
@@ -1039,9 +1106,6 @@ impl Document {
                 .filter(|s| [8, 12].contains(&s.role))
                 .map(|s| s.start..s.end),
         );
-        let active = state
-            .conceals
-            .query_viewport(start, end, &state.marker_list, cursors);
         for block in self
             .code
             .iter()
@@ -1161,6 +1225,17 @@ impl Document {
                 });
             }
         }
+        for opener in &self.heading_openers {
+            if opener.start >= start
+                && opener.end <= end
+                && !source_line_has_cursor(&self.text, opener.start, cursors)
+            {
+                overrides.push(Conceal {
+                    source: opener.clone(),
+                    replacement: None,
+                });
+            }
+        }
         for (heading, underline) in &self.underlines {
             if underline.start < start || underline.end > end {
                 continue;
@@ -1223,7 +1298,7 @@ impl Document {
                 });
             }
         }
-        for (range, replacement) in active {
+        for (range, replacement) in &active {
             // The grid expands a nested item's leading whitespace according
             // to its column measure. Native indentation already comes from
             // parsed container depth, so keep only the original whitespace.
@@ -1237,10 +1312,10 @@ impl Document {
                     .iter()
                     .any(|s| s.role == 13 && s.start == range.end && s.content_start.is_some())
             {
-                revealed.push(range);
+                revealed.push(range.clone());
                 continue;
             }
-            if replacement != Some("▌")
+            if *replacement != Some("▌")
                 || self.text.get(range.clone()) != Some(">")
                 || !self
                     .spans
@@ -1278,17 +1353,14 @@ impl Document {
                 });
             }
         }
-        state
-            .conceals
-            .project_text_with_overrides(
-                &self.text[start..end],
-                start,
-                &state.marker_list,
-                cursors,
-                &overrides,
-                &revealed,
-            )
-            .ok()
+        crate::view::conceal::ConcealManager::project_resolved_ranges(
+            &self.text[start..end],
+            start,
+            &active,
+            &overrides,
+            &revealed,
+        )
+        .ok()
     }
 }
 
@@ -1485,6 +1557,10 @@ impl ComposeCache {
                 .get_text_range_mut(0, state.buffer.len())
                 .ok()?;
             let text = String::from_utf8(bytes).ok()?;
+            let previous = self
+                .documents
+                .remove(&key)
+                .filter(|doc| doc.epoch == state.marker_list.instance_id());
             if self.documents.len() >= CACHE_LIMIT {
                 if let Some(oldest) = self
                     .documents
@@ -1495,10 +1571,16 @@ impl ComposeCache {
                     self.documents.remove(&oldest);
                 }
             }
-            self.documents.insert(
-                key,
-                Document::parse(text, revision, self.clock, state.marker_list.instance_id()),
-            );
+            let mut document =
+                Document::parse(text, revision, self.clock, state.marker_list.instance_id());
+            if let Some(previous) = previous {
+                let outline = document.decorations.outline().to_vec();
+                document.decorations =
+                    previous
+                        .decorations
+                        .rebase(revision, outline, &state.coord_map);
+            }
+            self.documents.insert(key, document);
         }
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
@@ -1515,13 +1597,13 @@ impl ComposeCache {
             }
         };
         for _ in 0..4 {
-            if status(start, end) != Status::Ready {
-                break;
-            }
-            let ranges =
+            let ranges = if status(start, end) == Status::Ready {
                 state
                     .conceals
-                    .query_viewport(start, end, &state.marker_list, &cursor_positions);
+                    .query_viewport(start, end, &state.marker_list, &cursor_positions)
+            } else {
+                doc.decorations.active(&(start..end), &cursor_positions)
+            };
             let old = (start, end);
             for (range, _) in ranges {
                 start = start.min(range.start);
@@ -1557,21 +1639,45 @@ impl ComposeCache {
             .map(|image| image.start..image.end)
             .collect();
         let status = status(start, end);
-        let tables = if measured_tables && status == Status::Ready {
+        if status == Status::Ready {
+            let complete = if readiness_enabled {
+                readiness.completed_ranges(buffer)
+            } else {
+                vec![0..doc.text.len()]
+            };
+            let region = start..end;
+            if doc
+                .decorations
+                .needs_capture(state.conceals.version(), &region, &complete)
+            {
+                let records = state
+                    .conceals
+                    .resolved_snapshot(&state.marker_list, &region);
+                doc.decorations.capture(
+                    state.conceals.version(),
+                    region,
+                    complete,
+                    doc.text.len(),
+                    records,
+                );
+            }
+        }
+        let tables = if measured_tables && status != Status::Failed {
             doc.tables
                 .snapshot(&doc.text, start..end, &cursor_positions)
         } else {
             Vec::new()
         };
-        let projection = if status == Status::Ready {
-            doc.native_table_projection(
-                state,
+        let projection = if status != Status::Failed {
+            let active = doc.decorations.active(&(start..end), &cursor_positions);
+            doc.project_native(
                 start,
                 end,
                 &cursor_positions,
                 &objects,
                 &revealed,
                 &tables,
+                active,
             )?
         } else {
             // Never publish a partially applied replacement/conceal map.
@@ -1589,7 +1695,8 @@ impl ComposeCache {
         pane.asset_authority = asset_authority;
         pane.asset_document = asset_document;
         pane.ready = Some(status != Status::Pending);
-        if status != Status::Ready {
+        pane.current_projection = status != Status::Failed;
+        if status == Status::Failed {
             for image in &mut pane.images {
                 image.rendered = false;
                 image.source_preview = false;
@@ -1697,6 +1804,7 @@ impl ComposePane {
             focused,
             keyboard: false,
             native_newline: 0,
+            current_projection: false,
             top_byte,
             document_len: doc.text.len(),
             asset_authority: 0,
@@ -2215,6 +2323,41 @@ mod tests {
             .unwrap();
         assert!(grid.text.contains('─') && grid.text.contains('▌'));
         assert_eq!(doc.text, text);
+    }
+
+    #[test]
+    fn current_parser_headings_and_images_do_not_need_mutable_formatter_output() {
+        let source = "# Title\n\nBefore ![dot](dot.png) after.\n\nTail\n";
+        let doc = Document::parse(source.into(), 0, 0, 1);
+        let image = doc.images[0].start..doc.images[0].end;
+        let projection = doc
+            .project_native(0, source.len(), &[source.len()], &[image], &[], &[], vec![])
+            .unwrap();
+        assert_eq!(projection.text, "Title\n\nBefore \u{fffc} after.\n\nTail\n");
+        let editing = doc
+            .project_native(0, source.len(), &[0], &[], &[], &[], vec![])
+            .unwrap();
+        assert!(
+            editing.text.starts_with("# Title"),
+            "the active heading's exact source opener is still editable"
+        );
+        let quoted = Document::parse("> ## Quoted\n\n`# literal`\n".into(), 0, 0, 1);
+        let editing = quoted
+            .project_native(0, quoted.text.len(), &[0], &[], &[], &[], vec![])
+            .unwrap();
+        assert!(
+            editing.text.starts_with("> ## Quoted"),
+            "a cursor in the quote prefix reveals the heading line"
+        );
+        assert!(editing.text.contains("# literal"));
+        let setext = Document::parse("#Literal\n--------\n".into(), 0, 0, 1);
+        let projection = setext
+            .project_native(0, setext.text.len(), &[], &[], &[], &[], vec![])
+            .unwrap();
+        assert!(
+            projection.text.starts_with("#Literal"),
+            "a setext title's literal hash is not an ATX delimiter"
+        );
     }
 
     #[test]

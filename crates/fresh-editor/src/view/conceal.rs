@@ -80,7 +80,44 @@ pub struct ConcealManager {
     version: u32,
 }
 
+/// Marker-free presentation data captured only after a formatter completes.
+/// The source owner validates these ranges before retaining them across edits.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedConceal {
+    pub source: Range<usize>,
+    pub replacement: Option<String>,
+    pub activation: Option<(bool, Range<usize>)>,
+}
+
 impl ConcealManager {
+    pub(crate) fn resolved_snapshot(
+        &self,
+        markers: &MarkerList,
+        region: &Range<usize>,
+    ) -> Vec<ResolvedConceal> {
+        self.ranges
+            .iter()
+            .filter_map(|entry| {
+                let source = entry.range(markers);
+                if source.is_empty() || source.start < region.start || source.end > region.end {
+                    return None;
+                }
+                let activation = match entry.activation {
+                    Some(rule) => Some((
+                        rule.if_cursor_in,
+                        markers.get_position(rule.scope_start)?
+                            ..markers.get_position(rule.scope_end)?,
+                    )),
+                    None => None,
+                };
+                Some(ResolvedConceal {
+                    source,
+                    replacement: entry.replacement.clone(),
+                    activation,
+                })
+            })
+            .collect()
+    }
     /// Create a new empty conceal manager
     pub fn new() -> Self {
         Self {
@@ -373,14 +410,28 @@ impl ConcealManager {
         overrides: &[fresh_core::compose::Conceal<'_>],
         revealed: &[Range<usize>],
     ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
+        let end = source_start
+            .checked_add(source.len())
+            .ok_or(fresh_core::compose::ProjectionError::CoordinateOverflow)?;
+        let ranges = self.query_viewport(source_start, end, marker_list, cursors);
+        Self::project_resolved_ranges(source, source_start, &ranges, overrides, revealed)
+    }
+
+    pub(crate) fn project_resolved_ranges(
+        source: &str,
+        source_start: usize,
+        ranges: &[(Range<usize>, Option<&str>)],
+        overrides: &[fresh_core::compose::Conceal<'_>],
+        revealed: &[Range<usize>],
+    ) -> Result<fresh_core::compose::Projection, fresh_core::compose::ProjectionError> {
         use fresh_core::compose::{Conceal, Projection, ProjectionError};
-        let source_end = source_start
+        let _source_end = source_start
             .checked_add(source.len())
             .ok_or(ProjectionError::CoordinateOverflow)?;
-        let ranges = self.query_viewport(source_start, source_end, marker_list, cursors);
         let mut covered = None;
         let mut conceals: Vec<_> = ranges
-            .into_iter()
+            .iter()
+            .cloned()
             .filter(|(range, _)| {
                 // Deleting a decoration's source can collapse both markers
                 // before its plugin rebuild arrives. It no longer conceals

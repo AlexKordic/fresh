@@ -112,6 +112,7 @@ use crate::view::scene::Rgb;
 
 mod wire;
 mod compose;
+mod compose_decorations;
 mod compose_assets;
 mod compose_text;
 mod compose_tables;

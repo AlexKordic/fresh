@@ -270,6 +270,29 @@ impl Registry {
         coverage(&buffer.lines, range)
     }
 
+    /// Disjoint completed source intervals; pending/failed batches never
+    /// certify a partially applied clear/rebuild command stream.
+    pub fn completed_ranges(&self, id: BufferId) -> Vec<Range<usize>> {
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        if let Some(buffer) = self.buffers.get(&id) {
+            for line in buffer
+                .lines
+                .iter()
+                .filter(|line| line.status == Status::Ready)
+            {
+                if let Some(last) = ranges
+                    .last_mut()
+                    .filter(|last| last.end >= line.range.start)
+                {
+                    last.end = last.end.max(line.range.end);
+                } else {
+                    ranges.push(line.range.clone());
+                }
+            }
+        }
+        ranges
+    }
+
     pub fn adjust(
         &mut self,
         id: BufferId,
@@ -356,10 +379,12 @@ mod tests {
         assert_eq!(registry.status(id, 0..10), Status::Ready);
         assert_eq!(registry.status(id, 22..32), Status::Ready);
         assert_eq!(registry.status(id, 0..32), Status::Pending);
+        assert_eq!(registry.completed_ranges(id), vec![0..10, 22..32]);
         let next = registry.begin(1, id, &[(10, 22)]).unwrap();
         assert!(!registry.complete(&first, true));
         registry.complete(&next, true);
         assert_eq!(registry.status(id, 0..32), Status::Ready);
+        assert_eq!(registry.completed_ranges(id), vec![0..32]);
         registry.adjust(id, 7, 6, 0, 0, 2);
         assert_eq!(registry.status(id, 12..24), Status::Ready);
         assert_eq!(registry.status(id, 0..12), Status::Pending);
@@ -408,6 +433,7 @@ mod tests {
         let failed = registry.begin(1, id, &[(0, 10)]).unwrap();
         registry.complete(&failed, false);
         assert_eq!(registry.status(id, 0..10), Status::Failed);
+        assert!(registry.completed_ranges(id).is_empty());
         let retry = registry.begin(1, id, &[(0, 10)]).unwrap();
         registry.complete(&retry, true);
         assert_eq!(registry.status(id, 0..10), Status::Ready);
