@@ -87,7 +87,7 @@ struct ExplorerSection {
 /// turn each one-line scroll into a walk over the whole run. The consumer then
 /// sees a line whose predecessor is missing, which it already has to treat as a
 /// block head.
-const FLOW_RUN_MAX_LINES: usize = 200;
+pub(super) const FLOW_RUN_MAX_LINES: usize = 200;
 
 /// Bytes of source text one frame offers the plugins through `lines_changed`.
 ///
@@ -223,17 +223,28 @@ impl crate::view::shell::fold::ProvenanceSink for FoldProvenance {
 impl Editor {
     #[cfg(feature = "web")]
     pub(crate) fn compose_plugins_active(&self) -> bool {
-        self.plugin_manager.try_read().map(|manager| manager.is_active()).unwrap_or(true)
+        self.plugin_manager
+            .try_read()
+            .map(|manager| manager.is_active())
+            .unwrap_or(true)
     }
 
-    pub(crate) fn compose_hook_scope(&self, buffer_id: crate::model::event::BufferId) -> Option<fresh_core::api::LinesBatch> {
+    pub(crate) fn compose_hook_scope(
+        &self,
+        buffer_id: crate::model::event::BufferId,
+    ) -> Option<fresh_core::api::LinesBatch> {
         #[cfg(feature = "web")]
         {
             let window = self.active_window();
             if window.compose_readiness.is_tracked(buffer_id) {
                 let state = window.buffer_state(buffer_id)?;
-                return Some(fresh_core::api::LinesBatch { window_id: window.id.0, buffer_id,
-                    buffer_epoch: state.marker_list.instance_id(), revision: state.buffer.version(), id: 0 });
+                return Some(fresh_core::api::LinesBatch {
+                    window_id: window.id.0,
+                    buffer_id,
+                    buffer_epoch: state.marker_list.instance_id(),
+                    revision: state.buffer.version(),
+                    id: 0,
+                });
             }
         }
         let _ = buffer_id;
@@ -507,7 +518,10 @@ impl Editor {
             let offers: Vec<_> = visible_buffers
                 .iter()
                 .map(|&(leaf, buffer, area)| {
-                    let top = self.active_window().split_view_states().get(&leaf)
+                    let top = self
+                        .active_window()
+                        .split_view_states()
+                        .get(&leaf)
                         .map_or(0, |vs| vs.buffer_tab_state().viewport.top_byte());
                     (leaf, buffer, area, top, None::<usize>)
                 })
@@ -522,20 +536,26 @@ impl Editor {
                 for request in &self.active_window().compose_regions {
                     let Some(&(_, _, area)) = visible_buffers.iter().find(|&&(leaf, buffer, _)| {
                         leaf == request.leaf && buffer == request.buffer
-                    }) else { continue; };
+                    }) else {
+                        continue;
+                    };
                     let current = self.active_window().buffer_state(request.buffer);
                     if current.is_none_or(|state| state.buffer.version() != request.revision) {
                         continue;
                     }
-                    offers.push((request.leaf, request.buffer, area,
-                        request.source.start, Some(request.source.end)));
+                    offers.push((
+                        request.leaf,
+                        request.buffer,
+                        area,
+                        request.source.start,
+                        Some(request.source.end),
+                    ));
                 }
                 offers
             };
 
             let mut total_new_lines = 0usize;
             for (_split_id, buffer_id, split_area, viewport_top_byte, source_end) in offers {
-
                 // Whether this buffer is being composed in any split, read from
                 // the live view states rather than from the plugin snapshot.
                 // Travels with the batch (see `HookArgs::LinesChanged`) because
@@ -564,7 +584,8 @@ impl Editor {
                 {
                     if __win.compose_readiness.is_tracked(buffer_id) {
                         if let Some(state) = __win.buffer_state(buffer_id) {
-                            let (epoch, revision) = (state.marker_list.instance_id(), state.buffer.version());
+                            let (epoch, revision) =
+                                (state.marker_list.instance_id(), state.buffer.version());
                             if __win.compose_readiness.track(buffer_id, epoch, revision) {
                                 __win.seen_byte_ranges.remove(&buffer_id);
                             }
@@ -691,74 +712,105 @@ impl Editor {
                             return 0;
                         }
 
-                        let mut walked: Vec<WalkedLine> = Vec::new();
-                        let mut line_number = state.buffer.get_line_number(walk_start);
-                        // Capped per read *and* in total: the walk offers the
-                        // plugins the lines under the viewport, and on a file
-                        // that is one enormous line "a line" is the file. The
-                        // reader's own 100 KB piece cap still made this a
-                        // multi-megabyte read every frame — for text no plugin
-                        // can decorate, since only the first screenful of it is
-                        // ever drawn.
-                        let buffer_len = state.buffer.len();
-                        let mut iter = state
-                            .buffer
-                            .line_iterator(walk_start, estimated_line_length)
-                            .with_max_line_bytes(offer_budget);
-                        let mut walked_bytes = 0usize;
-                        // End of the last line walked, so the embedded-region
-                        // probe below covers exactly the lines we iterated.
-                        let mut walked_end = walk_start;
-                        // Lines walked ahead of the viewport's own top line:
-                        // the run's lead-in, which must not eat the viewport's
-                        // line budget.
-                        let mut lead_in = 0usize;
-                        while let Some((line_start, line_content)) = iter.next_line() {
-                            let byte_end = line_start + line_content.len();
-                            walked_end = byte_end;
-                            walked_bytes += line_content.len();
-                            let blank = line_is_blank(&line_content);
-                            if line_start < top_byte {
-                                lead_in += 1;
+                        #[cfg(feature = "web")]
+                        let native_walk = if let Some(end) = source_end.filter(|_| compose_readiness.is_tracked(buffer_id)) {
+                            let length = state.buffer.len();
+                            let number = state.buffer.get_line_number(walk_start);
+                            match compose_readiness.offer_lines(buffer_id, top_byte..end, walk_start,
+                                number, length, composing_in_any_split, offer_budget,
+                                |start, count| state.buffer.get_text_range_mut(start, count).ok()) {
+                                Ok(Some(lines)) => {
+                                    let end = lines.last().map_or(walk_start, |line| line.byte_end);
+                                    let lines = lines.into_iter().map(|line| WalkedLine {
+                                        line_number: line.line_number, byte_start: line.byte_start,
+                                        byte_end: line.byte_end, content: line.content,
+                                        seen: seen_byte_ranges.contains(&(line.byte_start, line.byte_end)),
+                                    }).collect();
+                                    Some((lines, end))
+                                }
+                                Ok(None) => {
+                                    // A complete physical line/run can span several bounded
+                                    // reads. Keep drawing so the next frame resumes its exact
+                                    // UTF-8 frontier; never certify a truncated prefix.
+                                    hooks_deferred = true;
+                                    return 0;
+                                }
+                                Err(()) => return 0,
                             }
-                            // A piece that stopped short of its line's own
-                            // terminator is the front of a line, not a line:
-                            // the read cap above cut it. Counting it as one
-                            // would number every line below it wrongly, and
-                            // there is nothing below it to offer anyway —
-                            // only the part that fits on screen is ever drawn.
-                            let complete =
-                                line_content.ends_with('\n') || byte_end >= buffer_len;
-                            walked.push(WalkedLine {
-                                line_number,
-                                byte_start: line_start,
-                                byte_end,
-                                seen: seen_byte_ranges.contains(&(line_start, byte_end)),
-                                content: line_content,
-                            });
-                            if !complete {
-                                break;
-                            }
-                            line_number += 1;
+                        } else { None };
+                        #[cfg(not(feature = "web"))]
+                        let native_walk: Option<(Vec<WalkedLine>, usize)> = None;
+                        let (walked, walked_end) = if let Some(ready) = native_walk { ready } else {
+                            let mut walked: Vec<WalkedLine> = Vec::new();
+                            let mut line_number = state.buffer.get_line_number(walk_start);
+                            // Capped per read *and* in total: the walk offers the
+                            // plugins the lines under the viewport, and on a file
+                            // that is one enormous line "a line" is the file. The
+                            // reader's own 100 KB piece cap still made this a
+                            // multi-megabyte read every frame — for text no plugin
+                            // can decorate, since only the first screenful of it is
+                            // ever drawn.
+                            let buffer_len = state.buffer.len();
+                            let mut iter = state
+                                .buffer
+                                .line_iterator(walk_start, estimated_line_length)
+                                .with_max_line_bytes(offer_budget);
+                            let mut walked_bytes = 0usize;
+                            // End of the last line walked, so the embedded-region
+                            // probe below covers exactly the lines we iterated.
+                            let mut walked_end = walk_start;
+                            // Lines walked ahead of the viewport's own top line:
+                            // the run's lead-in, which must not eat the viewport's
+                            // line budget.
+                            let mut lead_in = 0usize;
+                            while let Some((line_start, line_content)) = iter.next_line() {
+                                let byte_end = line_start + line_content.len();
+                                walked_end = byte_end;
+                                walked_bytes += line_content.len();
+                                let blank = line_is_blank(&line_content);
+                                if line_start < top_byte {
+                                    lead_in += 1;
+                                }
+                                // A piece that stopped short of its line's own
+                                // terminator is the front of a line, not a line:
+                                // the read cap above cut it. Counting it as one
+                                // would number every line below it wrongly, and
+                                // there is nothing below it to offer anyway —
+                                // only the part that fits on screen is ever drawn.
+                                let complete =
+                                    line_content.ends_with('\n') || byte_end >= buffer_len;
+                                walked.push(WalkedLine {
+                                    line_number,
+                                    byte_start: line_start,
+                                    byte_end,
+                                    seen: seen_byte_ranges.contains(&(line_start, byte_end)),
+                                    content: line_content,
+                                });
+                                if !complete {
+                                    break;
+                                }
+                                line_number += 1;
 
-                            if walked_bytes >= offer_budget {
-                                break;
+                                if walked_bytes >= offer_budget {
+                                    break;
+                                }
+                                if walked.len() < lead_in + rows {
+                                    continue;
+                                }
+                                // The viewport is covered. A composing buffer walks
+                                // on to the end of the run it stopped inside, so a
+                                // batch never carries half a paragraph — bounded,
+                                // because a file whose lines never blank out must
+                                // not turn one frame into a walk over the buffer.
+                                if !composing_in_any_split
+                                    || blank
+                                    || walked.len() >= lead_in + rows + FLOW_RUN_MAX_LINES
+                                {
+                                    break;
+                                }
                             }
-                            if walked.len() < lead_in + rows {
-                                continue;
-                            }
-                            // The viewport is covered. A composing buffer walks
-                            // on to the end of the run it stopped inside, so a
-                            // batch never carries half a paragraph — bounded,
-                            // because a file whose lines never blank out must
-                            // not turn one frame into a walk over the buffer.
-                            if !composing_in_any_split
-                                || blank
-                                || walked.len() >= lead_in + rows + FLOW_RUN_MAX_LINES
-                            {
-                                break;
-                            }
-                        }
+                            (walked, walked_end)
+                        };
 
                         // What to send. A line the plugin has not been offered
                         // before, always; and for a composing buffer, every
@@ -794,6 +846,7 @@ impl Editor {
                             }
                         }
 
+                        let walked_start = walked.first().map_or(walk_start, |line| line.byte_start);
                         let mut new_lines: Vec<crate::services::plugins::hooks::LineInfo> =
                             Vec::new();
                         let mut fresh_ranges: Vec<(usize, usize)> = Vec::new();
@@ -833,7 +886,7 @@ impl Editor {
                             // report.
                             let structure = state
                                 .highlighter
-                                .structure_lines_in(&state.buffer, walk_start..walked_end);
+                                .structure_lines_in(&state.buffer, walked_start..walked_end);
                             if !structure.regions.is_empty() {
                                 let mut next = 0usize;
                                 for line in new_lines.iter_mut() {

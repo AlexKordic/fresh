@@ -9,6 +9,10 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[path = "compose_offer.rs"]
+mod offer;
+pub(crate) use offer::OfferedLine;
+
 static NEXT_BATCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,6 +59,7 @@ struct Buffer {
     lines: Vec<Line>,
     waiting: HashMap<(usize, usize), (Instant, bool)>,
     fallback: bool,
+    offer: Option<offer::Offer>,
 }
 
 #[derive(Default)]
@@ -82,6 +87,7 @@ impl Registry {
                 lines: Vec::new(),
                 waiting: HashMap::new(),
                 fallback: false,
+                offer: None,
             },
         );
         true
@@ -99,11 +105,13 @@ impl Registry {
     pub fn invalidate(&mut self, id: BufferId) {
         if let Some(buffer) = self.buffers.get_mut(&id) {
             buffer.lines.clear();
+            buffer.offer = None;
         }
     }
     pub fn invalidate_all(&mut self) {
         for buffer in self.buffers.values_mut() {
             buffer.lines.clear();
+            buffer.offer = None;
         }
     }
 
@@ -147,12 +155,64 @@ impl Registry {
 
     pub fn retain_demands(&mut self, regions: &[crate::app::window::ComposeRegion]) {
         for (id, buffer) in &mut self.buffers {
+            if buffer.offer.as_ref().is_some_and(|offer| {
+                !regions
+                    .iter()
+                    .any(|r| r.buffer == *id && r.source == offer.request)
+            }) {
+                buffer.offer = None;
+            }
             buffer.waiting.retain(|&(start, end), _| {
                 regions
                     .iter()
                     .any(|r| r.buffer == *id && r.source.start == start && r.source.end == end)
             });
         }
+    }
+
+    /// At most one native formatting offer is retained per tracked buffer.
+    /// Competing live ranges wait; edits, invalidation and withdrawn demands
+    /// discard unfinished source instead of mixing revisions or owners.
+    pub fn offer_lines(
+        &mut self,
+        id: BufferId,
+        request: Range<usize>,
+        start: usize,
+        line_number: usize,
+        length: usize,
+        close_run: bool,
+        budget: usize,
+        read: impl FnMut(usize, usize) -> Option<Vec<u8>>,
+    ) -> Result<Option<Vec<OfferedLine>>, ()> {
+        let buffer = self.buffers.get_mut(&id).ok_or(())?;
+        if start > request.start || request.start > request.end || request.end > length {
+            buffer.offer = None;
+            buffer.fallback = true;
+            return Err(());
+        }
+        if buffer.offer.as_ref().is_some_and(|o| o.request != request) {
+            return Ok(None);
+        }
+        if buffer
+            .offer
+            .as_ref()
+            .is_some_and(|o| !o.matches(&request, length))
+        {
+            buffer.offer = None;
+            buffer.fallback = true;
+            return Err(());
+        }
+        let offer = buffer.offer.get_or_insert_with(|| {
+            offer::Offer::new(request, start, line_number, length, close_run)
+        });
+        let result = offer.poll(budget, read);
+        if !matches!(result, Ok(None)) {
+            buffer.offer = None;
+        }
+        if result.is_err() {
+            buffer.fallback = true;
+        }
+        result
     }
 
     pub fn begin(
@@ -163,6 +223,12 @@ impl Registry {
     ) -> Option<LinesBatch> {
         let buffer = self.buffers.get_mut(&id)?;
         let token = NEXT_BATCH.fetch_add(1, Ordering::Relaxed);
+        tracing::trace!(
+            batch = token,
+            buffer = id.0,
+            ranges = ranges.len(),
+            "compose formatting batch offered"
+        );
         // A newer offer owns every line it rebuilds. An older completion can
         // never complete the replacement batch, even at the same source range.
         buffer.lines.retain(|line| {
@@ -212,6 +278,11 @@ impl Registry {
             }
         }
         if changed {
+            tracing::trace!(
+                batch = batch.id,
+                success,
+                "compose formatting batch completed"
+            );
             if !success {
                 buffer.fallback = true;
             }
@@ -243,6 +314,7 @@ impl Registry {
                 .retain(|&(a, b), _| coverage(lines, a..b) == Status::Pending);
             for (started, expired) in buffer.waiting.values_mut() {
                 if !*expired && now.saturating_duration_since(*started) >= Duration::from_secs(5) {
+                    tracing::trace!("compose formatting demand expired");
                     *expired = true;
                     buffer.fallback = true;
                     changed = true;
@@ -252,6 +324,12 @@ impl Registry {
                 if line.status == Status::Pending
                     && now.saturating_duration_since(line.started) >= Duration::from_secs(5)
                 {
+                    tracing::trace!(
+                        batch = line.batch,
+                        start = line.range.start,
+                        end = line.range.end,
+                        "compose formatting batch expired"
+                    );
                     line.status = Status::Failed;
                     changed = true;
                 }
@@ -322,6 +400,7 @@ impl Registry {
             }
         });
         buffer.revision = revision;
+        buffer.offer = None;
         buffer.waiting.clear();
     }
 }
@@ -329,6 +408,108 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfinished_offers_do_not_certify_and_edits_restart_from_current_source() {
+        let id = BufferId(3);
+        let old = "a".repeat(200);
+        let new = "b".repeat(200);
+        let mut registry = Registry::default();
+        registry.track(id, 7, 4);
+        assert!(registry
+            .offer_lines(id, 0..200, 0, 0, 200, true, 64, |at, n| Some(
+                old.as_bytes()[at..at + n].to_vec()
+            ))
+            .unwrap()
+            .is_none());
+        assert_eq!(registry.demand(id, 0..200), Status::Pending);
+        registry.adjust(id, 7, 5, 0, 1, 1);
+        let mut starts = Vec::new();
+        let lines = loop {
+            let result = registry
+                .offer_lines(id, 0..200, 0, 0, 200, true, 64, |at, n| {
+                    starts.push(at);
+                    Some(new.as_bytes()[at..at + n].to_vec())
+                })
+                .unwrap();
+            if let Some(lines) = result {
+                break lines;
+            }
+            assert_eq!(registry.status(id, 0..200), Status::Pending);
+        };
+        assert_eq!(starts[0], 0);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.content.as_str())
+                .collect::<String>(),
+            new
+        );
+        let ranges = lines
+            .iter()
+            .map(|line| (line.byte_start, line.byte_end))
+            .collect::<Vec<_>>();
+        let batch = registry.begin(1, id, &ranges).unwrap();
+        assert_eq!(registry.demand(id, 0..200), Status::Pending);
+        registry.complete(&batch, true);
+        assert_eq!(registry.demand(id, 0..200), Status::Ready);
+    }
+
+    #[test]
+    fn competing_offers_wait_and_withdrawn_or_replaced_owners_release_source() {
+        let id = BufferId(3);
+        let source = "a".repeat(200);
+        let mut registry = Registry::default();
+        registry.track(id, 7, 4);
+        assert!(registry
+            .offer_lines(id, 0..200, 0, 0, 200, true, 64, |at, n| Some(
+                source.as_bytes()[at..at + n].to_vec()
+            ))
+            .unwrap()
+            .is_none());
+        assert!(registry
+            .offer_lines(id, 0..100, 0, 0, 200, true, 64, |_, _| panic!(
+                "a competing offer must not allocate another source batch"
+            ))
+            .unwrap()
+            .is_none());
+        registry.retain_demands(&[]);
+        assert!(registry
+            .offer_lines(id, 0..100, 0, 0, 200, true, 64, |at, n| {
+                assert_eq!(at, 0);
+                Some(source.as_bytes()[at..at + n].to_vec())
+            })
+            .unwrap()
+            .is_none());
+        assert!(registry.track(id, 8, 0));
+        let fresh = "fresh\n";
+        let lines = registry
+            .offer_lines(id, 0..fresh.len(), 0, 0, fresh.len(), true, 64, |at, n| {
+                Some(fresh.as_bytes()[at..at + n].to_vec())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.content.as_str())
+                .collect::<String>(),
+            fresh
+        );
+        assert_eq!(registry.status(id, 0..fresh.len()), Status::Pending);
+    }
+
+    #[test]
+    fn failed_offer_reads_release_work_and_enter_editable_source_fallback() {
+        let id = BufferId(3);
+        let mut registry = Registry::default();
+        registry.track(id, 7, 4);
+        assert!(registry
+            .offer_lines(id, 0..200, 0, 0, 200, true, 64, |_, _| None)
+            .is_err());
+        assert!(registry.buffers[&id].offer.is_none());
+        assert_eq!(registry.demand(id, 0..200), Status::Failed);
+    }
 
     #[test]
     fn completed_requests_do_not_expire_after_the_reader_leaves_the_view() {
