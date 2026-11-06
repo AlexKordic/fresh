@@ -13,6 +13,41 @@ use crate::input::keybindings::Action;
 
 use super::Editor;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::popup::{Popup, PopupListItem};
+
+    #[test]
+    fn popup_click_cannot_confirm_a_disabled_or_missing_row() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.clipboard.use_osc52 = false;
+        config.clipboard.use_system_clipboard = false;
+        let mut editor = Editor::for_test(
+            config, 80, 24, Some(root.path().into()),
+            crate::config_io::DirectoryContext::for_testing(root.path()),
+            crate::view::color_support::ColorCapability::TrueColor,
+            std::sync::Arc::new(crate::model::filesystem::StdFileSystem),
+            None, None, false, false, false,
+        ).unwrap();
+        let theme = crate::view::theme::Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        let mut unavailable = PopupListItem::new("disabled", "Unavailable".into());
+        unavailable.disabled = true;
+        for global in [false, true] {
+            let popup = Popup::list(vec![unavailable.clone(), PopupListItem::new("enabled", "Available".into())], &theme);
+            if global { editor.global_popups.show(popup); }
+            else { editor.active_state_mut().popups.show(popup); }
+            editor.select_popup_item(0);
+            assert!(editor.topmost_popup_mut().is_some(), "disabled row dismissed popup");
+            editor.select_popup_item(99);
+            assert!(editor.topmost_popup_mut().is_some(), "missing row dismissed popup");
+            editor.select_popup_item(1);
+            assert!(editor.topmost_popup_mut().is_none(), "valid row must still confirm");
+        }
+    }
+}
+
 /// Behavior owned by this component (moved from mouse_input.rs —
 /// the handlers its arms dispatch to).
 impl Editor {
@@ -50,17 +85,20 @@ impl Editor {
     /// ones: global popups win over a buffer's while any is visible.
     pub(crate) fn select_popup_item(&mut self, index: usize) {
         let set = |p: &mut crate::view::popup::Popup| {
-            if let crate::view::popup::PopupContent::List { selected, .. } = &mut p.content {
-                *selected = index;
+            if let crate::view::popup::PopupContent::List { items, selected } = &mut p.content {
+                if items.get(index).is_some_and(|item| !item.disabled) {
+                    *selected = index;
+                    return true;
+                }
             }
+            false
         };
-        if self.global_popups.is_visible() {
-            if let Some(p) = self.global_popups.top_mut() {
-                set(p);
-            }
-        } else if let Some(p) = self.active_state_mut().popups.top_mut() {
-            set(p);
-        }
+        let selectable = if self.global_popups.is_visible() {
+            self.global_popups.top_mut().is_some_and(set)
+        } else {
+            self.active_state_mut().popups.top_mut().is_some_and(set)
+        };
+        if !selectable { return; }
         if let Err(e) = self.handle_action(Action::PopupConfirm) {
             tracing::warn!("popup confirm failed: {e}");
         }
