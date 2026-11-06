@@ -25,6 +25,9 @@ mod parsing;
 mod prefixes;
 pub(crate) use prefixes::Context as ComposeHangingContext;
 
+#[path = "compose_flow.rs"]
+mod flow;
+
 #[cfg(test)]
 #[path = "compose_profile.rs"]
 mod profile;
@@ -776,6 +779,7 @@ struct Document {
     spans: Vec<ComposeSpan>,
     images: Vec<ComposeImage>,
     paragraphs: Vec<Range<usize>>,
+    tight_paragraphs: Vec<Range<usize>>,
     item_paragraphs: HashMap<usize, usize>,
     prefix_cache: prefixes::Cache,
     underlines: Vec<(Range<usize>, Range<usize>)>,
@@ -814,6 +818,7 @@ impl Document {
             spans: Vec::new(),
             images: Vec::new(),
             paragraphs: Vec::new(),
+            tight_paragraphs: Vec::new(),
             item_paragraphs: HashMap::new(),
             prefix_cache: Default::default(),
             underlines: Vec::new(),
@@ -845,6 +850,7 @@ impl Document {
         let mut images = Vec::new();
         let mut image_stack: Vec<ComposeImage> = Vec::new();
         let mut paragraphs = Vec::new();
+        let mut tight_flows = flow::TightFlows::default();
         let mut item_paragraphs = HashMap::new();
         let mut underlines = Vec::new();
         let mut heading_openers = Vec::new();
@@ -860,6 +866,7 @@ impl Document {
                 return None;
             }
             tables.event(&text, &event, &range);
+            tight_flows.event(&text, &event, &range);
             // Use the parser's item ownership and inline ranges. Tight lists
             // have no Paragraph event; task markers precede their body. An
             // empty item whose first child is on another line has no prefix
@@ -1015,6 +1022,14 @@ impl Document {
         if cancelled() {
             return None;
         }
+        let tight_paragraphs = tight_flows
+            .finish(&text)
+            .into_iter()
+            .map(|(owner, range)| {
+                *item_paragraphs.entry(owner).or_insert(0usize) += 1;
+                range
+            })
+            .collect();
         tables.finish(&text, &spans, &images);
         if cancelled() {
             return None;
@@ -1046,6 +1061,7 @@ impl Document {
             spans,
             images,
             paragraphs,
+            tight_paragraphs,
             item_paragraphs,
             prefix_cache: Default::default(),
             underlines,
@@ -1103,6 +1119,14 @@ impl Document {
         while !self.text.is_char_boundary(anchor) {
             anchor -= 1;
         }
+        // Older clients keep the pre-capability policy. For capable clients,
+        // direct inline flows are complete paragraphs even when the parser
+        // omits Paragraph tags in a tight list.
+        let paragraphs = || {
+            self.paragraphs
+                .iter()
+                .chain(self.tight_paragraphs.iter().filter(|_| paragraph_windows))
+        };
         let context_start = |mut at: usize| {
             while !self.text.is_char_boundary(at) {
                 at -= 1;
@@ -1110,17 +1134,16 @@ impl Document {
             // Preserve paragraph joins, but do not let an unrelated preceding
             // paragraph pull the requested byte beyond the window's end.
             let physical_start = |byte| self.text[..byte].rfind('\n').map_or(0, |n| n + 1);
-            let parsed_paragraph = self.paragraphs.iter().find(|r| {
+            let parsed_paragraph = paragraphs().find(|r| {
                 r.contains(&at) || paragraph_windows && physical_start(r.start) <= at && at < r.end
             });
             let paragraph = parsed_paragraph.map_or_else(
                 || self.text[..at].rfind('\n').map_or(0, |n| n + 1),
                 |r| r.start,
             );
-            // Loose-list Paragraph events provide their own complete shaping
-            // context. A capable client receives the opening marker separately.
-            // Tight lists retain their existing item context until their flow
-            // and soft-wrap continuation contract is qualified.
+            // Parsed explicit paragraphs and tight inline flows provide their
+            // complete shaping context. A capable client receives offscreen
+            // ancestor markers separately; no soft-wrap slice is inferred.
             if paragraph_windows && parsed_paragraph.is_some() {
                 // Include source-owned leading whitespace so Home/Left can
                 // still address it and native hanging layout charges it once.
@@ -1147,8 +1170,8 @@ impl Document {
                     return line_start;
                 }
             }
-            // Tight list paragraphs may omit Paragraph events. Retain their
-            // marker context so hanging measurement is repeatable on a page.
+            // Structural bytes outside a known paragraph retain their item
+            // context so hanging measurement remains repeatable on a page.
             if self
                 .spans
                 .iter()
@@ -1191,11 +1214,7 @@ impl Document {
             end += self.text[end..].find('\n').map_or(0, |n| n + 1);
         }
         if paragraph_windows {
-            if let Some(paragraph) = self
-                .paragraphs
-                .iter()
-                .find(|r| r.start < end && end < r.end)
-            {
+            if let Some(paragraph) = paragraphs().find(|r| r.start < end && end < r.end) {
                 end = paragraph.end;
             }
         }

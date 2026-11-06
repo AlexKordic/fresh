@@ -273,6 +273,56 @@ mod tests {
     use super::*;
     use fresh_core::compose::Conceal;
 
+    #[test]
+    fn tight_nested_windows_omit_earlier_siblings_and_keep_the_whole_inline_flow() {
+        let mut text = "100) **Parent** café\r\n".to_owned();
+        for index in 0..2200 {
+            text.push_str(&format!("     - [ ] Child {index} with **prose**, café 👩🏽‍💻 and `code`.\r\n       continuation 東京 and [link](target.md).\r\n"));
+        }
+        assert_eq!(
+            pulldown_cmark::Parser::new_ext(&text, pulldown_cmark::Options::all())
+                .filter(|event| matches!(
+                    event,
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::Paragraph)
+                ))
+                .count(),
+            0,
+            "this fixture must exercise tight-list flow, not loose Paragraph tags"
+        );
+        let doc = Document::parse(text, 0, 0, 1);
+        let anchor = doc.text.rfind("Child").unwrap();
+        let physical = doc.text[..anchor].rfind('\n').unwrap() + 1;
+        let continuation = doc.text[anchor..].find("continuation").unwrap() + anchor;
+        let window = doc.source_window_policy(0, Some(continuation), Some(physical..anchor), true);
+        assert_eq!(doc.source_window(0, Some(continuation)).start, 0);
+        assert!(
+            window.start > super::super::WINDOW_BYTES,
+            "a nested tight list must not pull its earlier siblings into the window: {window:?}"
+        );
+        assert!(window.start <= physical && window.end == doc.text.len());
+        assert!(window.len() < super::super::WINDOW_BYTES * 2);
+        assert!(doc.text[window].contains("Child 2199"));
+    }
+
+    #[test]
+    fn tight_joined_paragraphs_remain_whole_with_bidi_unicode_and_hard_breaks() {
+        let text = "100) Parent\r\n     - Child **café**\r\n".to_owned()
+            + &"       continuation עברית العربية 東京 👩🏽‍💻 with `code` and words.\r\n".repeat(2400)
+            + "       final line  \r\n       after hard break\r\n";
+        let doc = Document::parse(text, 0, 0, 1);
+        let body = doc.text.find("Child").unwrap();
+        let physical = doc.text[..body].rfind('\n').unwrap() + 1;
+        let anchor = doc.text.rfind("continuation").unwrap();
+        let window = doc.source_window_policy(0, Some(anchor), None, true);
+        assert_eq!(window.start, physical);
+        assert_eq!(window.end, doc.text.len());
+        assert!(
+            window.len() > super::super::WINDOW_BYTES * 2,
+            "a logical paragraph must not be sliced into arbitrary soft-wrap contexts"
+        );
+        assert_eq!(doc.source_window(0, Some(anchor)).start, 0);
+    }
+
     fn cache_fixture() -> (Document, crate::state::EditorState) {
         let text = "1) **Opening** café\r\n\r\n   Later paragraph.\r\n\r\n   Last paragraph.\r\n";
         let mut state = crate::state::EditorState::new(

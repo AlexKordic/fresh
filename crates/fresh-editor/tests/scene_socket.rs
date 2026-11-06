@@ -293,6 +293,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_image_source_previews_reveal_nested_and_reference_markup(&root,&work);
     rich_list_markers_are_source_anchors_not_cell_widths(&root,&work);
     rich_paragraph_windows_prepare_cold_markers_and_keep_legacy_clients_independent(&root,&work);
+    rich_tight_list_windows_keep_complete_flows_and_offscreen_parent_markers(&root,&work);
     rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_compose(&root,&work);
     rich_native_content_is_independent_of_terminal_markdown_measure(&root,&work);
     rich_native_code_frames_reveal_and_edit_parser_owned_source(&root,&work);
@@ -709,6 +710,53 @@ fn rich_paragraph_windows_prepare_cold_markers_and_keep_legacy_clients_independe
     assert_eq!(modern.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().source_start,modern_start);
     let current=ed.active_window().active_state();
     assert_eq!(current.buffer.slice_bytes(0..current.buffer.len()),original.as_bytes());
+}
+
+fn rich_tight_list_windows_keep_complete_flows_and_offscreen_parent_markers(root:&std::path::Path,work:&std::path::Path) {
+    let mut original="100) **Parent** café 👩🏽‍💻\r\n".to_owned();
+    for index in 0..2200 {
+        original.push_str(&format!("     - [ ] Child {index} **prose**, café 👩🏽‍💻 and `code`.\r\n       continued 東京 with [link](target.md).\r\n"));
+    }
+    assert_eq!(pulldown_cmark::Parser::new_ext(&original,pulldown_cmark::Options::all())
+        .filter(|event|matches!(event,pulldown_cmark::Event::Start(pulldown_cmark::Tag::Paragraph))).count(),0);
+    let file=work.join("tight-windows.md"); std::fs::write(&file,&original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file],true).unwrap();
+    for _ in 0..12 {apply_step(&mut ed,&json!({}));}
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    apply_step(&mut ed,&json!({"action":"move_document_end"}));
+    let path=root.join("tight-windows.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap();
+    let mut modern=App::connect(&path);
+    modern.send(16,pb::ClientHello {version:1,rich_compose:true,paragraph_windows:true,..Default::default()});
+    settle_bridge(&mut bridge,&mut ed);
+    let scene=ready_scene(&mut bridge,&mut ed,&mut modern);
+    let compose=scene.panes.iter().find_map(|p|p.pane.as_ref().and_then(|p|p.compose.as_ref())).unwrap();
+    assert!(compose.source_start > 128<<10, "a tight child must not import preceding sibling paragraphs");
+    assert!(compose.source_end-compose.source_start < 128<<10);
+    assert!(compose.text.contains("Child 2199") && compose.text.contains("continued 東京"));
+    let parent=compose.spans.iter().find(|s|s.role==13 && s.start==0).unwrap();
+    let sample=compose.hanging_contexts.iter().find(|c|c.item_start==parent.start).unwrap();
+    assert_eq!(sample.text,"100) P");
+    assert!(sample.spans.iter().any(|span|span.flags&1!=0));
+    assert!(compose.current_projection && compose.ready==Some(true));
+    if let Some(output)=std::env::var_os("FC_COMPOSE_TIGHT_WINDOW_SCENE") {
+        std::fs::write(output,compose.encode_to_vec()).unwrap();
+    }
+    let modern_start=compose.source_start;
+    let mut legacy=App::connect(&path);
+    legacy.send(16,pb::ClientHello {version:1,rich_compose:true,..Default::default()});
+    settle_bridge(&mut bridge,&mut ed);
+    let old=ready_scene(&mut bridge,&mut ed,&mut legacy);
+    let old=old.panes.iter().find_map(|p|p.pane.as_ref().and_then(|p|p.compose.as_ref())).unwrap();
+    assert_eq!(old.source_start,0);
+    assert_eq!(old.source_end as usize,original.len());
+    if let Some(output)=std::env::var_os("FC_COMPOSE_TIGHT_WINDOW_SCENE") {
+        std::fs::write(std::path::Path::new(&output).with_extension("legacy.pb"),old.encode_to_vec()).unwrap();
+    }
+    modern.send(26,pb::Applied {seq:scene.seq}); settle_bridge(&mut bridge,&mut ed);
+    while let Some(frame)=modern.frame() {modern.send(26,pb::Applied {seq:frame.seq});}
+    assert_eq!(modern.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().source_start,modern_start);
+    let state=ed.active_window().active_state();
+    assert_eq!(state.buffer.slice_bytes(0..state.buffer.len()),original.as_bytes());
 }
 
 fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,work:&std::path::Path) {
