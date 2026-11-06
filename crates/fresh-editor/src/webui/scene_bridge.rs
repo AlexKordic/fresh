@@ -676,12 +676,23 @@ impl SceneClient {
                         out.frame_owed = true;
                         return Ok(());
                     }
+                    let cursors = if input.replacement.is_some() {
+                        input.replacement_cursor.into_iter().chain(input.replacements.iter().map(|r| r.cursor)).collect()
+                    } else { editor.active_window().active_cursors().iter().map(|(id, _)| id.0).collect::<Vec<_>>() };
                     let result = input.replace(editor);
                     match result {
                         Ok(()) => {
                             out.mutated = true;
                             self.navigation.clear();
-                            self.finish_input(super::compose::InputReply { id: input.id, accepted: true, ..Default::default() });
+                            let edit = input.scope.and_then(|scope| {
+                                let epoch = editor.active_window().buffer_state(scope.buffer)?.marker_list.instance_id();
+                                let position = editor.active_window().active_cursors().primary().position;
+                                let mut pane = compose.gather_tables_at(editor, scope.leaf, scope.buffer, Some(position), self.measured_tables)?;
+                                pane.viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
+                                if let Some(viewport) = &pane.viewport { pane.top_byte = viewport.position; }
+                                Some(super::compose::EditReceipt { window: scope.window, leaf: scope.leaf.0.0, buffer: scope.buffer.0, epoch, pane, cursors })
+                            });
+                            self.finish_input(super::compose::InputReply { id: input.id, accepted: true, edit, ..Default::default() });
                         }
                         Err(error) => self.cancel_input(input.id, &error),
                     }

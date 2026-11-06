@@ -773,7 +773,7 @@ use super::compose_text::Chunk as ComposeTextChunk;
 use super::compose_assets::Chunk;
 use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewportReply};
 use super::compose_tables::{Measurement as ComposeTableMeasurement, Column as ComposeTableColumn, Sample as ComposeTableSample, Style as ComposeTableStyle};
-use super::compose::InputReply;
+use super::compose::{EditReceipt, InputReply};
 use super::compose_navigation::CaretState;
 use crate::view::scene::{
     ContextMenuView, EntryDialogView, FileExplorerView, FileRow, KbConfirm, KbEditDialog, KbRow,
@@ -988,7 +988,13 @@ proto! {
         1 id: uint64, 2 accepted: bool, 3 needs_layout: bool,
         4 need_region: optional uint64, 5 carets: repeated ComposeCaret,
         6 need_y: optional double, 7 compose: maybe ComposePane,
-        8 cancelled: bool, 9 error: string,
+        8 cancelled: bool, 9 error: string, 10 edit: maybe ComposeEditReceipt,
+    }
+    /// The exact source and edited cursor set immediately after a native edit.
+    /// Kept in the accepted reply, including retries of the same input ID.
+    EditReceipt as ComposeEditReceipt {
+        1 window: uint64, 2 leaf: uint64, 3 buffer: uint64, 4 epoch: uint64,
+        5 pane: ComposePane, 6 cursors: repeated uint64,
     }
     CaretState as ComposeCaret { 1 id: uint64, 2 position: uint64, 3 affinity: uint32 }
     /// A line between panes.

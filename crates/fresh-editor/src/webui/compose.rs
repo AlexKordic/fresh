@@ -36,9 +36,22 @@ pub(crate) struct InputReply {
     pub need_y: Option<f64>,
     pub carets: Vec<super::compose_navigation::CaretState>,
     pub compose: Option<ComposePane>,
+    pub edit: Option<EditReceipt>,
     /// Terminal outcome: this request will never be retried or applied.
     pub cancelled: bool,
     pub error: String,
+}
+
+/// Immutable state captured immediately after this client's native edit.
+/// Other clients or later frames cannot replace the accepted cursor context.
+#[derive(Clone, Debug)]
+pub(crate) struct EditReceipt {
+    pub window: u64,
+    pub leaf: usize,
+    pub buffer: usize,
+    pub epoch: usize,
+    pub pane: ComposePane,
+    pub cursors: Vec<usize>,
 }
 
 pub(crate) struct Input<'a> {

@@ -772,6 +772,25 @@ pub struct InputReply {
     pub cancelled: bool,
     #[prost(string, tag = "9")]
     pub error: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "10")]
+    pub edit: ::core::option::Option<ComposeEditReceipt>,
+}
+/// The exact source and edited cursor set immediately after a native edit.
+/// Kept in the accepted reply, including retries of the same input ID.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeEditReceipt {
+    #[prost(uint64, tag = "1")]
+    pub window: u64,
+    #[prost(uint64, tag = "2")]
+    pub leaf: u64,
+    #[prost(uint64, tag = "3")]
+    pub buffer: u64,
+    #[prost(uint64, tag = "4")]
+    pub epoch: u64,
+    #[prost(message, optional, tag = "5")]
+    pub pane: ::core::option::Option<ComposePane>,
+    #[prost(uint64, repeated, tag = "6")]
+    pub cursors: ::prost::alloc::vec::Vec<u64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeCaret {

@@ -477,6 +477,18 @@ message InputReply {
   ComposePane compose = 7;
   bool cancelled = 8;
   string error = 9;
+  ComposeEditReceipt edit = 10;
+}
+
+// The exact source and edited cursor set immediately after a native edit.
+// Kept in the accepted reply, including retries of the same input ID.
+message ComposeEditReceipt {
+  uint64 window = 1;
+  uint64 leaf = 2;
+  uint64 buffer = 3;
+  uint64 epoch = 4;
+  ComposePane pane = 5;
+  repeated uint64 cursors = 6;
 }
 
 message ComposeCaret {
