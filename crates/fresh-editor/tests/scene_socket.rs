@@ -672,6 +672,14 @@ fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,wo
     let compose=pane.compose.as_ref().unwrap();
     let bodies:Vec<_>=compose.spans.iter().filter_map(|s|s.content_start).map(|p|original[p as usize..].split_whitespace().next().unwrap()).collect();
     assert_eq!(bodies,["Parent","Child","Child","Quoted","An"]);
+    assert_eq!(compose.hanging_contexts.len(), bodies.len());
+    for (sample, body) in compose.hanging_contexts.iter().zip(&bodies) {
+        let owner = compose.spans.iter().find(|s| s.role == 13 && s.start == sample.item_start).unwrap();
+        assert_eq!(owner.content_start, Some(sample.content_start));
+        let at = sample.prefix_end as usize;
+        assert_eq!(&sample.text[at..], &body[..1]);
+        assert!(!sample.text[..at].contains(['\r','\n']));
+    }
     assert_eq!(compose.images.len(),1);
     if let Some(path)=std::env::var_os("FC_COMPOSE_LIST_SCENE_FILE") {
         let mut fixture=compose.clone(); fixture.asset_authority=1; fixture.asset_document=1;

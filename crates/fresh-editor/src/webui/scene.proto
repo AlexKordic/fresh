@@ -355,6 +355,17 @@ message ComposePane {
   repeated ComposeTable tables = 22;
   uint32 native_newline = 23;
   bool current_projection = 24;
+  repeated ComposeHangingContext hanging_contexts = 25;
+}
+
+// Measurement-only prefix samples; style ranges are relative display bytes.
+message ComposeHangingContext {
+  uint64 item_start = 1;
+  uint64 content_start = 2;
+  string text = 3;
+  uint64 prefix_end = 4;
+  repeated ComposeSpan spans = 5;
+  bool source_line_start = 6;
 }
 
 // Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.

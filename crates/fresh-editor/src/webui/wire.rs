@@ -766,7 +766,7 @@ impl<'a> Iterator for Reader<'a> {
 // grid's cells carry what the app shows of them.
 
 use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
-use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection};
+use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection, ComposeHangingContext};
 use super::compose_tables::{Table as ComposeTable, Row as ComposeTableRow, Cell as ComposeTableCell};
 use super::compose_text::Context as ComposeTextContext;
 use super::compose_text::Chunk as ComposeTextChunk;
@@ -940,7 +940,11 @@ proto! {
         21 text_chunks: repeated ComposeTextChunk,
         22 tables: repeated ComposeTable,
         23 native_newline: uint32, 24 current_projection: bool,
+        25 hanging_contexts: repeated ComposeHangingContext,
     }
+    /// Measurement-only prefix samples; style ranges are relative display bytes.
+    ComposeHangingContext { 1 item_start: uint64, 2 content_start: uint64, 3 text: string,
+        4 prefix_end: uint64, 5 spans: repeated ComposeSpan, 6 source_line_start: bool }
     /// Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.
     ComposeTable { 1 start: uint64, 2 end: uint64, 3 alignments: repeated uint32, 4 rows: repeated ComposeTableRow,
         5 measurement_id: uint64, 6 measurement: maybe ComposeTableMeasurement }

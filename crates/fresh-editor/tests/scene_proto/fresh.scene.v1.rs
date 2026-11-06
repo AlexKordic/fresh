@@ -585,6 +585,24 @@ pub struct ComposePane {
     pub native_newline: u32,
     #[prost(bool, tag = "24")]
     pub current_projection: bool,
+    #[prost(message, repeated, tag = "25")]
+    pub hanging_contexts: ::prost::alloc::vec::Vec<ComposeHangingContext>,
+}
+/// Measurement-only prefix samples; style ranges are relative display bytes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeHangingContext {
+    #[prost(uint64, tag = "1")]
+    pub item_start: u64,
+    #[prost(uint64, tag = "2")]
+    pub content_start: u64,
+    #[prost(string, tag = "3")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub prefix_end: u64,
+    #[prost(message, repeated, tag = "5")]
+    pub spans: ::prost::alloc::vec::Vec<ComposeSpan>,
+    #[prost(bool, tag = "6")]
+    pub source_line_start: bool,
 }
 /// Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -21,6 +21,10 @@ const CACHE_LIMIT: usize = 8;
 #[path = "compose_parse.rs"]
 mod parsing;
 
+#[path = "compose_prefix.rs"]
+mod prefixes;
+pub(crate) use prefixes::Context as ComposeHangingContext;
+
 #[cfg(test)]
 #[path = "compose_profile.rs"]
 mod profile;
@@ -758,6 +762,7 @@ pub(crate) struct ComposePane {
     /// Native insertion separator: 0 unknown, 1 LF (including CR disk files), 2 CRLF.
     pub native_newline: u32,
     pub current_projection: bool,
+    pub hanging_contexts: Vec<ComposeHangingContext>,
 }
 
 struct Document {
@@ -1828,6 +1833,7 @@ impl ComposePane {
                 image
             })
             .collect();
+        let hanging_contexts = prefixes::contexts(&p, &spans, &doc.text);
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         p.source.hash(&mut hash);
         doc.epoch.hash(&mut hash);
@@ -1835,6 +1841,7 @@ impl ComposePane {
         spans.hash(&mut hash);
         images.hash(&mut hash);
         tables.hash(&mut hash);
+        hanging_contexts.hash(&mut hash);
         let segments = p
             .segments
             .iter()
@@ -1904,6 +1911,7 @@ impl ComposePane {
             text_context,
             text_chunks,
             tables,
+            hanging_contexts,
         }
     }
 }
