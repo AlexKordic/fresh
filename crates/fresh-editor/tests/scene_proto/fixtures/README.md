@@ -56,5 +56,7 @@ FC_COMPOSE_PAGE_LAYOUT_B="$PWD/../editor-fresh/crates/fresh-editor/tests/scene_p
 
 The optional exports sanitize only the image authority/document identifiers.
 No running application, editor session or source file is modified. This large
-URI currently exposes slow synchronous minimum-glyph measurement; the fixture
-is functional evidence, not performance qualification.
+URI also exercises complete minimum-glyph measurement. The native consumer
+collects logical caret edges once per shaped sample; repeated point queries
+previously made that fixture take about 29 seconds. The fixture is functional
+evidence, not complete large-table or multiple-pane performance qualification.
