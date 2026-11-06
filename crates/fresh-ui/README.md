@@ -95,6 +95,9 @@ check this policy before applying a source-mapped document click.
 wrapped rows, returning the logical byte and element even beyond their bounds.
 `Ui::pointer_geometry_in_subtree` reports arranged geometry and scroll offsets
 without treating hover or selection paint as an input-target change.
+When that projected owner retires, `Ui::cancel_pointer_subtree` ends its
+capture, scrollbar grab, drag/autoscroll state and pending click without
+synthesizing a release or drop in another surface.
 
 ## Subsystems
 

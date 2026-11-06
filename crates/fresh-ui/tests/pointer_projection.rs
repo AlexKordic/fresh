@@ -462,3 +462,48 @@ fn targeted_popup_input_does_not_release_another_subtrees_drag() {
     assert_eq!(result.msgs, ["popup-release"]);
     assert!(!ui.dragging());
 }
+
+#[test]
+fn retiring_a_surface_cancels_its_capture_drag_and_pending_click_without_a_drop() {
+    let mut ui: Ui<&'static str> = Ui::new();
+    ui.frame(
+        layer()
+            .key("popup")
+            .anchor(Anchor::Point(1, 1))
+            .place(Place::Over)
+            .child(
+                gesture(text("drag"))
+                    .on(
+                        GestureKind::Press,
+                        Rc::new(|event| {
+                            event.start_drag();
+                            None
+                        }),
+                    )
+                    .on(GestureKind::Click, Rc::new(|_| Some("click")))
+                    .on(GestureKind::Drop, Rc::new(|_| Some("drop"))),
+            ),
+        Size::new(20, 10),
+    );
+    ui.dispatch(Input::press(
+        Point::new(2, 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(ui.captured().is_some());
+    assert!(ui.dragging());
+    ui.cancel_pointer_subtree(&Key::from("unrelated"));
+    assert!(ui.captured().is_some());
+    ui.cancel_pointer_subtree(&Key::from("popup"));
+    assert!(ui.captured().is_none());
+    assert!(!ui.dragging());
+    assert!(ui.drag_autoscroll().is_none());
+    assert!(ui
+        .dispatch(Input::release(
+            Point::new(2, 1),
+            MouseButton::Left,
+            Mods::NONE
+        ))
+        .msgs
+        .is_empty());
+}

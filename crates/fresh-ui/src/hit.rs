@@ -1212,6 +1212,41 @@ impl<M: 'static> Ui<M> {
         self.captured
     }
 
+    /// Retire a host-projected surface's gesture without synthesizing a click,
+    /// drop or release. No capture, scrollbar grab or drag timer may outlive
+    /// the source owner that supplied the surface's coordinates.
+    pub fn cancel_pointer_subtree(&mut self, key: &crate::Key) {
+        let Some(root) = self.find_by_key(key) else {
+            return;
+        };
+        if self
+            .captured
+            .is_some_and(|element| self.is_ancestor(root, element))
+        {
+            self.captured = None;
+        }
+        if self
+            .scrollbar_drag
+            .and_then(|render| self.element_of(render))
+            .is_some_and(|element| self.is_ancestor(root, element))
+        {
+            self.scrollbar_drag = None;
+        }
+        if self.drag.as_ref().is_some_and(|drag| {
+            drag.lifted_from
+                .iter()
+                .any(|&element| self.is_ancestor(root, element))
+        }) {
+            self.drag = None;
+        }
+        if let Some((mut targets, button, count)) = self.press.take() {
+            targets.retain(|&element| !self.is_ancestor(root, element));
+            if !targets.is_empty() {
+                self.press = Some((targets, button, count));
+            }
+        }
+    }
+
     // -- defaults ------------------------------------------------------------
 
     /// The viewport whose scrollbar gutter is under a point, if any. The gutter
