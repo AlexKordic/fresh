@@ -181,13 +181,13 @@ pub(crate) fn panes_of(s: &Splits) -> Vec<LeafId> {
 /// grid: there is no path left that lays the grid out alone.
 ///
 /// Thread-local, because the editor renders on one thread and tests run one
-/// editor per thread. Counted only with debug assertions on; the release
-/// build pays nothing.
+/// editor per thread. Counted in unit tests and with debug assertions on;
+/// ordinary release builds pay nothing.
 pub mod stats {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     use std::cell::Cell;
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     thread_local! {
         static SHELL_LAYOUTS: Cell<u32> = const { Cell::new(0) };
         static OFFSCREEN_GRIDS: Cell<u32> = const { Cell::new(0) };
@@ -210,18 +210,18 @@ pub mod stats {
 
     #[inline]
     pub fn note_shell_layout() {
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         SHELL_LAYOUTS.with(|c| c.set(c.get().saturating_add(1)));
     }
 
     #[inline]
     pub fn note_offscreen_grid() {
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         OFFSCREEN_GRIDS.with(|c| c.set(c.get().saturating_add(1)));
     }
 
     /// The counts since the last call, which resets them.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     pub fn take() -> LayoutCounts {
         LayoutCounts {
             shell: SHELL_LAYOUTS.with(|c| c.replace(0)),

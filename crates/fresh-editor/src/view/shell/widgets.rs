@@ -8075,6 +8075,9 @@ pub(crate) mod tests {
     ///
     /// Pinned because the two are indistinguishable in the cells: every other
     /// test here would pass either way.
+    // The counter belongs to the core dependency and is deliberately absent
+    // from optimized builds. Other text-area behavior tests run in both modes.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_text_area_formats_only_the_rows_in_its_window() {
         let doc: String = (0..3000).map(|i| format!("line {i}\n")).collect();
