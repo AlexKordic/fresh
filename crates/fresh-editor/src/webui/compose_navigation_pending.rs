@@ -9,6 +9,8 @@ struct Origin {
     anchor: Option<usize>,
     deselect_on_move: bool,
     revision: u64,
+    selection: u64,
+    environment: u64,
     motion: Motion,
     select: bool,
 }
@@ -40,7 +42,16 @@ impl InputContext {
         let progress = self
             .plans
             .get(&id)
-            .filter(|plan| plan.origin == origin)
+            .filter(|plan| {
+                plan.origin == origin
+                    && match plan.progress {
+                        Progress::Destination {
+                            destination: Destination::Page(page),
+                            ..
+                        } => page.environment == layout.environment_revision,
+                        _ => true,
+                    }
+            })
             .map(|plan| plan.progress);
         if let Some(Progress::Ready(memory)) = progress {
             return Ok(memory);
@@ -52,13 +63,11 @@ impl InputContext {
             origin.motion,
             Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown
         );
-        let result = if let Some(
-            step @ Progress::Destination {
-                destination,
-                goal,
-                column,
-            },
-        ) = progress
+        let result = if let Some(Progress::Destination {
+            destination,
+            goal,
+            column,
+        }) = progress
         {
             match layout.resume(destination, goal, &self.tables) {
                 Ok(row) => {
@@ -72,6 +81,11 @@ impl InputContext {
                     }
                 }
                 Err(need) => {
+                    let step = Progress::Destination {
+                        destination: need.destination.unwrap_or(destination),
+                        goal,
+                        column,
+                    };
                     self.plans.insert(
                         id,
                         CursorPlan {
@@ -120,6 +134,22 @@ impl InputContext {
             let stop = match origin.motion {
                 Motion::Start => layout.lines[row].start,
                 Motion::End => layout.lines[row].end,
+                Motion::PageUp
+                    if target_row == row
+                        && layout.source_start == 0
+                        && layout.lines[row].y - layout.page_height < 0.0 =>
+                {
+                    layout.lines[row].start
+                }
+                Motion::PageDown
+                    if target_row == row
+                        && layout.source_end == layout.document_len
+                        && layout.lines[row].y + layout.page_height >= layout.height
+                        && layout.at_end(row) =>
+                {
+                    layout.lines[row].end
+                }
+                Motion::PageUp | Motion::PageDown => layout.nearest(target_row, goal),
                 _ if target_row == row && backwards => layout.lines[row].start,
                 _ if target_row == row && !backwards && layout.at_end(row) => layout.lines[row].end,
                 _ => layout.nearest(target_row, goal),
@@ -184,6 +214,12 @@ impl InputContext {
                     anchor: cursor.anchor,
                     deselect_on_move: cursor.deselect_on_move,
                     revision,
+                    selection: self.selection_revision,
+                    environment: if matches!(motion, Motion::PageUp | Motion::PageDown) {
+                        layout.environment_revision
+                    } else {
+                        0
+                    },
                     motion,
                     select,
                 },
@@ -236,6 +272,8 @@ mod tests {
             total_lines: 1,
             height: 20.0,
             style_revision: id,
+            environment_revision: 0,
+            anchors: Vec::new(),
             lines: vec![Line {
                 number: 0,
                 y: 0.0,
@@ -322,6 +360,8 @@ mod tests {
             anchor: None,
             deselect_on_move: true,
             revision: 1,
+            selection: 0,
+            environment: 0,
             motion: Motion::End,
             select: true,
         };

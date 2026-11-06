@@ -794,7 +794,17 @@ impl Document {
         self.native_table_projection(state, start, end, cursors, objects, revealed, &[])
     }
 
+    #[cfg(test)]
     fn source_window(&self, top_byte: usize, region: Option<usize>) -> Range<usize> {
+        self.source_window_with_context(top_byte, region, None)
+    }
+
+    fn source_window_with_context(
+        &self,
+        top_byte: usize,
+        region: Option<usize>,
+        keep: Option<Range<usize>>,
+    ) -> Range<usize> {
         let mut anchor = region.unwrap_or(top_byte).min(self.text.len());
         while !self.text.is_char_boundary(anchor) {
             anchor -= 1;
@@ -805,13 +815,31 @@ impl Document {
             }
             // Preserve paragraph joins, but do not let an unrelated preceding
             // paragraph pull the requested byte beyond the window's end.
-            self.paragraphs
+            let paragraph = self
+                .paragraphs
                 .iter()
                 .find(|r| r.contains(&at))
                 .map_or_else(
                     || self.text[..at].rfind('\n').map_or(0, |n| n + 1),
                     |r| r.start,
-                )
+                );
+            // Tight list paragraphs may omit Paragraph events. Retain their
+            // marker context so hanging measurement is repeatable on a page.
+            if self
+                .spans
+                .iter()
+                .any(|s| matches!(s.role, 8 | 12) && s.start <= at && at < s.end)
+            {
+                paragraph
+            } else {
+                self.spans
+                    .iter()
+                    .filter(|s| s.role == 13 && s.start <= at && at < s.end)
+                    .map(|s| s.start)
+                    .min()
+                    .unwrap_or(paragraph)
+                    .min(paragraph)
+            }
         };
         let mut start = context_start(if region.is_some() {
             anchor.saturating_sub(WINDOW_BYTES / 3)
@@ -821,8 +849,16 @@ impl Document {
         if anchor.saturating_sub(start) >= WINDOW_BYTES {
             start = context_start(anchor);
         }
+        if let Some(keep) = &keep {
+            start = start.min(context_start(keep.start.min(self.text.len())));
+        }
         let mut end = (start + WINDOW_BYTES)
-            .max(anchor.saturating_add(1))
+            .max(anchor.saturating_add(if region.is_some() {
+                WINDOW_BYTES * 2 / 3
+            } else {
+                1
+            }))
+            .max(keep.map_or(0, |range| range.end))
             .min(self.text.len());
         while !self.text.is_char_boundary(end) {
             end += 1;
@@ -1211,6 +1247,18 @@ impl ComposeCache {
         region: Option<usize>,
         measured_tables: bool,
     ) -> Option<ComposePane> {
+        self.gather_tables_with_context(editor, leaf, buffer, region, measured_tables, None)
+    }
+
+    pub fn gather_tables_with_context(
+        &mut self,
+        editor: &mut Editor,
+        leaf: LeafId,
+        buffer: BufferId,
+        region: Option<usize>,
+        measured_tables: bool,
+        keep: Option<Range<usize>>,
+    ) -> Option<ComposePane> {
         let context = editor.get_key_context();
         let owns_keyboard = document_keyboard(editor);
         let context = format!("{context:?}");
@@ -1322,7 +1370,7 @@ impl ComposeCache {
         }
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
-        let window = doc.source_window(top_byte, region);
+        let window = doc.source_window_with_context(top_byte, region, keep);
         let (mut start, mut end) = (window.start, window.end);
         // Conceal replacements must travel whole. Extend the requested slice
         // rather than clipping a range into an invalid source map.
@@ -1610,6 +1658,42 @@ mod tests {
         assert!(doc.text.is_char_boundary(window.start) && doc.text.is_char_boundary(window.end));
         let eof = doc.source_window(0, Some(doc.text.len()));
         assert_eq!(eof.end, doc.text.len());
+    }
+
+    #[test]
+    fn page_measurements_retain_complete_row_and_tight_list_context() {
+        let text = "| Head | Image |\n|---|---|\n| tiny | ![p](".to_owned()
+            + &"x".repeat(90_000)
+            + ".png) |\n\nTail paragraph\n";
+        let doc = Document::parse(text, 0, 0, 1);
+        let row = doc.tables.snapshot(&doc.text, 0..doc.text.len(), &[])[0].rows[1].clone();
+        let window = doc.source_window_with_context(0, Some(row.end), Some(row.start..row.end));
+        assert_eq!(window.start, row.start);
+        assert_eq!(window.end, doc.text.len());
+        assert!(
+            window.start > 0,
+            "only the pivot context travels, not the original header cursor"
+        );
+
+        let prefix = "Unrelated paragraph.\n\n".repeat(5000);
+        let item_start = prefix.len();
+        let text = prefix
+            + "- first line\n"
+            + &"  café continuation words.\n".repeat(5000)
+            + "\n- next item\n";
+        let doc = Document::parse(text, 0, 0, 1);
+        let anchor = doc.text.rfind("café").unwrap();
+        assert!(doc
+            .spans
+            .iter()
+            .any(|s| s.role == 13 && s.start == item_start && s.end > anchor));
+        let window =
+            doc.source_window_with_context(0, Some(anchor), Some(anchor..anchor + "café".len()));
+        assert_eq!(
+            window.start, item_start,
+            "a tight list retains its hanging marker when paging into a continuation"
+        );
+        assert!(window.contains(&anchor));
     }
 
     #[test]

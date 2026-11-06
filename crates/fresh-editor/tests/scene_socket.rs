@@ -291,6 +291,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(&root,&work);
     rich_table_motion_crosses_disjoint_source_windows(&root,&work);
     rich_table_edges_cross_disjoint_source_windows(&root,&work);
+    rich_page_motion_keeps_pixel_distance_across_source_windows(&root,&work);
     rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(&root,&work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
@@ -499,7 +500,7 @@ fn rich_table_motion_crosses_disjoint_source_windows(root:&std::path::Path,work:
         let cell=&table.rows.iter().find(|r|r.start==row).unwrap().cells[1];
         let stop=pb::ComposeStop {source:point,x:110.0,affinity:0};
         pb::ComposeLayout {id,page_height:20.0,source_start:compose.source_start,source_end:compose.source_end,
-            document_len:compose.document_len,total_lines:total,height:40.0,style_revision:1,lines:vec![pb::ComposeLine {
+            document_len:compose.document_len,total_lines:total,height:40.0,style_revision:1,environment_revision:0,anchors:Vec::new(),lines:vec![pb::ComposeLine {
                 number,y:8.0,height:10.0,source_start:cell.start,source_end:cell.end,stops:vec![stop.clone()],start:Some(stop.clone()),end:Some(stop),
                 cell:Some(pb::ComposeCellLine {table_start:table.start,row_start:row,column:Some(1),part:0,parts:1,x:100.0,width:80.0,row_y:0.0,row_height:30.0})
             }]}
@@ -608,6 +609,53 @@ fn rich_table_edges_cross_disjoint_source_windows(root:&std::path::Path,work:&st
         assert_eq!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().viewport.as_ref().unwrap().position,viewport);
         assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
     }
+}
+
+fn rich_page_motion_keeps_pixel_distance_across_source_windows(root:&std::path::Path,work:&std::path::Path) {
+    let original="| Head | Image |\n|---|---|\n| tiny | ![p](".to_owned()+&"x".repeat(90_000)+".png) |\n\nTail paragraph\n";
+    let origin=original.find("Head").unwrap() as u64;
+    let edge=original.find("\n\nTail").unwrap() as u64+1;
+    let file=work.join("page-flow.md"); std::fs::write(&file,&original).unwrap();
+    let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
+    for _ in 0..12 {apply_step(&mut ed,&json!({}));}
+    apply_step(&mut ed,&json!({"action":"markdownToggleCompose"}));
+    let path=root.join("page-flow.sock"); let mut bridge=SceneBridge::bind(&path,&ed).unwrap(); let mut app=App::connect(&path);
+    app.send(16,pb::ClientHello {version:1,rich_compose:true,measured_tables:true,..Default::default()}); settle_bridge(&mut bridge,&mut ed);
+    let initial=ready_scene(&mut bridge,&mut ed,&mut app);
+    let pane=initial.panes.iter().find_map(|p|p.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
+    let mut scope=pane_scope(initial.window_id.unwrap(),pane);
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some(origin),..Default::default()});
+    let shown=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
+    assert_eq!(shown.source_end,edge);
+    let mut fixture=shown.clone(); fixture.asset_authority=1; fixture.asset_document=1;
+    if let Some(path)=std::env::var_os("FC_COMPOSE_PAGE_SCENE_A") {std::fs::write(path,fixture.encode_to_vec()).unwrap();}
+    let stored=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/scene_proto/fixtures/compose-page-layout-a.pb");
+    let mut first=pb::ComposeLayout::decode(&std::fs::read(stored).unwrap()[..]).unwrap();
+    let line=first.lines.iter().find(|l|l.source_start<=origin && origin<=l.source_end).unwrap();
+    first.page_height=first.height+10.0-line.y;
+    let action=|layout:Option<pb::ComposeLayout>|pb::ComposeInput {id:2,kind:21,layout_id:layout.as_ref().map_or(0,|l|l.id),layout,
+        payload:pb::Action {name:"select_page_down".into(),..Default::default()}.encode_to_vec(),..Default::default()};
+    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(Some(first))).input_reply.unwrap();
+    assert!(reply.needs_layout && !reply.accepted); assert_eq!(reply.need_region,Some(edge));
+    assert_eq!(ed.active_window().active_cursors().primary().position as u64,origin);
+    let mut request=action(None); request.region=Some(edge);
+    let mut reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,request).input_reply.unwrap();
+    for _ in 0..10 {
+        if reply.compose.as_ref().is_some_and(|c|c.ready!=Some(false)) {break;}
+        settle_bridge(&mut bridge,&mut ed); reply=rich_reply(&mut bridge,&mut ed,&mut app,&mut scope,2).input_reply.unwrap();
+    }
+    let measured=reply.compose.as_ref().unwrap(); assert!(measured.ready!=Some(false));
+    assert!(measured.source_start>origin,"the continuation keeps its flow context, not the original header cursor");
+    let mut fixture=measured.clone(); fixture.asset_authority=1; fixture.asset_document=1;
+    if let Some(path)=std::env::var_os("FC_COMPOSE_PAGE_SCENE_B") {std::fs::write(path,fixture.encode_to_vec()).unwrap();}
+    let stored=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/scene_proto/fixtures/compose-page-layout-b.pb");
+    let target=pb::ComposeLayout::decode(&std::fs::read(stored).unwrap()[..]).unwrap();
+    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(Some(target))).input_reply.unwrap();
+    assert!(reply.accepted,"page continuation: region={:?}, y={:?}, error={}",reply.need_region,reply.need_y,reply.error);
+    assert_eq!(ed.active_window().active_cursors().primary().position as u64,edge);
+    assert_eq!(ed.active_window().active_cursors().primary().anchor,Some(origin as usize));
+    assert_eq!(app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap().viewport.as_ref().unwrap().position,0);
+    assert_eq!(std::fs::read(file).unwrap(),original.as_bytes());
 }
 
 fn rich_list_markers_are_source_anchors_not_cell_widths(root:&std::path::Path,work:&std::path::Path) {
@@ -1537,7 +1585,7 @@ fn rich_navigation_uses_measured_lines_after_resolving_a_key_chord(root: &std::p
         x += if ch == 'W' {18.0} else {9.0};
     }
     tail.push((original.len()-1,x));
-    let mut geometry = pb::ComposeLayout { id: 7, page_height: 75.0, source_start: 0,
+    let mut geometry = pb::ComposeLayout { id: 7, page_height: 75.0, source_start: 0, environment_revision:0,anchors:Vec::new(),
         source_end: original.len() as u64, document_len: original.len() as u64, total_lines: 6, height: 134.0, style_revision:1,
         lines: vec![
             row(0,0.0,30.0,0,5,vec![(0,0.0),(1,10.0),(2,20.0),(3,36.0),(4,46.0),(5,54.0)]),

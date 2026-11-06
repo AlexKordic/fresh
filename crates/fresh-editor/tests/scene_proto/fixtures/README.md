@@ -25,3 +25,36 @@ Then run Fresh's `scene_socket` test with the `web` feature. The optional
 `FC_COMPOSE_TABLE_LAYOUT_FILE` and `FC_COMPOSE_TABLE_SOURCE_LAYOUT_FILE`
 environment variables select other geometry artifacts for a development round
 trip; ordinary tests use the checked-in files.
+
+
+## Pixel page continuation
+
+`compose-page-layout-a.pb` and `compose-page-layout-b.pb` record Core Text
+geometry for successive source windows in the same Markdown document. A long
+image URI crosses the source target size while its displayed object stays
+small. A Page Down selection leaves the original header cursor outside the
+second window. The shared complete-row flow anchor carries the remaining
+pixel distance; Fresh accepts the destination only after measuring it and
+keeps the original selection anchor and visible viewport.
+
+To regenerate, export both pane snapshots from Fresh's real-plugin test:
+
+```sh
+FC_COMPOSE_PAGE_SCENE_A="$PWD/../file_commander/macos/Tests/FreshKitTests/Fixtures/compose-page-window-a.pb" \
+FC_COMPOSE_PAGE_SCENE_B="$PWD/../file_commander/macos/Tests/FreshKitTests/Fixtures/compose-page-window-b.pb" \
+  cargo test --locked -p fresh-editor --features web --test scene_socket -- --nocapture
+```
+
+Then export their geometry from File Commander on macOS and replay the Fresh
+test again without the export variables:
+
+```sh
+FC_COMPOSE_PAGE_LAYOUT_A="$PWD/../editor-fresh/crates/fresh-editor/tests/scene_proto/fixtures/compose-page-layout-a.pb" \
+FC_COMPOSE_PAGE_LAYOUT_B="$PWD/../editor-fresh/crates/fresh-editor/tests/scene_proto/fixtures/compose-page-layout-b.pb" \
+  swift test --package-path macos --filter ComposeFlowTests
+```
+
+The optional exports sanitize only the image authority/document identifiers.
+No running application, editor session or source file is modified. This large
+URI currently exposes slow synchronous minimum-glyph measurement; the fixture
+is functional evidence, not performance qualification.

@@ -1319,6 +1319,17 @@ message ComposeLayout {
   uint64 total_lines = 7;
   double height = 8;
   uint64 style_revision = 9;
+  uint64 environment_revision = 10;
+  repeated ComposeFlowAnchor anchors = 11;
+}
+// A repeatable source-to-flow point. Context is retained while measuring a
+// page continuation; kind: 0 physical text start, 1 table row, 2 document EOF.
+message ComposeFlowAnchor {
+  uint64 source = 1;
+  double y = 2;
+  uint64 context_start = 3;
+  uint64 context_end = 4;
+  uint32 kind = 5;
 }
 message ComposeLine {
   double y = 1;

@@ -1426,6 +1426,25 @@ pub struct ComposeLayout {
     pub height: f64,
     #[prost(uint64, tag = "9")]
     pub style_revision: u64,
+    #[prost(uint64, tag = "10")]
+    pub environment_revision: u64,
+    #[prost(message, repeated, tag = "11")]
+    pub anchors: ::prost::alloc::vec::Vec<ComposeFlowAnchor>,
+}
+/// A repeatable source-to-flow point. Context is retained while measuring a
+/// page continuation; kind: 0 physical text start, 1 table row, 2 document EOF.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ComposeFlowAnchor {
+    #[prost(uint64, tag = "1")]
+    pub source: u64,
+    #[prost(double, tag = "2")]
+    pub y: f64,
+    #[prost(uint64, tag = "3")]
+    pub context_start: u64,
+    #[prost(uint64, tag = "4")]
+    pub context_end: u64,
+    #[prost(uint32, tag = "5")]
+    pub kind: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComposeLine {

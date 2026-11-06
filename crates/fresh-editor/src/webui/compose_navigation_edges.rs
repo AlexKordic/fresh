@@ -11,6 +11,7 @@ impl Layout {
     ) -> Result<usize, Need> {
         match destination {
             Destination::Cell(cell) => self.resume_cell(cell, goal, tables),
+            Destination::Page(page) => self.resume_page(page, goal, tables),
             Destination::Source { edge, backwards } => self
                 .source_entry(edge, backwards, goal, tables)
                 .map_err(|need| need.destination(destination)),

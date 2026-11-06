@@ -13,6 +13,8 @@ use std::sync::Arc;
 mod cells;
 #[path = "compose_navigation_edges.rs"]
 mod edges;
+#[path = "compose_navigation_page.rs"]
+mod page;
 #[path = "compose_navigation_pending.rs"]
 mod pending;
 
@@ -74,6 +76,8 @@ pub(crate) struct Layout {
     pub total_lines: usize,
     pub height: f64,
     pub style_revision: u64,
+    pub environment_revision: u64,
+    anchors: Vec<page::Anchor>,
     bands: Vec<cells::Band>,
 }
 
@@ -121,6 +125,8 @@ impl Layout {
             total_lines: 0,
             height: 0.0,
             style_revision: 0,
+            environment_revision: 0,
+            anchors: Vec::new(),
             bands: Vec::new(),
         };
         let mut total_stops = 0;
@@ -203,6 +209,13 @@ impl Layout {
                 (7, v) => result.total_lines = v.uint() as usize,
                 (8, v) => result.height = number(v)?,
                 (9, v) => result.style_revision = v.uint(),
+                (10, v) => result.environment_revision = v.uint(),
+                (11, Field::Bytes(bytes)) => {
+                    if result.anchors.len() >= MAX_LINES {
+                        return Err("too many flow anchors".into());
+                    }
+                    result.anchors.push(page::Anchor::parse(bytes)?);
+                }
                 _ => {}
             }
         }
@@ -228,6 +241,9 @@ impl Layout {
             return Err("incomplete graphical layout".into());
         }
         result.bands = cells::bands(&result.lines, result.height)?;
+        if !page::valid_geometry(&result.anchors, result.height) {
+            return Err("invalid flow anchors".into());
+        }
         Ok(result)
     }
 
@@ -257,21 +273,22 @@ impl Layout {
                 && at <= self.source_end
                 && source.is_char_boundary(at - self.source_start)
         };
-        self.lines.iter().all(|line| {
-            cells::valid_source(line, tables)
-                && line.source_start >= self.source_start
-                && line.source_end <= self.source_end
-                && valid(line.source_start)
-                && valid(line.source_end)
-                && [line.start, line.end]
-                    .iter()
-                    .chain(line.stops.iter())
-                    .all(|stop| {
-                        stop.source >= line.source_start
-                            && stop.source <= line.source_end
-                            && valid(stop.source)
-                    })
-        })
+        page::valid_source(&self.anchors, self, &valid, tables)
+            && self.lines.iter().all(|line| {
+                cells::valid_source(line, tables)
+                    && line.source_start >= self.source_start
+                    && line.source_end <= self.source_end
+                    && valid(line.source_start)
+                    && valid(line.source_end)
+                    && [line.start, line.end]
+                        .iter()
+                        .chain(line.stops.iter())
+                        .all(|stop| {
+                            stop.source >= line.source_start
+                                && stop.source <= line.source_end
+                                && valid(stop.source)
+                        })
+            })
     }
 
     fn line_for(&self, position: usize, affinity: Affinity) -> Option<(usize, f64)> {
@@ -356,6 +373,8 @@ pub(crate) struct Session {
     pending: Option<(u64, Identity, Action)>,
     plans: HashMap<CursorId, pending::CursorPlan>,
     regions: HashMap<Identity, (u64, usize)>,
+    pending_context: Option<(u64, std::ops::Range<usize>)>,
+    measurement_context: Option<(u64, std::ops::Range<usize>)>,
 }
 
 impl Session {
@@ -378,9 +397,15 @@ impl Session {
             self.cached = None;
             self.memory.clear();
             self.plans.clear();
+            self.pending_context = None;
+            self.measurement_context = None;
         }
         self.identity = Some(identity);
         self.regions.insert(identity, (scope.revision, anchor));
+        self.measurement_context = self
+            .pending_context
+            .clone()
+            .filter(|(revision, _)| *revision == scope.revision);
         self.cached = None;
     }
 
@@ -407,6 +432,8 @@ impl Session {
             self.cached = None;
             self.memory.clear();
             self.plans.clear();
+            self.pending_context = None;
+            self.measurement_context = None;
         }
         if let Some(bytes) = input.layout {
             let layout = Layout::parse(bytes)?;
@@ -449,6 +476,7 @@ impl Session {
         let mut context = InputContext::new(scope.leaf, scope.buffer, layout, memory);
         context.plans = std::mem::take(&mut self.plans);
         context.source_revision = scope.revision;
+        context.selection_revision = scope.selection;
         context.images = snapshot
             .images
             .iter()
@@ -490,6 +518,7 @@ impl Session {
         };
         self.memory = context.memory;
         if let Some(action) = context.deferred {
+            self.pending_context = context.need_context.map(|range| (scope.revision, range));
             self.plans = context.plans;
             self.pending = Some((
                 input.id,
@@ -504,6 +533,8 @@ impl Session {
         }
         self.pending = None;
         self.plans.clear();
+        self.pending_context = None;
+        self.measurement_context = None;
         if let Some(state) = window.buffer_state(scope.buffer) {
             self.regions
                 .remove(&Identity(scope.window, scope.leaf, scope.buffer));
@@ -548,6 +579,8 @@ impl Session {
         self.memory.clear();
         self.pending = None;
         self.plans.clear();
+        self.pending_context = None;
+        self.measurement_context = None;
         let window = editor.active_window();
         let id = window.active_cursors().primary_id();
         let position = window.active_cursors().primary().position;
@@ -576,6 +609,18 @@ impl Session {
         self.pending = None;
         self.plans.clear();
         self.regions.clear();
+        self.pending_context = None;
+        self.measurement_context = None;
+    }
+
+    pub fn context(&self, scope: &super::compose::Scope) -> Option<std::ops::Range<usize>> {
+        if self.identity != Some(Identity(scope.window, scope.leaf, scope.buffer)) {
+            return None;
+        }
+        self.measurement_context
+            .as_ref()
+            .filter(|(version, _)| *version == scope.revision)
+            .map(|(_, range)| range.clone())
     }
 }
 
@@ -613,12 +658,14 @@ struct Need {
     region: Option<usize>,
     y: Option<f64>,
     destination: Option<Destination>,
+    context: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Destination {
     Cell(cells::CellDestination),
     Source { edge: usize, backwards: bool },
+    Page(page::Destination),
 }
 
 impl Need {
@@ -627,6 +674,7 @@ impl Need {
             region: Some(position),
             y: None,
             destination: None,
+            context: None,
         }
     }
     fn y(y: f64) -> Self {
@@ -634,6 +682,7 @@ impl Need {
             region: None,
             y: Some(y),
             destination: None,
+            context: None,
         }
     }
 
@@ -651,7 +700,9 @@ pub(crate) struct InputContext {
     pub deferred: Option<Action>,
     pub need_region: Option<usize>,
     pub need_y: Option<f64>,
+    need_context: Option<std::ops::Range<usize>>,
     source_revision: u64,
+    selection_revision: u64,
     images: Vec<std::ops::Range<usize>>,
     tables: Vec<super::compose_tables::Table>,
     prepared: Option<(Action, Vec<Event>, HashMap<CursorId, Memory>)>,
@@ -673,7 +724,9 @@ impl InputContext {
             deferred: None,
             need_region: None,
             need_y: None,
+            need_context: None,
             source_revision: 0,
+            selection_revision: 0,
             images: Vec::new(),
             tables: Vec::new(),
             prepared: None,
@@ -741,6 +794,7 @@ pub(crate) fn prepare_action(editor: &mut Editor, action: &Action) -> bool {
             context.deferred = Some(action.clone());
             context.need_region = need.region;
             context.need_y = need.y;
+            context.need_context = need.context;
             true
         }
     };

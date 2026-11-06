@@ -492,22 +492,28 @@ impl Layout {
             } else {
                 self.page_height
             };
-        if y < 0.0 && self.source_start > 0 {
-            return Err(Need::region(self.source_start - 1));
-        }
-        if y >= self.height && self.source_end < self.document_len {
-            return Err(Need::region(self.source_end));
-        }
+        let column = self.lines[row]
+            .cell
+            .as_ref()
+            .and_then(|cell| cell.column.or(column).map(|c| (cell.table, c)));
+        self.page_at(y, goal, tables, column)
+    }
+
+    pub(super) fn page_row(
+        &self,
+        y: f64,
+        goal: f64,
+        tables: &[super::super::compose_tables::Table],
+        column: Option<(usize, u32)>,
+    ) -> Result<usize, Need> {
         let y = y.clamp(0.0, (self.height - 0.001).max(0.0));
         let band = self.page_band(y)?;
         let Some(target) = self.lines[band.lines.start].cell.as_ref() else {
             return Ok(band.lines.start);
         };
-        let preferred = self.lines[row]
-            .cell
-            .as_ref()
-            .filter(|c| c.table == target.table)
-            .and_then(|c| c.column.or(column));
+        let preferred = column
+            .filter(|(table, _)| *table == target.table)
+            .map(|(_, column)| column);
         let axis = self.cell_axis(band, preferred, goal, tables)?;
         if let Some(&index) = axis
             .iter()
@@ -674,6 +680,8 @@ mod tests {
             total_lines: lines.len(),
             height: 100.0,
             style_revision: 1,
+            environment_revision: 0,
+            anchors: Vec::new(),
             lines,
             bands,
         };
@@ -965,6 +973,8 @@ mod tests {
                 total_lines: 1,
                 height: 100.0,
                 style_revision: 1,
+                environment_revision: 0,
+                anchors: Vec::new(),
                 bands: Vec::new(),
             };
             prose.lines[0].number = 0;
@@ -988,6 +998,8 @@ mod tests {
                 total_lines: 1,
                 height: 100.0,
                 style_revision: 1,
+                environment_revision: 0,
+                anchors: Vec::new(),
                 bands: Vec::new(),
             };
             prose.lines[0].number = 0;
