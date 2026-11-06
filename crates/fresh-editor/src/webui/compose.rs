@@ -18,6 +18,10 @@ const SOURCE_LIMIT: usize = 2 << 20;
 const WINDOW_BYTES: usize = 64 << 10;
 const CACHE_LIMIT: usize = 8;
 
+#[cfg(test)]
+#[path = "compose_profile.rs"]
+mod profile;
+
 pub(super) fn document_keyboard(editor: &mut Editor) -> bool {
     use crate::input::keybindings::KeyContext;
     editor.menu_state().active_menu.is_none()
