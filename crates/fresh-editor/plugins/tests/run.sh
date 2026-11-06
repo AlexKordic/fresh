@@ -11,7 +11,7 @@ FAILED=0
 for test in *.test.ts; do
   [ -e "$test" ] || continue
   echo "── $test"
-  "$NODE" --experimental-strip-types --no-warnings "$test" || FAILED=$((FAILED + 1))
+  "$NODE" --experimental-transform-types --no-warnings "$test" || FAILED=$((FAILED + 1))
 done
 
 if [ "$FAILED" -eq 0 ]; then

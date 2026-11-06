@@ -47,6 +47,7 @@ function harness(files = false) {
     panel: () => ({
       setFocusKey: (k) => (calls.push(`focus:${k}`), true),
       setValue: (k, v) => (calls.push(`value:${k}=${v}`), true),
+      setSelectedIndex: (k, v) => (calls.push(`selected:${k}=${v}`), true),
     }),
   });
   return { field, calls, picker };
@@ -61,6 +62,7 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   eq(picker.handle(ev("activate", "browse")), true, "Browse… is the picker's own event");
   await tick();
   eq(picker.browser?.dir, "/home/u", "it opens where the dialog says");
+  eq(calls.includes("selected:browse_list=1"), true, "the host list highlights the first entry after ..");
   eq(calls.includes("focus:browse_list"), true, "and the list takes focus once it has loaded");
   // Rows: "..", then plain/, repo/.
   picker.handle(ev("activate", "browse_list", { index: 1 }));
