@@ -776,6 +776,7 @@ struct Document {
     spans: Vec<ComposeSpan>,
     images: Vec<ComposeImage>,
     paragraphs: Vec<Range<usize>>,
+    item_paragraphs: HashMap<usize, usize>,
     underlines: Vec<(Range<usize>, Range<usize>)>,
     heading_openers: Vec<Range<usize>>,
     code: Vec<CodeBlock>,
@@ -812,6 +813,7 @@ impl Document {
             spans: Vec::new(),
             images: Vec::new(),
             paragraphs: Vec::new(),
+            item_paragraphs: HashMap::new(),
             underlines: Vec::new(),
             heading_openers: Vec::new(),
             code: Vec::new(),
@@ -841,6 +843,7 @@ impl Document {
         let mut images = Vec::new();
         let mut image_stack: Vec<ComposeImage> = Vec::new();
         let mut paragraphs = Vec::new();
+        let mut item_paragraphs = HashMap::new();
         let mut underlines = Vec::new();
         let mut heading_openers = Vec::new();
         let mut code: Vec<CodeBlock> = Vec::new();
@@ -948,6 +951,9 @@ impl Document {
                 Event::Start(Tag::Paragraph) => {
                     role = 11;
                     paragraphs.push(range.clone());
+                    if let Some(&(index, _)) = items.last() {
+                        *item_paragraphs.entry(spans[index].start).or_insert(0usize) += 1;
+                    }
                 }
                 Event::Start(Tag::Image {
                     dest_url, title, ..
@@ -1038,6 +1044,7 @@ impl Document {
             spans,
             images,
             paragraphs,
+            item_paragraphs,
             underlines,
             heading_openers,
             code,
@@ -1121,9 +1128,18 @@ impl Document {
                 let line_end = self.text[at..]
                     .find('\n')
                     .map_or(self.text.len(), |n| at + n + 1);
-                if self.text[line_start..line_end]
-                    .bytes()
-                    .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                let owner = self
+                    .spans
+                    .iter()
+                    .filter(|span| span.role == 13 && span.start <= at && at < span.end)
+                    .min_by_key(|span| span.end - span.start);
+                let independent_paragraphs = owner.is_none_or(|item| {
+                    self.item_paragraphs.get(&item.start).copied().unwrap_or(0) > 1
+                });
+                if independent_paragraphs
+                    && self.text[line_start..line_end]
+                        .bytes()
+                        .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
                 {
                     return line_start;
                 }

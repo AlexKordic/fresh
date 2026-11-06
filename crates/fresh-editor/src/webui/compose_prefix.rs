@@ -383,6 +383,24 @@ mod tests {
     }
 
     #[test]
+    fn a_single_giant_item_keeps_its_existing_context_at_its_trailing_blank_line() {
+        let text = "| A | B |\n|---|---|\n| one | two |\n\n# Long paragraph\n\n1) ".to_owned()
+            + &"Measured **prose** café 👩🏽‍💻 東京 with words that continue in one physical paragraph. ".repeat(2000)
+            + "\n\nTail\n";
+        let doc = Document::parse(text, 0, 0, 1);
+        let body_end = doc.text.find("\n\nTail").unwrap();
+        for at in body_end..=doc.text.len() {
+            for region in [None, Some(at)] {
+                assert_eq!(
+                    doc.source_window_policy(at, region, None, true).start,
+                    doc.source_window_policy(at, region, None, false).start,
+                    "a single-paragraph item must retain its qualified marker context at {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn offscreen_prefixes_keep_a_multiline_first_image_atomic() {
         use crate::app::compose_readiness::Registry;
         use crate::model::event::BufferId;
