@@ -146,6 +146,45 @@ impl<M: 'static> Ui<M> {
         }
     }
 
+    /// Route a host-translated pointer only into this retained subtree. A
+    /// higher pointer modal still owns input, and a missing key never falls
+    /// through into another surface. Keyboard input is deliberately refused.
+    pub fn dispatch_to_pointer_subtree(&mut self, input: Input, key: &crate::Key) -> Dispatch<M> {
+        if matches!(input, Input::Key(_)) {
+            return Dispatch {
+                msgs: Vec::new(),
+                claimed: false,
+            };
+        }
+        let Some(root) = self.find_by_key(key) else {
+            return Dispatch {
+                msgs: Vec::new(),
+                claimed: false,
+            };
+        };
+        let previous = self.pointer_only.replace(root);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.dispatch(input)));
+        self.pointer_only = previous;
+        match result {
+            Ok(result) => result,
+            Err(error) => std::panic::resume_unwind(error),
+        }
+    }
+
+    /// A pointer modal owns even source-mapped input a host routes without
+    /// integer-cell hit testing. Hosts must ask before mutating that source.
+    pub fn pointer_is_modal(&self) -> bool {
+        self.pointer_owned()
+    }
+
+    fn pointer_allowed(&self, element: ElementId) -> bool {
+        !self.pointer_excluded(element)
+            && self
+                .pointer_only
+                .is_none_or(|root| self.is_ancestor(root, element))
+    }
+
     fn pointer_excluded(&self, element: ElementId) -> bool {
         self.pointer_excluded
             .iter()
@@ -157,6 +196,9 @@ impl<M: 'static> Ui<M> {
             drag.lifted_from
                 .iter()
                 .any(|&element| self.pointer_excluded(element))
+                || self
+                    .pointer_only
+                    .is_some_and(|root| !drag.lifted_from.contains(&root))
         })
     }
 
@@ -188,7 +230,7 @@ impl<M: 'static> Ui<M> {
                 if let Some(r) = self.scrollbar_drag.filter(|&r| {
                     !self
                         .element_of(r)
-                        .is_some_and(|element| self.pointer_excluded(element))
+                        .is_some_and(|element| !self.pointer_allowed(element))
                 }) {
                     // A drag in progress owns the pointer.
                     self.scroll_to_pointer(r, pos.y, out);
@@ -313,7 +355,7 @@ impl<M: 'static> Ui<M> {
                 if self.scrollbar_drag.take().is_some_and(|r| {
                     !self
                         .element_of(r)
-                        .is_some_and(|element| self.pointer_excluded(element))
+                        .is_some_and(|element| !self.pointer_allowed(element))
                 }) {
                     return true;
                 }
@@ -535,6 +577,10 @@ impl<M: 'static> Ui<M> {
                 out.extend(path.into_iter().filter_map(|n| self.element_of(n)));
                 out
             })
+            .filter(|path: &Vec<ElementId>| {
+                path.last()
+                    .is_some_and(|&element| self.pointer_allowed(element))
+            })
             .collect()
     }
 
@@ -542,6 +588,13 @@ impl<M: 'static> Ui<M> {
     /// Returns whether an opaque hit occurred, which is what stops the search
     /// reaching anything behind.
     fn collect_paths(&self, r: RenderId, p: Point, out: &mut Vec<Vec<RenderId>>) -> bool {
+        if let Some(root) = self.pointer_only {
+            if self.element_of(r).is_some_and(|element| {
+                !self.is_ancestor(root, element) && !self.is_ancestor(element, root)
+            }) {
+                return false;
+            }
+        }
         if !self.pointer_excluded.is_empty()
             && self
                 .element_of(r)
@@ -614,7 +667,7 @@ impl<M: 'static> Ui<M> {
     /// otherwise whatever is under the pointer.
     fn route(&self, p: Point) -> Vec<Vec<ElementId>> {
         match self.captured {
-            Some(c) if self.arena.get(c).is_some() && !self.pointer_excluded(c) => {
+            Some(c) if self.arena.get(c).is_some() && self.pointer_allowed(c) => {
                 vec![self.path_to(c)]
             }
             _ => self.hit_paths(p),
@@ -1509,6 +1562,98 @@ impl<M: 'static> Ui<M> {
         let obj = self.render.get(r)?.obj.as_ref()?;
         let rect = self.rect_of(id);
         obj.text_byte_at(Point::new(pos.x - rect.x, pos.y - rect.y))
+    }
+
+    /// Resolve a point to the logical text byte in a keyed subtree, using its
+    /// retained wrapping. The closest text row handles captured motion beyond
+    /// its bounds. The element identifies the original logical line.
+    pub fn text_hit_in_subtree(
+        &self,
+        key: &crate::Key,
+        point: Point,
+    ) -> Option<(ElementId, usize)> {
+        fn visit<M: 'static>(
+            ui: &Ui<M>,
+            element: ElementId,
+            point: Point,
+            best: &mut Option<((i64, i64), ElementId, usize)>,
+        ) {
+            let Some(node) = ui.arena.get(element) else {
+                return;
+            };
+            if let Some(render) = node.render.and_then(|id| ui.render.get(id)) {
+                let rect = render.data.rect;
+                if rect.h > 0 {
+                    let local = Point::new(
+                        point.x.saturating_sub(rect.x).max(0),
+                        point
+                            .y
+                            .saturating_sub(rect.y)
+                            .clamp(0, i32::from(rect.h) - 1),
+                    );
+                    if let Some(byte) = render
+                        .obj
+                        .as_ref()
+                        .and_then(|object| object.text_byte_at(local))
+                    {
+                        let distance = |p: i32, lo: i32, hi: i32| {
+                            (i64::from(lo) - i64::from(p))
+                                .max(i64::from(p) - i64::from(hi))
+                                .max(0)
+                        };
+                        let score = (
+                            distance(point.y, rect.y, rect.bottom().saturating_sub(1)),
+                            distance(point.x, rect.x, rect.right()),
+                        );
+                        if best
+                            .as_ref()
+                            .is_none_or(|(previous, _, _)| score < *previous)
+                        {
+                            *best = Some((score, element, byte));
+                        }
+                    }
+                }
+            }
+            for &child in &node.children {
+                visit(ui, child, point, best);
+            }
+        }
+        let mut best = None;
+        visit(self, self.find_by_key(key)?, point, &mut best);
+        best.map(|(_, element, byte)| (element, byte))
+    }
+
+    /// Geometry and actual scroll offsets of retained objects, independent of
+    /// decorative run splitting or hover/selection colors in the paint list.
+    pub fn pointer_geometry_in_subtree(
+        &self,
+        key: &crate::Key,
+    ) -> Vec<(ElementId, crate::Rect, Point, Point)> {
+        fn visit<M: 'static>(
+            ui: &Ui<M>,
+            element: ElementId,
+            out: &mut Vec<(ElementId, crate::Rect, Point, Point)>,
+        ) {
+            let Some(node) = ui.arena.get(element) else {
+                return;
+            };
+            if let Some(render) = node.render.and_then(|id| ui.render.get(id)) {
+                out.push((
+                    element,
+                    render.data.rect,
+                    render.data.scroll,
+                    render.data.scroll_max,
+                ));
+            }
+            for &child in &node.children {
+                visit(ui, child, out);
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(root) = self.find_by_key(key) {
+            visit(self, root, &mut out);
+        }
+        out
     }
 
     fn dismiss_handler(&self, lid: ElementId) -> Option<crate::desc::Handler<M>> {

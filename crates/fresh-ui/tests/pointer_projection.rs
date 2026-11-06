@@ -332,3 +332,133 @@ fn an_excluded_drag_does_not_offer_a_drop_to_the_document() {
     assert_eq!(result.msgs, ["document-release"]);
     assert!(!ui.dragging());
 }
+
+#[test]
+fn translated_pointer_uses_its_named_popup_even_when_a_nonmodal_layer_overlaps() {
+    let mut ui = Ui::new();
+    ui.frame(
+        stack().children([
+            surface("document"),
+            layer()
+                .key("popup")
+                .anchor(Anchor::Point(1, 1))
+                .place(Place::Over)
+                .child(surface("popup")),
+            layer()
+                .key("other")
+                .anchor(Anchor::Point(1, 1))
+                .place(Place::Over)
+                .child(surface("other")),
+        ]),
+        Size::new(20, 10),
+    );
+    assert_eq!(ui.dispatch(press()).msgs, ["other"]);
+    assert_eq!(
+        ui.dispatch_to_pointer_subtree(press(), &Key::from("popup"))
+            .msgs,
+        ["popup"]
+    );
+    assert_eq!(ui.dispatch(press()).msgs, ["other"]);
+    let missing = ui.dispatch_to_pointer_subtree(press(), &Key::from("missing"));
+    assert!(!missing.claimed);
+    assert!(missing.msgs.is_empty());
+}
+
+#[test]
+fn a_higher_pointer_modal_blocks_targeted_popup_input_and_source_mapped_input() {
+    let mut ui = Ui::new();
+    ui.frame(
+        stack().children([
+            surface("document"),
+            layer()
+                .key("popup")
+                .anchor(Anchor::Point(1, 1))
+                .place(Place::Over)
+                .child(surface("popup")),
+            layer()
+                .key("modal")
+                .anchor(Anchor::Point(15, 7))
+                .place(Place::Over)
+                .modality(Modality::Pointer)
+                .child(surface("modal")),
+        ]),
+        Size::new(20, 10),
+    );
+    assert!(ui.pointer_is_modal());
+    let result = ui.dispatch_to_pointer_subtree(press(), &Key::from("popup"));
+    assert!(result.claimed);
+    assert!(result.msgs.is_empty());
+}
+
+#[test]
+fn captured_text_motion_clamps_to_the_source_at_each_edge_and_keeps_wrapped_bytes() {
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().key("body").w(Sizing::Cells(8)).children([
+            text("alpha bravo charlie").wrap().key("first"),
+            text("👩🏽‍💻 end").key("last"),
+        ]),
+        Size::new(8, 12),
+    );
+    let root = Key::from("body");
+    let (first, byte) = ui.text_hit_in_subtree(&root, Point::new(-20, -10)).unwrap();
+    assert_eq!(ui.key_of(first), Some(Key::from("first")));
+    assert_eq!(byte, 0);
+    let (wrapped, byte) = ui.text_hit_in_subtree(&root, Point::new(2, 1)).unwrap();
+    assert_eq!(wrapped, first);
+    assert_eq!(byte, "alpha br".len());
+    let (last, byte) = ui.text_hit_in_subtree(&root, Point::new(100, 100)).unwrap();
+    assert_eq!(ui.key_of(last), Some(Key::from("last")));
+    assert_eq!(byte, "👩🏽‍💻 end".len());
+    assert!(ui
+        .text_hit_in_subtree(&Key::from("absent"), Point::new(0, 0))
+        .is_none());
+}
+
+#[test]
+fn targeted_popup_input_does_not_release_another_subtrees_drag() {
+    let mut ui = Ui::new();
+    ui.frame(
+        stack().children([
+            layer()
+                .key("other")
+                .anchor(Anchor::Point(15, 0))
+                .place(Place::Over)
+                .child(
+                    gesture(text("drag"))
+                        .on(
+                            GestureKind::Press,
+                            Rc::new(|event| {
+                                event.start_drag();
+                                None
+                            }),
+                        )
+                        .on(GestureKind::Release, Rc::new(|_| Some("other-release"))),
+                ),
+            layer()
+                .key("popup")
+                .anchor(Anchor::Point(1, 1))
+                .place(Place::Over)
+                .child(surface("popup").on(
+                    GestureKind::Release,
+                    Rc::new(|event| {
+                        event.stop();
+                        Some("popup-release")
+                    }),
+                )),
+        ]),
+        Size::new(20, 10),
+    );
+    ui.dispatch(Input::press(
+        Point::new(15, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(ui.dragging());
+    let result = ui.dispatch_to_pointer_subtree(
+        Input::release(Point::new(3, 2), MouseButton::Left, Mods::NONE),
+        &Key::from("popup"),
+    );
+    assert_eq!(result.msgs, ["popup-release"]);
+    assert!(!ui.dragging());
+}

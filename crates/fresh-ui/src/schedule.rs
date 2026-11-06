@@ -499,6 +499,7 @@ pub struct Ui<M> {
     /// Pointer geometry temporarily supplied by another frontend. The layer
     /// keeps its keyboard/modal policy; only its old hit region is omitted.
     pub(crate) pointer_excluded: Vec<ElementId>,
+    pub(crate) pointer_only: Option<ElementId>,
     /// The drag the capture is, if it is one ([`crate::Event::start_drag`]).
     pub(crate) drag: Option<crate::hit::Drag>,
     /// The elements a press landed on, which button it was, and which press
@@ -588,6 +589,7 @@ impl<M: 'static> Ui<M> {
             pointer: None,
             captured: None,
             pointer_excluded: Vec::new(),
+            pointer_only: None,
             drag: None,
             press: None,
             focus: None,

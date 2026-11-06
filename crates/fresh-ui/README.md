@@ -86,6 +86,16 @@ blocking. The exclusion lasts for one dispatch and is restored even if a
 handler panics; ordinary dispatch still uses the original layout. The host
 must separately validate and translate input aimed at its projected surface.
 
+After that validation, `Ui::dispatch_to_pointer_subtree` delivers the translated
+pointer to that keyed surface's retained handlers. Missing keys do not fall
+through, a higher pointer modal still blocks input, and unrelated capture or
+drag state cannot acquire the event. `Ui::pointer_is_modal` also lets a host
+check this policy before applying a source-mapped document click.
+`Ui::text_hit_in_subtree` resolves captured text selection against the actual
+wrapped rows, returning the logical byte and element even beyond their bounds.
+`Ui::pointer_geometry_in_subtree` reports arranged geometry and scroll offsets
+without treating hover or selection paint as an input-target change.
+
 ## Subsystems
 
 | Area | What it does | Source |
