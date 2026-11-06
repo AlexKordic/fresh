@@ -180,6 +180,11 @@ impl<T: Message + ?Sized> Message for Box<T> {
     }
 }
 
+impl<T: Message + ?Sized> Message for std::sync::Arc<T> {
+    fn encoded_len(&self) -> usize { (**self).encoded_len() }
+    fn encode(&self, buf: &mut Vec<u8>) { (**self).encode(buf) }
+}
+
 /// An unsigned integer field's value (`uint32`, `uint64`, `bool`).
 pub(crate) trait Uint {
     fn uint(&self) -> u64;
@@ -767,6 +772,7 @@ use super::compose_text::Context as ComposeTextContext;
 use super::compose_text::Chunk as ComposeTextChunk;
 use super::compose_assets::Chunk;
 use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewportReply};
+use super::compose_tables::{Measurement as ComposeTableMeasurement, Column as ComposeTableColumn, Sample as ComposeTableSample, Style as ComposeTableStyle};
 use super::compose::InputReply;
 use super::compose_navigation::CaretState;
 use crate::view::scene::{
@@ -935,7 +941,14 @@ proto! {
         22 tables: repeated ComposeTable,
     }
     /// Parser-owned table ranges. Alignment: 0 default, 1 left, 2 center, 3 right.
-    ComposeTable { 1 start: uint64, 2 end: uint64, 3 alignments: repeated uint32, 4 rows: repeated ComposeTableRow }
+    ComposeTable { 1 start: uint64, 2 end: uint64, 3 alignments: repeated uint32, 4 rows: repeated ComposeTableRow,
+        5 measurement_id: uint64, 6 measurement: maybe ComposeTableMeasurement }
+    /// Complete, deduplicated font inputs; independent of source windows and cursors.
+    ComposeTableMeasurement { 1 columns: repeated ComposeTableColumn }
+    ComposeTableColumn { 1 samples: repeated ComposeTableSample }
+    ComposeTableSample { 1 text: string, 2 spans: repeated ComposeTableStyle, 3 minimum_only: bool, 4 image: bool }
+    /// Relative UTF-8 ranges with bold/italic flags and a code-font choice.
+    ComposeTableStyle { 1 start: uint64, 2 end: uint64, 3 flags: uint32, 4 code: bool }
     /// source selects exact structural Markdown; rows may be a bounded subset.
     ComposeTableRow {
         1 start: uint64, 2 end: uint64, 3 content_end: uint64,
@@ -1463,6 +1476,7 @@ pub(crate) struct EncodedScene {
     region_hashes: [u64; 10],
     panes: Vec<Vec<u8>>,
     pane_hashes: Vec<u64>,
+    pane_hash_scratch: Vec<u8>,
     theme: Vec<u8>,
     theme_hash: u64,
     clipboard: Vec<u8>,
@@ -1474,6 +1488,20 @@ pub(crate) struct EncodedScene {
 }
 
 impl EncodedScene {
+    /// A full measurement and its later reference describe the same pane.
+    /// Compare reference bytes so delivering a basis once does not invent a
+    /// follow-up scene change when its payload is omitted on the next push.
+    pub(crate) fn table_reference_hashes(&mut self, model: &mut SceneModel<'_>) {
+        for (index, pane) in model.panes.iter_mut().enumerate() {
+            let saved: Vec<_> = pane.compose.as_mut().map(|compose| compose.tables.iter_mut().enumerate()
+                .filter_map(|(index, table)| table.measurement.take().map(|value| (index, value))).collect()).unwrap_or_default();
+            if saved.is_empty() { continue; }
+            self.pane_hash_scratch.clear(); pane.encode(&mut self.pane_hash_scratch);
+            self.pane_hashes[index] = hash_bytes(&self.pane_hash_scratch);
+            for (index, measurement) in saved { pane.compose.as_mut().unwrap().tables[index].measurement = Some(measurement); }
+        }
+    }
+
     pub(crate) fn encode(&mut self, model: &SceneModel<'_>, clipboard: Clipboard<'_>) {
         let m = model;
         self.region(0, |b| field::msgs(b, 1, m.menu.menus.iter()));

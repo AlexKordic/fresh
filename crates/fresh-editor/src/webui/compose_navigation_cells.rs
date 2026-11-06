@@ -684,6 +684,8 @@ mod tests {
             revealed: false,
         };
         let tables = vec![Table {
+            measurement_id: 0,
+            measurement: None,
             start: 10,
             end: 80,
             alignments: vec![0, 0],

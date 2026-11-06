@@ -99,7 +99,19 @@ impl App {
                 }
                 let index=update.index as usize;
                 if self.panes.len()<=index {self.panes.resize(index+1,pb::Pane::default());}
-                self.panes[index]=pane.clone();
+                let mut next=pane.clone();
+                if let (Some(new),Some(old))=(next.compose.as_mut(),self.panes[index].compose.as_ref()) {
+                    if new.asset_document==old.asset_document && new.asset_authority==old.asset_authority {
+                        for table in &mut new.tables {
+                            if table.measurement_id!=0 && table.measurement.is_none() {
+                                if let Some(previous)=old.tables.iter().find(|p|p.start==table.start && p.end==table.end && p.measurement_id==table.measurement_id) {
+                                    table.measurement=previous.measurement.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                self.panes[index]=next;
             }
         }
     }
@@ -337,6 +349,7 @@ fn rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(root:
     let pane=hello.panes.iter().find_map(|u|u.pane.as_ref().filter(|p|p.compose.is_some())).unwrap();
     let compose=pane.compose.as_ref().unwrap();
     assert_eq!(compose.tables.len(),2);
+    assert!(compose.tables.iter().all(|t|t.measurement_id!=0 && t.measurement.is_some()));
     assert_eq!(compose.tables[0].alignments,[1,2,3]);
     assert_eq!(compose.tables[0].rows.len(),6);
     assert!(compose.tables[0].rows[3].cells[1..].iter().all(|c|c.missing));
@@ -354,7 +367,9 @@ fn rich_measured_tables_negotiate_source_cells_and_preserve_editor_history(root:
     let image=compose.images[0].start;
     let mut scope=pane_scope(hello.window_id.unwrap(),pane);
     let word=original.find("café").unwrap()+2;
-    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some(word as u64),..Default::default()});
+    let revealed=rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id:1,position:Some(word as u64),..Default::default()});
+    assert!(revealed.panes.iter().filter_map(|p|p.pane.as_ref()).filter_map(|p|p.compose.as_ref()).flat_map(|c|&c.tables)
+        .all(|t|t.measurement_id!=0 && t.measurement.is_none()),"unchanged measurement inputs are not repeated with source reveal");
     let current=app.panes.iter().find_map(|p|p.compose.as_ref()).unwrap();
     assert!(current.tables[0].rows[1].cells[0].revealed && !current.tables[0].rows[1].source);
     assert!(current.text.contains("**café 👩🏽‍💻** and [link](target.md)"));

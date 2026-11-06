@@ -8,6 +8,9 @@ selection actions. No macOS framework is required to replay the fixture.
 `compose-table-source-layout.pb` records the same document after a missing-cell
 motion reveals structural source. It uses a different style revision to verify
 that logical column intent survives a pixel-goal reset during source editing.
+Both fixtures use complete parser-owned column measurement inputs. Their widths
+remain stable when source windows show different row subsets or reveal syntax;
+the scene store retains inputs referred to by later pane updates.
 
 To regenerate with sibling `file_commander` and `editor-fresh` checkouts, run
 from File Commander on macOS:

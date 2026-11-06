@@ -761,6 +761,7 @@ impl Document {
                 }
             }
         }
+        tables.finish(&text, &spans, &images);
         Self {
             revision,
             epoch,
@@ -1527,6 +1528,57 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_table_font_inputs_are_deduplicated_stable_across_windows_and_independent_of_reveal()
+    {
+        let text =
+            "| H | V |\n|---|---|\n| **café** | `a\\|b` &amp; |\n| ![**pic**](x.png) | far |\n"
+                .to_owned()
+                + &"| repeat | x |\n".repeat(100);
+        let doc = Document::parse(text.clone(), 0, 0, 1);
+        let start = text.find("| repeat").unwrap();
+        let visible = doc.tables.snapshot(&text, start..text.len(), &[start + 2]);
+        let all = doc.tables.snapshot(&text, 0..text.len(), &[]);
+        assert_eq!(visible[0].measurement_id, all[0].measurement_id);
+        assert!(Arc::ptr_eq(
+            visible[0].measurement.as_ref().unwrap(),
+            all[0].measurement.as_ref().unwrap()
+        ));
+        let measurement = visible[0].measurement.as_ref().unwrap();
+        assert!(
+            measurement.columns[0].samples.len() < 10,
+            "repeated rows are not repeated on the wire"
+        );
+        let bold = measurement.columns[0]
+            .samples
+            .iter()
+            .find(|s| s.text == "café")
+            .unwrap();
+        assert!(bold.spans.iter().any(|s| s.flags == 1));
+        let code = measurement.columns[1]
+            .samples
+            .iter()
+            .find(|s| !s.minimum_only && s.text.contains("a|b"))
+            .unwrap();
+        assert!(code.spans.iter().any(|s| s.code));
+        assert!(code.text.contains('&') && !code.text.contains("&amp;"));
+        assert!(measurement.columns[0]
+            .samples
+            .iter()
+            .any(|s| s.image && !s.text.contains("![")));
+        assert!(measurement.columns[0].samples.iter().any(|s| s.minimum_only
+            && s.text.contains("![")
+            && s.spans.iter().any(|span| span.code)));
+        let edited = Document::parse(text.replace("far", "changed far"), 1, 0, 1);
+        assert_ne!(
+            edited
+                .tables
+                .snapshot(&edited.text, start..edited.text.len(), &[])[0]
+                .measurement_id,
+            all[0].measurement_id
+        );
+    }
 
     #[test]
     fn requested_source_window_contains_anchor_after_a_long_preceding_paragraph() {

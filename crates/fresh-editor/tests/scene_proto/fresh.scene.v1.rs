@@ -593,6 +593,44 @@ pub struct ComposeTable {
     pub alignments: ::prost::alloc::vec::Vec<u32>,
     #[prost(message, repeated, tag = "4")]
     pub rows: ::prost::alloc::vec::Vec<ComposeTableRow>,
+    #[prost(uint64, tag = "5")]
+    pub measurement_id: u64,
+    #[prost(message, optional, tag = "6")]
+    pub measurement: ::core::option::Option<ComposeTableMeasurement>,
+}
+/// Complete, deduplicated font inputs; independent of source windows and cursors.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeTableMeasurement {
+    #[prost(message, repeated, tag = "1")]
+    pub columns: ::prost::alloc::vec::Vec<ComposeTableColumn>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeTableColumn {
+    #[prost(message, repeated, tag = "1")]
+    pub samples: ::prost::alloc::vec::Vec<ComposeTableSample>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeTableSample {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub spans: ::prost::alloc::vec::Vec<ComposeTableStyle>,
+    #[prost(bool, tag = "3")]
+    pub minimum_only: bool,
+    #[prost(bool, tag = "4")]
+    pub image: bool,
+}
+/// Relative UTF-8 ranges with bold/italic flags and a code-font choice.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeTableStyle {
+    #[prost(uint64, tag = "1")]
+    pub start: u64,
+    #[prost(uint64, tag = "2")]
+    pub end: u64,
+    #[prost(uint32, tag = "3")]
+    pub flags: u32,
+    #[prost(bool, tag = "4")]
+    pub code: bool,
 }
 /// source selects exact structural Markdown; rows may be a bounded subset.
 #[derive(Clone, PartialEq, ::prost::Message)]

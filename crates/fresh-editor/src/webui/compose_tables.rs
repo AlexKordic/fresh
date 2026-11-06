@@ -2,14 +2,32 @@
 //! padding or terminal frame strings are part of this model.
 
 use pulldown_cmark::{Alignment, Event, Tag, TagEnd};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::sync::Arc;
 
-#[derive(Clone, Debug, Hash)]
+#[path = "compose_table_measurements.rs"]
+mod measurements;
+pub(crate) use measurements::{Column, Measurement, Sample, Style};
+
+#[derive(Clone, Debug)]
 pub(crate) struct Table {
     pub start: usize,
     pub end: usize,
     pub alignments: Vec<u32>,
     pub rows: Vec<Row>,
+    pub measurement_id: u64,
+    pub measurement: Option<Arc<Measurement>>,
+}
+
+impl Hash for Table {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.start.hash(state);
+        self.end.hash(state);
+        self.alignments.hash(state);
+        self.rows.hash(state);
+        self.measurement_id.hash(state);
+    }
 }
 
 #[cfg(test)]
@@ -174,6 +192,8 @@ struct ParsedTable {
     source: Range<usize>,
     alignments: Vec<u32>,
     rows: Vec<ParsedRow>,
+    measurement_id: u64,
+    measurement: Option<Arc<Measurement>>,
 }
 
 #[derive(Default)]
@@ -222,6 +242,8 @@ impl Tables {
                         })
                         .collect(),
                     rows: Vec::new(),
+                    measurement_id: 0,
+                    measurement: None,
                 });
             }
             Event::End(TagEnd::Table) => self.active = false,
@@ -379,6 +401,8 @@ impl Tables {
                     end: table.source.end,
                     alignments: table.alignments.clone(),
                     rows,
+                    measurement_id: table.measurement_id,
+                    measurement: table.measurement.clone(),
                 })
             })
             .collect()

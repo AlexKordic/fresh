@@ -361,6 +361,32 @@ message ComposeTable {
   uint64 end = 2;
   repeated uint32 alignments = 3;
   repeated ComposeTableRow rows = 4;
+  uint64 measurement_id = 5;
+  ComposeTableMeasurement measurement = 6;
+}
+
+// Complete, deduplicated font inputs; independent of source windows and cursors.
+message ComposeTableMeasurement {
+  repeated ComposeTableColumn columns = 1;
+}
+
+message ComposeTableColumn {
+  repeated ComposeTableSample samples = 1;
+}
+
+message ComposeTableSample {
+  string text = 1;
+  repeated ComposeTableStyle spans = 2;
+  bool minimum_only = 3;
+  bool image = 4;
+}
+
+// Relative UTF-8 ranges with bold/italic flags and a code-font choice.
+message ComposeTableStyle {
+  uint64 start = 1;
+  uint64 end = 2;
+  uint32 flags = 3;
+  bool code = 4;
 }
 
 // source selects exact structural Markdown; rows may be a bounded subset.

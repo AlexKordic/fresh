@@ -92,6 +92,8 @@ struct SceneClient {
     telemetry: bool,
     rich_compose: bool,
     measured_tables: bool,
+    /// Measurements already delivered for each visible pane/table identity.
+    table_measurements: HashSet<(u64, u64, u64, usize, usize, u64)>,
     last_input: u64,
     last_input_reply: Option<super::compose::InputReply>,
     pending_input_target: Option<super::compose::InputTarget>,
@@ -304,6 +306,7 @@ impl SceneBridge {
             // client. The common grid and chrome are still rendered once.
             let mut rich_encoded = std::mem::take(&mut client.rich_encoded);
             let mut timing = base;
+            let mut table_measurements = HashSet::new();
             if client.rich_compose {
                 let gather_started = Instant::now();
                 if model.aux_modal.is_none() && editor.menu_state().active_menu.is_none() {
@@ -315,6 +318,13 @@ impl SceneBridge {
                             let region = viewport.map(|v| v.position);
                             pane.compose = self.compose.gather_tables_at(editor, leaf, buffer, region, client.measured_tables);
                             if let Some(compose) = &mut pane.compose { compose.viewport = viewport; }
+                            if let Some(compose) = &mut pane.compose {
+                                for table in &mut compose.tables {
+                                    let key = (model.window_id, pane.leaf as u64, compose.asset_document, table.start, table.end, table.measurement_id);
+                                    table_measurements.insert(key);
+                                    if client.table_measurements.contains(&key) { table.measurement = None; }
+                                }
+                            }
                             if let Some(compose) = &pane.compose {
                                 compose_regions.push(crate::app::window::ComposeRegion {
                                     leaf, buffer, revision: compose.buffer_revision,
@@ -357,20 +367,27 @@ impl SceneBridge {
                 let encode_started = Instant::now();
                 let (seq, text) = source.clip.current(editor);
                 rich_encoded.encode(&model, wire::Clipboard { seq, text });
+                rich_encoded.table_reference_hashes(&mut model);
                 timing.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
                 timing.cpu_ms = process_cpu_ms();
                 for pane in &mut model.panes { pane.compose = None; }
             }
             let encoded = if client.rich_compose { &rich_encoded } else { &self.encoded };
-            if !client.hello_sent {
+            let sent = if !client.hello_sent {
                 client.send_hello(encoded, &grid);
+                true
             } else if client.ready() {
                 client.held = false;
                 client.send_frame(encoded, &grid, timing);
+                true
             } else {
                 client.held = true;
-            }
+                false
+            };
             client.rich_encoded = rich_encoded;
+            // A held scene was never delivered. Keep the previous bases until
+            // a real frame/hello establishes the receiver's current pane set.
+            if sent { client.table_measurements = table_measurements; }
         }
         compose_regions.sort_by_key(|r| (r.buffer.0, r.leaf.0.0, r.source.start, r.source.end));
         compose_regions.dedup();
@@ -439,6 +456,7 @@ impl SceneClient {
             telemetry: false,
             rich_compose: false,
             measured_tables: false,
+            table_measurements: HashSet::new(),
             last_input: 0,
             last_input_reply: None,
             pending_input_target: None,
