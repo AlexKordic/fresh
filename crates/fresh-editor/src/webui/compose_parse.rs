@@ -75,20 +75,19 @@ impl Worker {
 }
 
 impl ComposeCache {
-    /// Cache pressure must not make visible panes or workspaces continually
-    /// evict and reparse each other. Hidden tabs remain ordinary LRU victims.
+    /// A scene renders one active workspace. Protect its displayed Compose
+    /// splits; saved workspaces and hidden tabs remain ordinary LRU victims.
     pub(super) fn visible_documents(editor: &Editor) -> HashSet<(u64, usize)> {
         let mut visible = HashSet::new();
-        for (id, window) in &editor.windows {
-            if let Some((manager, views)) = window.buffers.splits() {
-                for (leaf, buffer) in manager.visible_leaves() {
-                    if views
-                        .get(&leaf)
-                        .and_then(|view| view.buffer_state(buffer))
-                        .is_some_and(|view| view.view_mode == ViewMode::PageView)
-                    {
-                        visible.insert((id.0, buffer.0));
-                    }
+        let window = editor.active_window();
+        if let Some((manager, views)) = window.buffers.splits() {
+            for (leaf, buffer) in manager.visible_leaves() {
+                if views
+                    .get(&leaf)
+                    .and_then(|view| view.buffer_state(buffer))
+                    .is_some_and(|view| view.view_mode == ViewMode::PageView)
+                {
+                    visible.insert((window.id.0, buffer.0));
                 }
             }
         }
@@ -718,17 +717,53 @@ mod tests {
     }
 
     #[test]
-    fn visible_workspaces_keep_their_working_snapshots_under_cache_pressure() {
-        let (mut editor, root) = editor("# First workspace\n");
+    fn inactive_workspaces_do_not_pin_page_view_snapshots() {
+        let (mut editor, root) = editor("# Earlier workspace\n");
         let mut cache = ComposeCache::default();
-        let first_window = editor.active_window().id;
+        let old_window = editor.active_window().id;
+        let old_buffer = editor.active_buffer();
+        gather(&mut cache, &mut editor);
+        let old = retain_capacity(&mut cache, &editor, 40 << 20);
+        let directory = root.path().join("active");
+        std::fs::create_dir(&directory).unwrap();
+        let active = editor.create_window_at(directory, "Active workspace".into());
+        editor.set_active_window(active);
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        gather(&mut cache, &mut editor);
+        retain_capacity(&mut cache, &editor, 40 << 20);
+        assert!(!cache.poll(&editor));
+        assert!(
+            old.upgrade().is_none(),
+            "an inactive workspace is not part of the displayed scene"
+        );
+        assert!(
+            editor.windows[&old_window]
+                .buffer_state(old_buffer)
+                .is_some(),
+            "eviction must keep the actual open buffer"
+        );
+        assert_eq!(
+            editor.windows[&old_window].focused_view().view_mode,
+            ViewMode::PageView
+        );
+        editor.set_active_window(old_window);
+        let restored = gather(&mut cache, &mut editor);
+        assert_eq!(restored.text_context.unwrap().text, "# Earlier workspace\n");
+        assert!(restored.spans.iter().any(|span| span.role == 1));
+    }
+
+    #[test]
+    fn visible_splits_keep_their_working_snapshots_under_cache_pressure() {
+        let (mut editor, _root) = editor("# First pane\n");
+        let mut cache = ComposeCache::default();
+        let window = editor.active_window().id;
+        let first_leaf = editor.active_window().effective_active_split();
         let first_buffer = editor.active_buffer();
         gather(&mut cache, &mut editor);
         let first_source = retain_capacity(&mut cache, &editor, 40 << 20);
-        let other = root.path().join("second");
-        std::fs::create_dir(&other).unwrap();
-        let second_window = editor.create_window_at(other, "Second workspace".into());
-        editor.set_active_window(second_window);
+        editor.split_pane_vertical();
+        assert_ne!(editor.active_window().effective_active_split(), first_leaf);
+        editor.new_buffer();
         editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
         gather(&mut cache, &mut editor);
         let second_source = retain_capacity(&mut cache, &editor, 40 << 20);
@@ -736,27 +771,30 @@ mod tests {
             gather(&mut cache, &mut editor);
             assert!(
                 first_source.upgrade().is_some(),
-                "visible documents must not evict each other"
+                "displayed splits must not evict each other"
             );
-            editor.set_active_window(first_window);
-            gather(&mut cache, &mut editor);
+            cache
+                .gather_tables_at(&mut editor, first_leaf, first_buffer, Some(0), true, false)
+                .unwrap();
             assert!(second_source.upgrade().is_some());
             assert_eq!(
-                Arc::as_ptr(&cache.documents[&(first_window.0, first_buffer.0)].text),
+                Arc::as_ptr(&cache.documents[&(window.0, first_buffer.0)].text),
                 first_source.as_ptr()
             );
-            editor.set_active_window(second_window);
         }
-        // After leaving Compose, that old snapshot is an ordinary LRU victim.
+        // A pane that leaves Compose becomes an ordinary LRU victim.
         editor
-            .windows
-            .get_mut(&first_window)
+            .active_window_mut()
+            .splits_mut()
+            .1
+            .get_mut(&first_leaf)
             .unwrap()
-            .focused_view_mut()
+            .buffer_state_mut(first_buffer)
+            .unwrap()
             .view_mode = ViewMode::Source;
         assert!(
             !cache.poll(&editor),
-            "retire over-budget hidden retention without another gather"
+            "retire hidden retention without another gather"
         );
         assert!(first_source.upgrade().is_none());
         assert!(second_source.upgrade().is_some());
