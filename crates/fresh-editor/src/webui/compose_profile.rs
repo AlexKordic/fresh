@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::webui::wire::Message;
+use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 fn peak_rss_bytes() -> Option<u64> {
@@ -29,6 +30,13 @@ fn fixtures() -> Vec<(&'static str, String)> {
         images.push_str(&format!("text ![image {i}](image-{i}.png) "));
     }
     images.push('\n');
+    let mut multiline_images = "# Image paragraph with soft breaks\n\n".to_owned();
+    for i in 0..4000 {
+        multiline_images.push_str(&format!("text ![image {i}](image-{i}.png) "));
+        if i % 40 == 39 {
+            multiline_images.push('\n');
+        }
+    }
     let mut nested = "# Nested\n\n".to_owned();
     for i in 0..1000 {
         nested.push_str(&format!("> > 1. **Item {i}** with [link](target.md), café and 👩🏽‍💻.\n> >\n> >    ```rust\n> >    let item = {i};\n> >    ```\n> >\n"));
@@ -46,12 +54,26 @@ fn fixtures() -> Vec<(&'static str, String)> {
         ("nested", nested),
         ("image-paragraph", images),
         ("unique-table", table),
+        ("multiline-image-paragraph", multiline_images),
     ]
 }
 
 #[test]
 #[ignore = "resource profile; set FC_COMPOSE_PROFILE_OUTPUT to export native inputs"]
 fn profile_rich_compose_document_workloads() {
+    let paragraph_windows = match std::env::var("FC_COMPOSE_PROFILE_PARAGRAPH_WINDOWS")
+        .as_deref()
+        .unwrap_or("1")
+    {
+        "1" => true,
+        "0" => false,
+        _ => panic!("FC_COMPOSE_PROFILE_PARAGRAPH_WINDOWS must be 0 or 1"),
+    };
+    let window_policy = if paragraph_windows {
+        "paragraph"
+    } else {
+        "legacy"
+    };
     let output = std::env::var_os("FC_COMPOSE_PROFILE_OUTPUT").map(std::path::PathBuf::from);
     if let Some(path) = &output {
         std::fs::create_dir_all(path).unwrap();
@@ -81,7 +103,7 @@ fn profile_rich_compose_document_workloads() {
         }
         let doc = document.unwrap();
         let started = Instant::now();
-        let window = doc.source_window_with_context(0, None, None);
+        let window = doc.source_window_policy(0, None, None, paragraph_windows);
         let tables = doc.tables.snapshot(&doc.text, window.clone(), &[]);
         let objects: Vec<_> = doc
             .images
@@ -121,6 +143,14 @@ fn profile_rich_compose_document_workloads() {
         pane.native_newline = 1;
         pane.asset_authority = 1;
         pane.asset_document = 1;
+        if paragraph_windows && name.ends_with("image-paragraph") {
+            assert!(window.end >= doc.images.last().unwrap().end);
+            assert_eq!(
+                pane.images.len(),
+                4000,
+                "profile the complete image paragraph"
+            );
+        }
         let projection_ms = started.elapsed().as_secs_f64() * 1000.0;
         let samples: usize = pane
             .tables
@@ -142,13 +172,15 @@ fn profile_rich_compose_document_workloads() {
             table.measurement = None;
         }
         let report = serde_json::json!({
-            "case": name, "source_bytes": text.len(), "background_parse_threshold": BACKGROUND_PARSE_BYTES,
+            "case": name, "source_bytes": text.len(), "source_sha256": format!("{:x}", Sha256::digest(text.as_bytes())),
+            "window_policy": window_policy, "background_parse_threshold": BACKGROUND_PARSE_BYTES,
             "semantic_parse_uses_worker": text.len() > BACKGROUND_PARSE_BYTES,
             "parse_ms": parse_ms, "source_context_ms": source_context_ms, "projection_ms": projection_ms,
             "encoding_ms": encoding_ms,
             "source_window_bytes": window.len(), "pane_bytes": wire_bytes,
             "pane_without_measurements_bytes": pane.encoded_len(),
-            "semantic_spans": doc.spans.len(), "images": doc.images.len(), "table_samples": samples,
+            "semantic_spans": doc.spans.len(), "images": doc.images.len(), "window_images": pane.images.len(),
+            "window_table_rows": pane.tables.iter().map(|table| table.rows.len()).sum::<usize>(), "table_samples": samples,
             "process_peak_rss_bytes": peak_rss_bytes(),
         });
         println!("COMPOSE_PROFILE {report}");
@@ -158,6 +190,7 @@ fn profile_rich_compose_document_workloads() {
     if let Some(path) = output {
         std::fs::write(path.join("backend.json"), serde_json::to_vec_pretty(&serde_json::json!({
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "window_policy": window_policy,
             "scope": "native parser/projection/encoding only; excludes plugin formatting and event-loop latency",
             "parse_scope": "semantic parse of a prepared immutable source and UTF-16 index; preparation is reported separately",
             "rss_scope": "process high-water mark since start, including input fixtures and prior cases",
