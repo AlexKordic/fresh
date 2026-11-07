@@ -409,21 +409,12 @@ impl Session {
         self.cached = None;
     }
 
-    pub fn begin(
-        &mut self,
-        editor: &mut Editor,
-        input: &super::compose::Input<'_>,
-        snapshot: &super::compose::ComposePane,
-    ) -> Result<(), String> {
-        let scope = input
-            .scope
-            .as_ref()
-            .ok_or("graphical navigation requires a pane")?;
+    fn begin_target(&mut self, request: u64, scope: &super::compose::Scope) -> Result<(), String> {
         let identity = Identity(scope.window, scope.leaf, scope.buffer);
         if self
             .pending
             .as_ref()
-            .is_some_and(|(id, target, _)| *id != input.id || *target != identity)
+            .is_some_and(|(id, target, _)| *id != request || *target != identity)
         {
             return Err("deferred graphical input changed its target".into());
         }
@@ -435,6 +426,33 @@ impl Session {
             self.pending_context = None;
             self.measurement_context = None;
         }
+        Ok(())
+    }
+
+    /// Core source actions need no table/image projection or cached pixel
+    /// layout, but still share the normal caret-memory completion path.
+    pub fn begin_source_action(&mut self, editor: &mut Editor, input: &super::compose::Input<'_>) -> Result<(), String> {
+        let scope = input.scope.as_ref().ok_or("source action requires a pane")?;
+        self.begin_target(input.id, scope)?;
+        let mut context = InputContext::new(scope.leaf, scope.buffer, None, std::mem::take(&mut self.memory));
+        context.plans = std::mem::take(&mut self.plans);
+        context.source_revision = scope.revision;
+        context.selection_revision = scope.selection;
+        editor.active_window_mut().compose_input = Some(context);
+        Ok(())
+    }
+
+    pub fn begin(
+        &mut self,
+        editor: &mut Editor,
+        input: &super::compose::Input<'_>,
+        snapshot: &super::compose::ComposePane,
+    ) -> Result<(), String> {
+        let scope = input
+            .scope
+            .as_ref()
+            .ok_or("graphical navigation requires a pane")?;
+        self.begin_target(input.id, scope)?;
         if let Some(bytes) = input.layout {
             let layout = Layout::parse(bytes)?;
             if layout.id != input.layout_id

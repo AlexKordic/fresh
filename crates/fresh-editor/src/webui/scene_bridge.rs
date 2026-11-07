@@ -978,17 +978,20 @@ impl SceneClient {
                 if input.kind == kind::ACTION && input.position.is_none() && input.region.is_none()
                     && input.source_revision.is_none() && self.navigation.pending_action(input.id).is_none()
                 {
-                    if let (Some(scope), Some(name), Some(target)) =
+                    if let (Some(scope), Some(_), Some(target)) =
                         (input.scope, source_action(input.payload).map_err(w)?, self.pending_input_target)
                     {
                         if compose.source_selection(editor, &scope, target.epoch) == Some(scope.selection) {
                             editor.focus_split(scope.leaf, scope.buffer);
-                            self.handle(kind::ACTION, input.payload, editor, out, compose, assets)?;
-                            if name != "save" { self.navigation.clear(); }
-                            let result = self.input_result(editor, compose, &input);
-                            self.finish_input(super::compose::InputReply {
-                                id: input.id, accepted: true, result, ..Default::default()
-                            });
+                            self.navigation.begin_source_action(editor, &input)?;
+                            let applied = self.handle(kind::ACTION, input.payload, editor, out, compose, assets);
+                            // Always finish, including an invalid argument payload.
+                            // This retains valid affinity/goals and prunes changed
+                            // source memory exactly as an ordinary scoped action.
+                            let mut reply = self.navigation.finish(editor, &input);
+                            applied?;
+                            if reply.accepted { reply.result = self.input_result(editor, compose, &input); }
+                            self.finish_input(reply);
                             out.frame_owed = true;
                             return Ok(());
                         }

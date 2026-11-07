@@ -356,20 +356,28 @@ fn rich_source_actions_keep_source_ownership_without_formatted_geometry(root: &s
     });
     let action = |id, name:&str| pb::ComposeInput { id, kind:21, buffer_epoch:epoch,
         payload:pb::Action {name:name.into(), ..Default::default()}.encode_to_vec(), ..Default::default() };
-    for (id, name, saved) in [(2,"save",Some(format!("日本{original}"))), (3,"undo",None),
-        (4,"save",Some(original.to_owned())), (5,"redo",None), (6,"save",Some(format!("日本{original}")))] {
+    let position=ed.active_window().active_cursors().primary().position as u64;
+    let revision=scope.buffer_revision;
+    let pointed=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {
+        id:2,position:Some(position),affinity:1,click_count:1,source_revision:Some(revision),buffer_epoch:epoch,..Default::default()
+    }).input_reply.unwrap();
+    assert!(pointed.accepted);assert_eq!(pointed.carets.len(),1);assert_eq!(pointed.carets[0].affinity,1);
+    let source_carets=pointed.carets;
+    for (id, name, saved) in [(3,"save",Some(format!("日本{original}"))), (4,"undo",None),
+        (5,"save",Some(original.to_owned())), (6,"redo",None), (7,"save",Some(format!("日本{original}")))] {
         scope.projection_revision ^= 1;
         let reply = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, action(id,name)).input_reply.unwrap();
         assert!(reply.accepted && !reply.needs_layout && !reply.cancelled,
             "source {name} must finish without measuring an obsolete projection: {reply:?}");
+        if id==3 { assert_eq!(reply.carets,source_carets,"source Save must retain the issued caret affinity"); }
         if let Some(saved)=saved { assert_eq!(std::fs::read(&file).unwrap(),saved.as_bytes()); }
-        if id==3 {
+        if id==4 {
             let duplicate = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, action(id,name)).input_reply.unwrap();
             assert_eq!(duplicate,reply,"a duplicate Undo must return its original receipt");
         }
     }
     let changed_len=ed.active_window().active_state().buffer.len();
-    for (id, selection) in [(7,false),(8,true)] {
+    for (id, selection) in [(8,false),(9,true)] {
         let good=scope.clone();
         if selection { scope.selection_revision ^= 1; } else { scope.buffer_revision += 1; }
         let stale=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(id,"undo")).input_reply.unwrap();
@@ -381,24 +389,24 @@ fn rich_source_actions_keep_source_ownership_without_formatted_geometry(root: &s
             assert!(reply.cancelled);
         }
     }
-    let mut retired=action(9,"undo");retired.buffer_epoch=epoch+1;
+    let mut retired=action(10,"undo");retired.buffer_epoch=epoch+1;
     let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,retired).input_reply.unwrap();
     assert!(reply.cancelled && !reply.accepted);
     assert_eq!(ed.active_window().active_state().buffer.len(),changed_len);
     let before_modal=scope.clone();
     apply_step(&mut ed,&json!({"action":"command_palette"}));
-    let waiting=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(10,"undo")).input_reply.unwrap();
+    let waiting=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(11,"undo")).input_reply.unwrap();
     assert!(waiting.needs_layout && !waiting.accepted && !waiting.cancelled,"a modal still owns the keyboard");
     assert_eq!(ed.active_window().active_state().buffer.len(),changed_len);
     apply_step(&mut ed,&json!({"key":"Escape"}));
     scope=before_modal;scope.projection_revision ^= 1;
-    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(10,"undo")).input_reply.unwrap();
+    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(11,"undo")).input_reply.unwrap();
     assert!(reply.accepted && !reply.needs_layout && !reply.cancelled,"the same input retries after the modal closes: {reply:?}");
     scope.projection_revision ^= 1;
-    assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(11,"save")).input_reply.unwrap().accepted);
+    assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(12,"save")).input_reply.unwrap().accepted);
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
     scope.projection_revision ^= 1;
-    let navigation=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(12,"move_down")).input_reply.unwrap();
+    let navigation=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(13,"move_down")).input_reply.unwrap();
     assert!(navigation.needs_layout && !navigation.accepted,"measured navigation retains its projection check");
 }
 

@@ -78,8 +78,9 @@ buffer lifetime, source revision and complete caret/context fingerprint against
 its current source index. Modal keyboard ownership still defers the request.
 The ordinary action decoder handles arguments and errors; these names resolve
 to the existing core actions. Save retains navigation memory; Undo/Redo retire
-obsolete measured navigation. Correlated receipts and duplicate-input handling
-remain the same.
+obsolete measured navigation. A source-only input context still uses ordinary
+navigation completion, returning valid caret affinity/goals and cleaning up on
+argument errors. Correlated receipts and duplicate-input handling remain the same.
 
 A stale source/selection falls through to the ordinary refresh/cancellation
 path. Navigation, unknown actions, region requests and an already deferred
