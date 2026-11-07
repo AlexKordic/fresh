@@ -27,6 +27,9 @@ pub(super) mod retention;
 #[path = "compose_parse.rs"]
 mod parsing;
 
+#[path = "compose_source.rs"]
+mod source;
+
 #[path = "compose_prefix.rs"]
 mod prefixes;
 pub(crate) use prefixes::Context as ComposeHangingContext;
@@ -1997,18 +2000,26 @@ impl ComposeCache {
             let previous = self
                 .documents
                 .remove(&key)
-                .filter(|doc| doc.epoch == state.marker_list.instance_id())
-                .map(|doc| doc.previous_decorations.unwrap_or(doc.decorations));
+                .filter(|doc| doc.epoch == state.marker_list.instance_id());
+            let (previous, previous_source) = previous.map_or((None, None), |doc| {
+                (
+                    Some(doc.previous_decorations.unwrap_or(doc.decorations)),
+                    Some((doc.revision, doc.text)),
+                )
+            });
             self.cancel_buffer_parse(window_id, buffer.0);
-            // Release the obsolete cached source/index and older snapshots
-            // before copying this revision. A parser still owns its cancelled
-            // input until completion; eviction never pretends that slot is free.
-            self.trim_cache(Some(key), state.buffer.len(), &visible);
-            let bytes = state
-                .buffer
-                .get_text_range_mut(0, state.buffer.len())
-                .ok()?;
-            let text = String::from_utf8(bytes).ok()?;
+            // Reserve the still-owned old source while capturing this revision;
+            // parser/stream references remain immutable until completion.
+            let previous_capacity = previous_source
+                .as_ref()
+                .map_or(0, |(_, text)| text.capacity());
+            self.trim_cache(
+                Some(key),
+                state.buffer.len().saturating_add(previous_capacity),
+                &visible,
+            );
+            let text =
+                source::capture(&mut state.buffer, &state.coord_map, previous_source).ok()?;
             let mut document = if text.len() > BACKGROUND_PARSE_BYTES {
                 Document::pending(text, revision, self.clock, state.marker_list.instance_id())
             } else {
@@ -2326,6 +2337,95 @@ impl ComposePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_source_capture_reuses_real_native_edit_history_without_mutating_old_workers() {
+        let root = tempfile::tempdir().unwrap();
+        let mut editor = Editor::for_test(
+            crate::config::Config::default(),
+            80,
+            24,
+            Some(root.path().into()),
+            crate::config_io::DirectoryContext::for_testing(root.path()),
+            crate::view::color_support::ColorCapability::TrueColor,
+            Arc::new(crate::model::filesystem::StdFileSystem),
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let original = "# Title\r\n\r\ncafé 👩🏽‍💻 東京 and **words**.\r\n\r\n".repeat(4000);
+        editor
+            .active_state_mut()
+            .buffer
+            .set_line_ending(crate::model::buffer::LineEnding::CRLF);
+        let cursor = editor.active_cursors().primary_id();
+        editor
+            .replace_native_texts(vec![(0..0, original.clone(), cursor)])
+            .unwrap();
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        let leaf = editor.active_window().effective_active_split();
+        let buffer = editor.active_buffer();
+        let key = (editor.active_window().id.0, buffer.0);
+        let mut cache = ComposeCache::default();
+        assert!(cache.gather_at(&mut editor, leaf, buffer, None).is_some());
+        assert!(
+            cache.documents[&key].text.as_str() == original,
+            "initial source preserves the CRLF fixture"
+        );
+        let mut expected = original.clone();
+        for step in 0..6 {
+            let old = &cache.documents[&key];
+            let revision = old.revision;
+            let worker_source = Arc::clone(&old.text);
+            let old_contents = expected.clone();
+            let start = expected.find("café").unwrap();
+            let replacement = if step % 2 == 0 {
+                "café 東京"
+            } else {
+                "café"
+            };
+            editor
+                .replace_native_texts(vec![(
+                    start..start + "café".len(),
+                    replacement.into(),
+                    cursor,
+                )])
+                .unwrap();
+            expected.replace_range(start..start + "café".len(), replacement);
+            let state = editor.active_window().buffer_state(buffer).unwrap();
+            assert!(
+                state
+                    .coord_map
+                    .unchanged_edges(
+                        revision,
+                        state.buffer.version(),
+                        worker_source.len(),
+                        expected.len()
+                    )
+                    .is_some(),
+                "the real native edit chokepoint supplies a complete capture history"
+            );
+            assert!(cache.gather_at(&mut editor, leaf, buffer, None).is_some());
+            let captured = &cache.documents[&key];
+            assert!(
+                captured.text.as_str() == expected,
+                "captured source matches native edits"
+            );
+            assert!(
+                worker_source.as_str() == old_contents,
+                "a worker keeps its immutable source"
+            );
+            for byte in [0, start, start + replacement.len(), expected.len()] {
+                assert_eq!(
+                    captured.text_index.utf16_at(&captured.text, byte),
+                    Some(expected[..byte].encode_utf16().count())
+                );
+            }
+        }
+    }
 
     #[test]
     fn pending_offscreen_prefix_uses_complete_source_until_its_context_is_certified() {

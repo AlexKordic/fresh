@@ -133,6 +133,51 @@ impl CoordMap {
         from_version < self.last_barrier
     }
 
+    /// Proven unchanged prefix/suffix byte lengths for rebuilding a validated
+    /// source snapshot. Unlike coordinate rebasing, this requires every content
+    /// version through `to_version`, including all tuples in a bulk revision.
+    /// Missing history, opaque restores or inconsistent lengths force a read
+    /// and validation of the complete source instead.
+    pub fn unchanged_edges(
+        &self,
+        from_version: u64,
+        to_version: u64,
+        before_len: usize,
+        after_len: usize,
+    ) -> Option<(usize, usize)> {
+        if from_version > to_version || from_version < self.min_mappable {
+            return None;
+        }
+        if from_version == to_version {
+            return (before_len == after_len).then_some((before_len, 0));
+        }
+        let (mut prefix, mut suffix, mut length) = (before_len, before_len, before_len);
+        let mut covered = from_version;
+        for delta in self
+            .deltas
+            .iter()
+            .filter(|d| d.version > from_version && d.version <= to_version)
+        {
+            if delta.version != covered && delta.version != covered.checked_add(1)? {
+                return None;
+            }
+            let end = delta.pos.checked_add(delta.removed)?;
+            if end > length {
+                return None;
+            }
+            prefix = prefix.min(delta.pos);
+            suffix = suffix.min(length - end);
+            length = length
+                .checked_sub(delta.removed)?
+                .checked_add(delta.inserted)?;
+            covered = delta.version;
+        }
+        (covered == to_version
+            && length == after_len
+            && prefix.checked_add(suffix)? <= before_len.min(after_len))
+        .then_some((prefix, suffix))
+    }
+
     fn push(&mut self, delta: EditDelta) {
         if delta.removed == 0 && delta.inserted == 0 {
             return;
@@ -470,6 +515,75 @@ mod tests {
             "inside the span: net insert shifts by +4"
         );
         assert_eq!(g.map(9, 0), Some(9), "before the span: unchanged");
+    }
+}
+
+#[cfg(test)]
+mod source_edges_tests {
+    use super::*;
+
+    #[test]
+    fn edges_keep_identical_bytes_through_sequential_and_bulk_edits() {
+        let original: Vec<u8> = (0..64).collect();
+        let mut current = original.clone();
+        let mut map = CoordMap::default();
+        let mut snapshots = vec![original];
+        for version in 1..=40 {
+            for tuple in 0..3 {
+                let at = (version as usize * 19 + tuple * 7) % (current.len() + 1);
+                let removed = (current.len() - at).min(tuple);
+                let inserted = vec![200 + tuple as u8; tuple + 1];
+                map.record_replace(version, at, removed, inserted.len());
+                current.splice(at..at + removed, inserted);
+            }
+            for (from, before) in snapshots.iter().enumerate() {
+                let (prefix, suffix) = map
+                    .unchanged_edges(from as u64, version, before.len(), current.len())
+                    .unwrap();
+                assert_eq!(before[..prefix], current[..prefix]);
+                assert_eq!(
+                    before[before.len() - suffix..],
+                    current[current.len() - suffix..]
+                );
+            }
+            snapshots.push(current.clone());
+        }
+    }
+
+    #[test]
+    fn capture_requires_complete_versions_bounds_and_lengths() {
+        let mut map = CoordMap::default();
+        map.record_insert(1, 5, 2);
+        assert_eq!(map.unchanged_edges(0, 1, 10, 12), Some((5, 5)));
+        assert_eq!(map.unchanged_edges(0, 1, 10, 11), None);
+        assert_eq!(map.unchanged_edges(0, 2, 10, 12), None);
+        map.record_delete(3, 0, 1);
+        assert_eq!(
+            map.unchanged_edges(0, 3, 10, 11),
+            None,
+            "a missing version cannot certify source"
+        );
+        assert_eq!(map.unchanged_edges(2, 3, 12, 11), Some((0, 11)));
+        map.record_replace(4, usize::MAX, 2, 1);
+        assert_eq!(map.unchanged_edges(3, 4, 11, 10), None);
+        assert_eq!(map.unchanged_edges(4, 3, 10, 11), None);
+        assert_eq!(map.unchanged_edges(3, 3, 11, 11), Some((11, 0)));
+        assert_eq!(map.unchanged_edges(3, 3, 11, 12), None);
+    }
+
+    #[test]
+    fn restores_and_evicted_bulk_tuples_force_complete_source_reads() {
+        let mut map = CoordMap::new(2);
+        map.record_insert(1, 0, 1);
+        map.record_insert(1, 0, 1);
+        map.record_insert(1, 0, 1);
+        assert_eq!(map.unchanged_edges(0, 1, 10, 13), None);
+        map.record_insert(2, 0, 1);
+        assert_eq!(map.unchanged_edges(1, 2, 13, 14), Some((0, 13)));
+        map.record_barrier(3);
+        map.record_insert(4, 0, 1);
+        assert_eq!(map.unchanged_edges(2, 4, 14, 15), None);
+        assert_eq!(map.unchanged_edges(3, 4, 14, 15), Some((0, 14)));
     }
 }
 
