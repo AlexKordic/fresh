@@ -1776,14 +1776,25 @@ impl ComposeCache {
         editor: &mut Editor,
         owner: &super::compose_index::Owner,
     ) -> Option<u64> {
+        self.source_selection(editor, &owner.scope(), owner.epoch)
+    }
+
+    /// Source/caret ownership without gathering or certifying a formatted
+    /// projection. Only an already-current source index can supply the hash.
+    pub(crate) fn source_selection(&self, editor: &mut Editor, scope: &Scope, epoch: usize) -> Option<u64> {
         let context = format!("{:?}", editor.get_key_context());
         let window = editor.active_window();
+        if window.id.0 != scope.window || window.pane_buffer(scope.leaf) != Some(scope.buffer) {
+            return None;
+        }
+        let state = window.buffer_state(scope.buffer)?;
+        if state.buffer.version() != scope.revision || state.marker_list.instance_id() != epoch {
+            return None;
+        }
         let (_, views) = window.buffers.splits()?;
-        let view = views
-            .get(&owner.scope().leaf)?
-            .buffer_state(BufferId(owner.buffer))?;
-        let doc = self.documents.get(&(owner.window, owner.buffer))?;
-        if doc.revision != owner.revision || doc.epoch != owner.epoch {
+        let view = views.get(&scope.leaf)?.buffer_state(scope.buffer)?;
+        let doc = self.documents.get(&(scope.window, scope.buffer.0))?;
+        if doc.revision != scope.revision || doc.epoch != epoch {
             return None;
         }
         let mut cursors: Vec<_> = view

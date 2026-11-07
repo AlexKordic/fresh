@@ -305,6 +305,7 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     assert!(!bridge.is_busy(), "the app left");
     drop(bridge);
     assert!(!path.exists(), "the bridge removes its socket");
+    rich_source_actions_keep_source_ownership_without_formatted_geometry(&root, &work);
     rich_compose_edits_keep_source_and_retry_obsolete_input(&root, &work);
     rich_navigation_uses_measured_lines_after_resolving_a_key_chord(&root, &work);
     rich_source_regions_belong_to_each_client_and_expire_after_edits(&root,&work);
@@ -329,6 +330,76 @@ fn an_app_gets_the_scene_and_drives_the_editor_over_the_socket() {
     rich_document_snapshots_prepare_full_projection_without_moving_the_viewport(&root, &work);
     scoped_compose_commands_follow_their_window_and_buffer_lifetime(&root);
     drop(std::fs::remove_dir_all(&root));
+}
+
+
+/// Save/undo/redo own source, not a particular formatted projection. This
+/// intentionally sends an obsolete projection and no pixel layout on every
+/// action; a helper that silently retries would conceal the extra round trip.
+fn rich_source_actions_keep_source_ownership_without_formatted_geometry(root: &std::path::Path, work: &std::path::Path) {
+    let file = work.join("source-actions.md");
+    let original = "# Source actions\r\n\r\nCafé **bold** 👩🏽‍💻\r\n";
+    std::fs::write(&file, original).unwrap();
+    let mut ed = build_editor(COLS, ROWS, &[file.clone()], true).unwrap();
+    for _ in 0..12 { apply_step(&mut ed, &json!({})); }
+    apply_step(&mut ed, &json!({"action":"markdownToggleCompose"}));
+    let mut bridge = SceneBridge::bind(&root.join("source-actions.sock"), &ed).unwrap();
+    let mut app = App::connect(bridge.socket_path().unwrap());
+    app.send(16, pb::ClientHello { version:1, rich_compose:true, paragraph_windows:true, ..Default::default() });
+    settle_bridge(&mut bridge, &mut ed); ready_scene(&mut bridge, &mut ed, &mut app);
+    let initial = app.panes.iter().find(|p|p.compose.is_some()).unwrap().clone();
+    let mut scope = pane_scope(app.window, &initial);
+    let epoch = initial.compose.unwrap().viewport.unwrap().epoch;
+    rich_accepted(&mut bridge, &mut ed, &mut app, &mut scope, pb::ComposeInput {
+        id:1, kind:20, text_input:true, buffer_epoch:epoch,
+        payload:pb::Paste {text:"日本".into()}.encode_to_vec(), ..Default::default()
+    });
+    let action = |id, name:&str| pb::ComposeInput { id, kind:21, buffer_epoch:epoch,
+        payload:pb::Action {name:name.into(), ..Default::default()}.encode_to_vec(), ..Default::default() };
+    for (id, name, saved) in [(2,"save",Some(format!("日本{original}"))), (3,"undo",None),
+        (4,"save",Some(original.to_owned())), (5,"redo",None), (6,"save",Some(format!("日本{original}")))] {
+        scope.projection_revision ^= 1;
+        let reply = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, action(id,name)).input_reply.unwrap();
+        assert!(reply.accepted && !reply.needs_layout && !reply.cancelled,
+            "source {name} must finish without measuring an obsolete projection: {reply:?}");
+        if let Some(saved)=saved { assert_eq!(std::fs::read(&file).unwrap(),saved.as_bytes()); }
+        if id==3 {
+            let duplicate = rich_step(&mut bridge, &mut ed, &mut app, &mut scope, action(id,name)).input_reply.unwrap();
+            assert_eq!(duplicate,reply,"a duplicate Undo must return its original receipt");
+        }
+    }
+    let changed_len=ed.active_window().active_state().buffer.len();
+    for (id, selection) in [(7,false),(8,true)] {
+        let good=scope.clone();
+        if selection { scope.selection_revision ^= 1; } else { scope.buffer_revision += 1; }
+        let stale=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(id,"undo")).input_reply.unwrap();
+        assert!(!stale.accepted,"an obsolete source/selection cannot authorize Undo");
+        assert_eq!(ed.active_window().active_state().buffer.len(),changed_len);
+        scope=good;
+        if !stale.cancelled {
+            let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,pb::ComposeInput {id,cancel:true,..Default::default()}).input_reply.unwrap();
+            assert!(reply.cancelled);
+        }
+    }
+    let mut retired=action(9,"undo");retired.buffer_epoch=epoch+1;
+    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,retired).input_reply.unwrap();
+    assert!(reply.cancelled && !reply.accepted);
+    assert_eq!(ed.active_window().active_state().buffer.len(),changed_len);
+    let before_modal=scope.clone();
+    apply_step(&mut ed,&json!({"action":"command_palette"}));
+    let waiting=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(10,"undo")).input_reply.unwrap();
+    assert!(waiting.needs_layout && !waiting.accepted && !waiting.cancelled,"a modal still owns the keyboard");
+    assert_eq!(ed.active_window().active_state().buffer.len(),changed_len);
+    apply_step(&mut ed,&json!({"key":"Escape"}));
+    scope=before_modal;scope.projection_revision ^= 1;
+    let reply=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(10,"undo")).input_reply.unwrap();
+    assert!(reply.accepted && !reply.needs_layout && !reply.cancelled,"the same input retries after the modal closes: {reply:?}");
+    scope.projection_revision ^= 1;
+    assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(11,"save")).input_reply.unwrap().accepted);
+    assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    scope.projection_revision ^= 1;
+    let navigation=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,action(12,"move_down")).input_reply.unwrap();
+    assert!(navigation.needs_layout && !navigation.accepted,"measured navigation retains its projection check");
 }
 
 fn rich_document_snapshots_prepare_full_projection_without_moving_the_viewport(root: &std::path::Path, work: &std::path::Path) {

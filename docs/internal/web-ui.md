@@ -70,6 +70,22 @@ source. A missing or cancelled result retains dependent text for explicit
 recovery. These additions do not supply a document-wide semantic index or
 claim interactive VoiceOver qualification.
 
+### Source actions without formatted geometry
+
+Scoped `save`, `undo` and `redo` actions can execute without a matching Markdown
+projection or pixel layout. Fresh verifies the current window, focused leaf,
+buffer lifetime, source revision and complete caret/context fingerprint against
+its current source index. Modal keyboard ownership still defers the request.
+The ordinary action decoder handles arguments and errors; these names resolve
+to the existing core actions. Save retains navigation memory; Undo/Redo retire
+obsolete measured navigation. Correlated receipts and duplicate-input handling
+remain the same.
+
+A stale source/selection falls through to the ordinary refresh/cancellation
+path. Navigation, unknown actions, region requests and an already deferred
+measured action keep their projection/geometry checks. This changes no wire
+fields; an older peer can still request layout when receiving these actions.
+
 ### Popup annotations for native Compose consumers
 
 The semantic popup projection retains its original `rect` and `content_rect`

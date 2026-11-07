@@ -971,6 +971,29 @@ impl SceneClient {
                     out.frame_owed = true;
                     return Ok(());
                 }
+                // These core actions depend on current source and carets, not
+                // on Markdown decoration readiness or a pixel layout. Retain
+                // the normal path for stale source, navigation and retries of
+                // an already deferred measured action.
+                if input.kind == kind::ACTION && input.position.is_none() && input.region.is_none()
+                    && input.source_revision.is_none() && self.navigation.pending_action(input.id).is_none()
+                {
+                    if let (Some(scope), Some(name), Some(target)) =
+                        (input.scope, source_action(input.payload).map_err(w)?, self.pending_input_target)
+                    {
+                        if compose.source_selection(editor, &scope, target.epoch) == Some(scope.selection) {
+                            editor.focus_split(scope.leaf, scope.buffer);
+                            self.handle(kind::ACTION, input.payload, editor, out, compose, assets)?;
+                            if name != "save" { self.navigation.clear(); }
+                            let result = self.input_result(editor, compose, &input);
+                            self.finish_input(super::compose::InputReply {
+                                id: input.id, accepted: true, result, ..Default::default()
+                            });
+                            out.frame_owed = true;
+                            return Ok(());
+                        }
+                    }
+                }
                 let mut accepted = false;
                 let current = input.scope.as_ref().and_then(|scope| {
                     let viewport = (scope.window == editor.active_window().id.0).then(|| super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer)).flatten();
@@ -1276,6 +1299,16 @@ impl SceneClient {
 }
 
 /// A `Mouse` message as the event it names; `None` for an unknown kind.
+/// Match the same final action-name field as the ordinary ACTION decoder.
+/// Arguments and errors still go through that decoder before anything runs.
+fn source_action(payload: &[u8]) -> Result<Option<&str>, WireError> {
+    let mut name = "";
+    for field in Reader::new(payload) {
+        if let (1, value) = field? { name = value.text()?; }
+    }
+    Ok(matches!(name, "save" | "undo" | "redo").then_some(name))
+}
+
 pub(super) fn mouse(payload: &[u8]) -> Result<Option<MouseInput>, WireError> {
     let (mut kind, mut button) = (0, 0);
     let mut input = MouseInput {
