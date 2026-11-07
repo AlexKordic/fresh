@@ -194,9 +194,29 @@ impl ComposeCache {
         }
     }
 
-    /// A completed parse never borrows a newer mutable source. Polling also
-    /// releases cancelled slots and starts the newest still-wanted snapshot.
-    pub fn poll(&mut self, editor: &Editor) -> bool {
+    /// Cached source and parsed metadata belong to a live buffer lifetime and
+    /// filesystem authority. Entry-count eviction alone must not keep a closed
+    /// workspace alive until another composing document happens to open.
+    pub(super) fn prune(&mut self, editor: &Editor) {
+        self.authorities.retain(|id, (previous, _)| {
+            editor
+                .windows
+                .get(&fresh_core::WindowId(*id))
+                .is_some_and(|window| {
+                    previous
+                        .upgrade()
+                        .is_some_and(|fs| Arc::ptr_eq(&fs, &window.authority().filesystem))
+                })
+        });
+        let authorities = &self.authorities;
+        self.documents.retain(|(window, buffer), doc| {
+            authorities.contains_key(window)
+                && editor
+                    .windows
+                    .get(&fresh_core::WindowId(*window))
+                    .and_then(|window| window.buffer_state(BufferId(*buffer)))
+                    .is_some_and(|state| state.marker_list.instance_id() == doc.epoch)
+        });
         let unwanted: Vec<_> = self
             .parse_wanted
             .iter()
@@ -215,6 +235,12 @@ impl ComposeCache {
         for key in obsolete {
             self.parsing[&key].store(true, Ordering::Release);
         }
+    }
+
+    /// A completed parse never borrows a newer mutable source. Polling also
+    /// releases cancelled slots and starts the newest still-wanted snapshot.
+    pub fn poll(&mut self, editor: &Editor) -> bool {
+        self.prune(editor);
         let completions: Vec<_> = match &self.parser {
             Some(Ok(worker)) => worker.results.try_iter().collect(),
             _ => Vec::new(),
@@ -347,6 +373,90 @@ mod tests {
                 result: Ok(parsed),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn closed_buffers_release_cached_source_and_keep_live_tabs_cached() {
+        let (mut editor, _root) = editor("# Old heading\n\n![old](missing.png)\n");
+        let mut cache = ComposeCache::default();
+        gather(&mut cache, &mut editor);
+        let old = editor.active_buffer();
+        let window = editor.active_window().id.0;
+        let document = &cache.documents[&(window, old.0)];
+        let source = Arc::downgrade(&document.text);
+        let semantics = Arc::downgrade(&document.semantics);
+
+        let live = editor.new_buffer();
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        gather(&mut cache, &mut editor);
+        let retained = Arc::downgrade(&cache.documents[&(window, live.0)].text);
+        editor.force_close_buffer(old).unwrap();
+        assert!(editor.active_window().buffer_state(old).is_none());
+        assert!(!cache.poll(&editor));
+        assert!(!cache.documents.contains_key(&(window, old.0)));
+        assert!(source.upgrade().is_none());
+        assert!(semantics.upgrade().is_none());
+        assert!(retained.upgrade().is_some());
+        let before = retained.as_ptr();
+        gather(&mut cache, &mut editor);
+        assert_eq!(
+            Arc::as_ptr(&cache.documents[&(window, live.0)].text),
+            before
+        );
+    }
+
+    #[test]
+    fn closed_windows_release_their_semantic_cache_and_authority() {
+        let (mut editor, root) = editor("# Old workspace\n");
+        let mut cache = ComposeCache::default();
+        gather(&mut cache, &mut editor);
+        let old = editor.active_window().id;
+        let buffer = editor.active_buffer();
+        let source = Arc::downgrade(&cache.documents[&(old.0, buffer.0)].text);
+        editor.active_state_mut().buffer.set_modified(false);
+        let directory = root.path().join("other-workspace");
+        std::fs::create_dir(&directory).unwrap();
+        let live = editor.create_window_at(directory, "Other workspace".into());
+        editor.set_active_window(live);
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        gather(&mut cache, &mut editor);
+        assert!(editor.close_window(old));
+        assert!(!cache.poll(&editor));
+        assert!(source.upgrade().is_none());
+        assert!(!cache.authorities.contains_key(&old.0));
+        assert!(cache.authorities.contains_key(&live.0));
+        assert!(cache.documents.keys().all(|(window, _)| *window == live.0));
+    }
+
+    #[test]
+    fn closed_pending_parse_is_cancelled_and_cannot_restore_its_snapshot() {
+        let (mut editor, _root) = editor(&"Paragraph café.\n\n".repeat(6000));
+        let (mut cache, input, output) = controlled();
+        gather(&mut cache, &mut editor);
+        let job = input
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let key = job.key;
+        let source = Arc::downgrade(&job.text);
+        let cancellation = job.cancel.clone();
+        let old = editor.active_buffer();
+        editor.new_buffer();
+        editor.force_close_buffer(old).unwrap();
+        assert!(!cache.poll(&editor));
+        assert!(cancellation.load(Ordering::Acquire));
+        assert!(!cache.documents.contains_key(&(key.window, key.buffer)));
+        assert!(cache.parse_wanted.is_empty());
+        assert_eq!(
+            cache.parsing.len(),
+            1,
+            "a running slot remains owned until its completion"
+        );
+        complete(job, &output);
+        assert!(!cache.poll(&editor));
+        assert!(cache.parsing.is_empty());
+        assert!(cache.documents.is_empty());
+        assert!(source.upgrade().is_none());
+        assert!(input.try_recv().is_err());
     }
 
     #[test]

@@ -1869,6 +1869,7 @@ impl ComposeCache {
         paragraph_windows: bool,
         keep: Option<Range<usize>>,
     ) -> Option<ComposePane> {
+        self.prune(editor);
         let context = editor.get_key_context();
         let owns_keyboard = document_keyboard(editor);
         let context = format!("{context:?}");
@@ -1896,8 +1897,6 @@ impl ComposeCache {
         let cursor_positions: Vec<_> = cursors.iter().map(|c| c.position).collect();
         let focused = window.effective_active_split() == leaf;
         let fs = window.authority().filesystem.clone();
-        self.authorities
-            .retain(|window, _| editor.windows.contains_key(&fresh_core::WindowId(*window)));
         if !self
             .authorities
             .get(&window_id)
