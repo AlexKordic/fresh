@@ -136,23 +136,49 @@ impl Sample {
 }
 
 impl Tables {
-    pub fn finish(&mut self, text: &str, spans: &[ComposeSpan], images: &[ComposeImage]) {
-        let mut styles: Vec<_> = spans
-            .iter()
-            .filter(|s| s.role == 7 || s.flags & 3 != 0)
-            .collect();
+    /// False retires the whole parse, including any earlier completed tables.
+    /// The caller must not publish a partially finalized document.
+    pub fn finish(
+        &mut self,
+        text: &str,
+        spans: &[ComposeSpan],
+        images: &[ComposeImage],
+        mut cancelled: impl FnMut() -> bool,
+    ) -> bool {
+        if cancelled() {
+            return false;
+        }
+        let mut styles = Vec::new();
+        for chunk in spans.chunks(128) {
+            if cancelled() {
+                return false;
+            }
+            styles.extend(chunk.iter().filter(|s| s.role == 7 || s.flags & 3 != 0));
+        }
         styles.sort_by_key(|s| s.start);
+        if cancelled() {
+            return false;
+        }
         let mut assets: Vec<_> = images.iter().collect();
         assets.sort_by_key(|i| i.start);
         let (mut style_index, mut image_index) = (0, 0);
         let mut relevant: Vec<&ComposeSpan> = Vec::new();
         let mut images: Vec<&ComposeImage> = Vec::new();
         for table in &mut self.parsed {
+            if cancelled() {
+                return false;
+            }
             let mut columns: Vec<_> = (0..table.alignments.len())
                 .map(|_| Samples::default())
                 .collect();
             for row in &table.rows {
+                if cancelled() {
+                    return false;
+                }
                 for (column, cell) in row.cells.iter().enumerate().take(columns.len()) {
+                    if cancelled() {
+                        return false;
+                    }
                     if cell.source.start >= row.source.end {
                         continue;
                     }
@@ -160,6 +186,9 @@ impl Tables {
                     images.retain(|i| i.end > cell.source.start);
                     while style_index < styles.len() && styles[style_index].start < cell.source.end
                     {
+                        if cancelled() {
+                            return false;
+                        }
                         let item = styles[style_index];
                         style_index += 1;
                         if item.end > cell.source.start {
@@ -168,6 +197,9 @@ impl Tables {
                     }
                     while image_index < assets.len() && assets[image_index].start < cell.source.end
                     {
+                        if cancelled() {
+                            return false;
+                        }
                         let image = assets[image_index];
                         image_index += 1;
                         if image.end > cell.source.start {
@@ -176,6 +208,9 @@ impl Tables {
                     }
                     let mut reading = Sample::new(false);
                     for part in &cell.parts {
+                        if cancelled() {
+                            return false;
+                        }
                         if images
                             .iter()
                             .any(|i| i.start <= part.source.start && part.source.end <= i.end)
@@ -197,6 +232,9 @@ impl Tables {
                         .map(|s| (s.start, s.end))
                         .chain(images.iter().map(|i| (i.start, i.end)))
                     {
+                        if cancelled() {
+                            return false;
+                        }
                         if cell.source.start < start && start < cell.source.end {
                             boundaries.push(start);
                         }
@@ -207,6 +245,9 @@ impl Tables {
                     boundaries.sort_unstable();
                     boundaries.dedup();
                     for pair in boundaries.windows(2) {
+                        if cancelled() {
+                            return false;
+                        }
                         raw.append(
                             &text[pair[0]..pair[1]],
                             style(pair[0], row.header, &relevant, &images),
@@ -221,6 +262,9 @@ impl Tables {
                     }
                 }
             }
+            if cancelled() {
+                return false;
+            }
             // Avoid Vec's in-place collect reusing the larger Samples slots
             // as excess retained capacity for the much smaller Column type.
             let mut measurement = Measurement {
@@ -233,9 +277,13 @@ impl Tables {
             }
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             measurement.hash(&mut hash);
+            if cancelled() {
+                return false;
+            }
             table.measurement_id = hash.finish().max(1);
             table.measurement = Some(Arc::new(measurement));
         }
+        !cancelled()
     }
 }
 
@@ -243,6 +291,57 @@ impl Tables {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn parsed_tables(text: &str) -> Tables {
+        let mut tables = Tables::default();
+        for (event, range) in
+            pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::all()).into_offset_iter()
+        {
+            tables.event(text, &event, &range);
+        }
+        tables
+    }
+
+    #[test]
+    fn superseded_table_work_stops_before_publishing_its_measurement_and_can_retry() {
+        let mut text = "| First | Value |\n|---|---|\n| small | table |\n\n".to_owned();
+        text.push_str("| Second | Value |\n|---|---|\n");
+        for row in 0..1000 {
+            text.push_str(&format!(
+                "| café {row} | **東京** [entry {row}](target.md) |\n"
+            ));
+        }
+        let mut tables = parsed_tables(&text);
+        assert_eq!(tables.parsed.len(), 2);
+        let mut polls = 0;
+        assert!(!tables.finish(&text, &[], &[], || {
+            polls += 1;
+            polls >= 128
+        }));
+        assert!(
+            tables.parsed[0].measurement.is_some(),
+            "finish earlier work"
+        );
+        assert!(
+            tables.parsed[1].measurement.is_none(),
+            "do not finish the obsolete large table before observing cancellation"
+        );
+        assert!(tables.finish(&text, &[], &[], || false));
+        let mut uninterrupted = parsed_tables(&text);
+        assert!(uninterrupted.finish(&text, &[], &[], || false));
+        for (actual, expected) in tables.parsed.iter().zip(&uninterrupted.parsed) {
+            assert_eq!(actual.measurement, expected.measurement);
+            assert_eq!(actual.measurement_id, expected.measurement_id);
+        }
+    }
+
+    #[test]
+    fn already_cancelled_table_work_does_not_build_measurements() {
+        let text = "| Header | Value |\n|---|---|\n| café | 東京 |\n";
+        let mut tables = parsed_tables(text);
+        assert!(!tables.finish(text, &[], &[], || true));
+        assert!(tables.parsed[0].measurement.is_none());
+    }
 
     fn variants() -> Vec<Sample> {
         let plain = Sample {

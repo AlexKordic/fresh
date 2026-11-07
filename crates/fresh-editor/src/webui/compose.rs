@@ -1152,7 +1152,9 @@ impl Document {
                 range
             })
             .collect();
-        tables.finish(&text, &spans, &images);
+        if !tables.finish(&text, &spans, &images, &cancelled) {
+            return None;
+        }
         if cancelled() {
             return None;
         }
