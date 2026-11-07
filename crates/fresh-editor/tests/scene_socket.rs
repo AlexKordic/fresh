@@ -57,12 +57,30 @@ impl App {
     }
 
     fn send(&mut self, kind: u64, message: impl Message) {
+        self.stream.write_all(&Self::packet(kind,message)).expect("send");
+    }
+
+    fn packet(kind: u64, message: impl Message) -> Vec<u8> {
         let payload = message.encode_to_vec();
         let mut buf = Vec::new();
         put_varint(&mut buf, kind);
         put_varint(&mut buf, payload.len() as u64);
         buf.extend_from_slice(&payload);
-        self.stream.write_all(&buf).expect("send");
+        buf
+    }
+
+    /// The bridge runs in this test thread. Large writes must let it consume
+    /// input while the client fills the socket; a synchronous write can fill
+    /// SO_SNDBUF before the bridge is ever polled.
+    fn send_pumped(&mut self, kind: u64, message: impl Message, mut poll: impl FnMut()) {
+        let bytes=Self::packet(kind,message);
+        let mut stream=self.stream.try_clone().expect("clone test client writer");
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let writer=std::thread::spawn(move || stream.write_all(&bytes));
+        while !writer.is_finished() { poll(); std::thread::sleep(Duration::from_millis(1)); }
+        let result=writer.join().expect("test writer panicked");
+        self.stream.set_write_timeout(None).unwrap();
+        result.expect("send while polling bridge");
     }
 
     /// The next message, or `None` when nothing arrives in time or the
@@ -1082,6 +1100,7 @@ fn rich_native_ornaments_reveal_and_edit_their_source_without_changing_terminal_
 }
 
 fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root:&std::path::Path,work:&std::path::Path) {
+    use sha2::{Digest,Sha256};
     let original="# Text\r\n\r\n**café** 👩🏽‍💻 end\r\n\r\nTail\r\n";
     let file=work.join("text-input.md"); std::fs::write(&file,original).unwrap();
     let mut ed=build_editor(COLS,ROWS,&[file.clone()],true).unwrap();
@@ -1111,6 +1130,11 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     let receipt=first.input_reply.unwrap().edit.expect("native replacements return an immutable source receipt");
     assert_eq!((receipt.window,receipt.leaf,receipt.buffer,receipt.epoch),(scope.window_id,scope.leaf,scope.buffer,epoch));
     assert_eq!(receipt.cursors,vec![0],"explicit native edits retain their exact edited cursor set");
+    assert_eq!(receipt.source_revision,Some(revision)); assert_eq!(receipt.source_length,Some(original.len() as u64));
+    assert_eq!(receipt.anchors.len(),1);
+    assert_eq!((receipt.anchors[0].cursor,receipt.anchors[0].before_start,receipt.anchors[0].before_end,receipt.anchors[0].start,receipt.anchors[0].end),
+        (0,start,end,start,start+"東京".len() as u64));
+    assert_eq!(receipt.anchors[0].digest,Sha256::digest("東京".as_bytes()).to_vec());
     assert_eq!(receipt.preserved_cursors,vec![0,secondary.0 as u64],"unchanged carets are separately proven against captured source anchors");
     let accepted=receipt.pane.as_ref().unwrap();
     assert!(accepted.current_projection,"native edit receipts keep a coherent current-source projection while formatting catches up");
@@ -1143,7 +1167,11 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     *ed.active_cursors_mut().primary_mut()=fresh::model::cursor::Cursor::new(0);
     ed.active_cursors_mut().remove_secondary();
     ed.paste_text("前置 ".into());
-    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(5,captured,"東京"));
+    let rebased_revision=ed.active_window().active_state().buffer.version();
+    let rebased=rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(5,captured,"東京"));
+    let rebased=rebased.input_reply.unwrap().edit.unwrap();
+    assert_eq!(rebased.source_revision,Some(rebased_revision),"proofs own actual rebased input coordinates, not an obsolete request header");
+    assert_eq!(rebased.anchors[0].before_start,start+"前置 ".len() as u64);
     assert_eq!(text(&ed),format!("前置 {}",original.replacen("café","東京",1)),"reflow/cursor movement cannot retarget an explicit replacement");
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(6,"undo")); assert_eq!(text(&ed),format!("前置 {original}"));
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(7,"undo")); assert_eq!(text(&ed),original);
@@ -1159,7 +1187,10 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     let mut invalid=replacement(9,current,""); invalid.replacement_start=Some(end-1); invalid.replacement_end=Some(end-1);
     assert!(rich_step(&mut bridge,&mut ed,&mut app,&mut scope,invalid).input_reply.unwrap().cancelled,"UTF-8 interiors are not legal replacement boundaries");
     let current=ed.active_window().active_state().buffer.version();
-    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(10,current,""));
+    let deleted=rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(10,current,""));
+    let deleted=deleted.input_reply.unwrap().edit.unwrap();
+    assert_eq!(deleted.anchors[0].start,deleted.anchors[0].end);
+    assert_eq!(deleted.anchors[0].digest,Sha256::digest(b"").to_vec());
     assert_eq!(text(&ed),original.replacen("café","",1),"empty replacement deletes the intended source range");
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(11,"undo")); assert_eq!(text(&ed),changed);
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(12,"undo")); assert_eq!(text(&ed),original);
@@ -1252,6 +1283,22 @@ fn rich_text_replacements_rebase_and_preserve_source_undo_and_other_cursors(root
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(37,"undo")); assert_eq!(text(&ed),original);
     rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(38,"save"));
     assert_eq!(std::fs::read(&file).unwrap(),original.as_bytes());
+    let large="日".to_string()+&"café 東京 👩🏽‍💻\n".repeat(5000);
+    let normalized=large.replace('\n',"\r\n");
+    let current=ed.active_window().active_state().buffer.version();
+    let frame=rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,replacement(39,current,&large));
+    let large_receipt=frame.input_reply.unwrap().edit.unwrap();
+    assert_eq!(large_receipt.anchors.len(),1);
+    let anchor=&large_receipt.anchors[0];
+    assert_eq!((anchor.start,anchor.end),(start,start+normalized.len() as u64));
+    assert_eq!(anchor.digest,Sha256::digest(normalized.as_bytes()).to_vec());
+    assert!(anchor.encoded_len()<128,"proof wire cost is independent of inserted byte count");
+    assert!(large_receipt.pane.as_ref().unwrap().text_context.as_ref().unwrap().source_start>start+3,
+        "the beginning of this insertion is genuinely outside the bounded receipt context");
+    let repeated=rich_step(&mut bridge,&mut ed,&mut app,&mut scope,replacement(39,current,"not twice"));
+    assert_eq!(repeated.input_reply.unwrap().edit,Some(large_receipt));
+    rich_accepted(&mut bridge,&mut ed,&mut app,&mut scope,action(40,"undo"));
+    assert_eq!(text(&ed),original);
 }
 
 fn rich_image_objects_select_edit_move_delete_and_undo_as_source(root:&std::path::Path,work:&std::path::Path) {
@@ -1727,7 +1774,8 @@ fn rich_step(bridge: &mut SceneBridge, ed: &mut fresh::app::Editor, app: &mut Ap
     scope: &mut pb::ComposeScope, mut input: pb::ComposeInput) -> pb::Frame {
     input.scope = Some(scope.clone());
     let request=input.id;
-    app.send(27, input);
+    if input.encoded_len()>32 << 10 { app.send_pumped(27,input,||pass(bridge,ed)); }
+    else { app.send(27, input); }
     settle_bridge(bridge, ed);
     rich_reply(bridge, ed, app, scope, request)
 }

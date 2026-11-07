@@ -35,6 +35,10 @@ pub(super) mod links;
 mod selection;
 pub(crate) use selection::Target as SelectionTarget;
 
+#[path = "compose_edit_proof.rs"]
+mod edit_proof;
+pub(crate) use edit_proof::{Anchor as EditAnchor, Proof as EditProof};
+
 #[path = "compose_semantics.rs"]
 pub(super) mod semantics;
 
@@ -79,6 +83,9 @@ pub(crate) struct EditReceipt {
     pub pane: ComposePane,
     pub cursors: Vec<usize>,
     pub preserved_cursors: Vec<usize>,
+    pub anchors: Vec<EditAnchor>,
+    pub source_revision: Option<u64>,
+    pub source_length: Option<usize>,
 }
 
 pub(crate) struct Input<'a> {
@@ -497,7 +504,7 @@ impl<'a> Input<'a> {
             .collect()
     }
 
-    pub fn replace(&self, editor: &mut Editor) -> Result<(), String> {
+    pub fn replace(&self, editor: &mut Editor) -> Result<Option<EditProof>, String> {
         let scope = self
             .scope
             .ok_or("The text replacement has no editor view.")?;
@@ -524,7 +531,7 @@ impl<'a> Input<'a> {
                 return Err("The document is read-only; text was not inserted.".into());
             }
             editor.insert_native_text(self.text()?);
-            return Ok(());
+            return Ok(None);
         }
         let range = self.replacement.clone().unwrap();
         let revision = self
@@ -573,7 +580,9 @@ impl<'a> Input<'a> {
             replacements.push((range, text, crate::model::event::CursorId(cursor)));
         }
         editor.focus_split(scope.leaf, scope.buffer);
-        editor.replace_native_texts(replacements)
+        let proof = EditProof::prepare(editor, &replacements);
+        editor.replace_native_texts(replacements)?;
+        Ok(proof.and_then(|proof| proof.verified(editor)))
     }
 
     fn text(&self) -> Result<String, String> {
@@ -3333,6 +3342,7 @@ mod tests {
                 pane: pane.clone(),
                 cursors: Vec::new(),
                 preserved_cursors: Vec::new(),
+                anchors: Vec::new(), source_revision: None, source_length: None,
             }),
             result: Some(EditReceipt {
                 window: 1,
@@ -3342,6 +3352,7 @@ mod tests {
                 pane,
                 cursors: Vec::new(),
                 preserved_cursors: Vec::new(),
+                anchors: Vec::new(), source_revision: None, source_length: None,
             }),
             ..Default::default()
         };

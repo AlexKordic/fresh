@@ -793,7 +793,7 @@ use super::compose_text::Chunk as ComposeTextChunk;
 use super::compose_assets::Chunk;
 use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewportReply};
 use super::compose_tables::{Measurement as ComposeTableMeasurement, Column as ComposeTableColumn, Sample as ComposeTableSample, Style as ComposeTableStyle};
-use super::compose::{EditReceipt, InputReply};
+use super::compose::{EditAnchor, EditReceipt, InputReply};
 use super::compose_index::{Owner as IndexOwner, Part as IndexPart, Chunk as IndexChunk};
 use super::compose_document::Chunk as DocumentChunk;
 use super::compose_navigation::CaretState;
@@ -1044,6 +1044,14 @@ proto! {
     EditReceipt as ComposeEditReceipt {
         1 window: uint64, 2 leaf: uint64, 3 buffer: uint64, 4 epoch: uint64,
         5 pane: ComposePane, 6 cursors: repeated uint64, 7 preserved_cursors: repeated uint64,
+        8 anchors: repeated ComposeEditAnchor, 9 source_revision: optional uint64, 10 source_length: optional uint64,
+    }
+    /// Verified accepted UTF-8 insertions (empty for deletion), in source order.
+    /// Before ranges belong to the receipt's source_revision/source_length.
+    /// Post ranges and SHA-256 belong to its resulting pane's source owner.
+    EditAnchor as ComposeEditAnchor {
+        1 cursor: uint64, 2 start: uint64, 3 end: uint64, 4 digest: bytes,
+        5 before_start: uint64, 6 before_end: uint64,
     }
     CaretState as ComposeCaret { 1 id: uint64, 2 position: uint64, 3 affinity: uint32 }
     /// Source ownership for a complete document navigation generation.

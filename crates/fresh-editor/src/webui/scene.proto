@@ -531,6 +531,21 @@ message ComposeEditReceipt {
   ComposePane pane = 5;
   repeated uint64 cursors = 6;
   repeated uint64 preserved_cursors = 7;
+  repeated ComposeEditAnchor anchors = 8;
+  optional uint64 source_revision = 9;
+  optional uint64 source_length = 10;
+}
+
+// Verified accepted UTF-8 insertions (empty for deletion), in source order.
+// Before ranges belong to the receipt's source_revision/source_length.
+// Post ranges and SHA-256 belong to its resulting pane's source owner.
+message ComposeEditAnchor {
+  uint64 cursor = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+  bytes digest = 4;
+  uint64 before_start = 5;
+  uint64 before_end = 6;
 }
 
 message ComposeCaret {

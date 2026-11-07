@@ -679,6 +679,9 @@ impl SceneClient {
             pane,
             cursors: Vec::new(),
             preserved_cursors: Vec::new(),
+            anchors: Vec::new(),
+            source_revision: None,
+            source_length: None,
         })
     }
 
@@ -922,7 +925,7 @@ impl SceneClient {
                     let preserved_cursors = input.preserved_cursors(editor);
                     let result = input.replace(editor);
                     match result {
-                        Ok(()) => {
+                        Ok(proof) => {
                             out.mutated = true;
                             self.navigation.clear();
                             let edit = input.scope.and_then(|scope| {
@@ -931,7 +934,12 @@ impl SceneClient {
                                 let mut pane = compose.gather_tables_at(editor, scope.leaf, scope.buffer, Some(position), self.measured_tables, self.paragraph_windows)?;
                                 pane.viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
                                 if let Some(viewport) = &pane.viewport { pane.top_byte = viewport.position; }
-                                Some(super::compose::EditReceipt { window: scope.window, leaf: scope.leaf.0.0, buffer: scope.buffer.0, epoch, pane, cursors, preserved_cursors })
+                                // Gathering formatter metadata cannot relabel
+                                // an older edit proof with a newer source.
+                                let proof = proof.filter(|proof| proof.result_revision == pane.buffer_revision && proof.result_length == pane.document_len);
+                                let (anchors, source_revision, source_length) = proof.map(|proof| (proof.anchors, Some(proof.revision), Some(proof.length)))
+                                    .unwrap_or_default();
+                                Some(super::compose::EditReceipt { window: scope.window, leaf: scope.leaf.0.0, buffer: scope.buffer.0, epoch, pane, cursors, preserved_cursors, anchors, source_revision, source_length })
                             });
                             self.finish_input(super::compose::InputReply { id: input.id, accepted: true, edit, ..Default::default() });
                         }

@@ -863,6 +863,30 @@ pub struct ComposeEditReceipt {
     pub cursors: ::prost::alloc::vec::Vec<u64>,
     #[prost(uint64, repeated, tag = "7")]
     pub preserved_cursors: ::prost::alloc::vec::Vec<u64>,
+    #[prost(message, repeated, tag = "8")]
+    pub anchors: ::prost::alloc::vec::Vec<ComposeEditAnchor>,
+    #[prost(uint64, optional, tag = "9")]
+    pub source_revision: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "10")]
+    pub source_length: ::core::option::Option<u64>,
+}
+/// Verified accepted UTF-8 insertions (empty for deletion), in source order.
+/// Before ranges belong to the receipt's source_revision/source_length.
+/// Post ranges and SHA-256 belong to its resulting pane's source owner.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeEditAnchor {
+    #[prost(uint64, tag = "1")]
+    pub cursor: u64,
+    #[prost(uint64, tag = "2")]
+    pub start: u64,
+    #[prost(uint64, tag = "3")]
+    pub end: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    pub digest: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "5")]
+    pub before_start: u64,
+    #[prost(uint64, tag = "6")]
+    pub before_end: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ComposeCaret {
