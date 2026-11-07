@@ -19,11 +19,11 @@
 //! welcome screen, the orchestrator dock, update checks), so two runs see the
 //! same scene. `scene.proto` itself must be what the encoders write.
 
+#[path = "scene_proto/client.rs"]
+mod client;
 #[path = "scene_proto/fresh.scene.v1.rs"]
 #[allow(clippy::all)]
 mod scene_proto;
-#[path = "scene_proto/client.rs"]
-mod client;
 
 use fresh::webui::{apply_step, build_editor, scene_value, wire_schema, WireProbe};
 use serde_json::{json, Value};
@@ -46,19 +46,43 @@ fn golden_dir() -> PathBuf {
 fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     vec![
         ("open", vec![]),
-        ("typed", vec![json!({"key": "End"}), json!({"type": " // edited"})]),
-        ("paged", vec![json!({"key": "PageDown"}), json!({"key": "PageDown"})]),
-        ("scrolled", vec![json!({"kind": "scrolldown", "col": 20, "row": 10})]),
-        ("palette", vec![json!({"action": "command_palette"}), json!({"type": "split"})]),
+        (
+            "typed",
+            vec![json!({"key": "End"}), json!({"type": " // edited"})],
+        ),
+        (
+            "paged",
+            vec![json!({"key": "PageDown"}), json!({"key": "PageDown"})],
+        ),
+        (
+            "scrolled",
+            vec![json!({"kind": "scrolldown", "col": 20, "row": 10})],
+        ),
+        (
+            "palette",
+            vec![
+                json!({"action": "command_palette"}),
+                json!({"type": "split"}),
+            ],
+        ),
         ("palette_closed", vec![json!({"key": "Escape"})]),
-        ("menu", vec![json!({"action": "menu_open", "args": {"name": "File"}})]),
+        (
+            "menu",
+            vec![json!({"action": "menu_open", "args": {"name": "File"}})],
+        ),
         ("menu_closed", vec![json!({"key": "Escape"})]),
         ("explorer", vec![json!({"action": "toggle_file_explorer"})]),
-        ("explorer_closed", vec![json!({"action": "toggle_file_explorer"})]),
+        (
+            "explorer_closed",
+            vec![json!({"action": "toggle_file_explorer"})],
+        ),
         ("settings", vec![json!({"action": "open_settings"})]),
         ("settings_closed", vec![json!({"key": "Escape"})]),
         ("split", vec![json!({"action": "split_vertical"})]),
-        ("search", vec![json!({"action": "search"}), json!({"type": "line"})]),
+        (
+            "search",
+            vec![json!({"action": "search"}), json!({"type": "line"})],
+        ),
         ("search_closed", vec![json!({"key": "Escape"})]),
     ]
 }
@@ -69,7 +93,11 @@ fn sample(work: &Path) -> PathBuf {
         .collect();
     let path = work.join("sample.rs");
     std::fs::write(&path, text).expect("write sample");
-    std::fs::write(work.join("notes.md"), "# Notes\n\nA second file for the explorer.\n").expect("write notes");
+    std::fs::write(
+        work.join("notes.md"),
+        "# Notes\n\nA second file for the explorer.\n",
+    )
+    .expect("write notes");
     path
 }
 
@@ -101,7 +129,11 @@ fn web_scene_json_is_unchanged() {
     std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
     let file = sample(&work);
     std::env::set_current_dir(&work).expect("cwd");
-    let work_text = work.canonicalize().unwrap_or(work.clone()).display().to_string();
+    let work_text = work
+        .canonicalize()
+        .unwrap_or(work.clone())
+        .display()
+        .to_string();
 
     let mut ed = build_editor(COLS, ROWS, &[file], true).expect("editor");
     settle(&mut ed);
@@ -133,11 +165,17 @@ fn web_scene_json_is_unchanged() {
         } else {
             let expected = std::fs::read_to_string(&path).unwrap_or_default();
             if expected != text {
-                let at = expected.bytes().zip(text.bytes()).take_while(|(a, b)| a == b).count();
+                let at = expected
+                    .bytes()
+                    .zip(text.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
                 let from = at.saturating_sub(80);
                 mismatches.push(format!(
                     "{name}.web: differs at byte {at}\n  recorded: {}\n  now:      {}",
-                    expected.get(from..(at + 120).min(expected.len())).unwrap_or(""),
+                    expected
+                        .get(from..(at + 120).min(expected.len()))
+                        .unwrap_or(""),
                     text.get(from..(at + 120).min(text.len())).unwrap_or("")
                 ));
             }
@@ -149,9 +187,14 @@ fn web_scene_json_is_unchanged() {
             copied += client.rows_copied;
         }
         let mut fresh = client::Client::default();
-        let (kind, payload) = WireProbe::new(&ed).next(&mut ed, COLS, ROWS).expect("a hello");
+        let (kind, payload) = WireProbe::new(&ed)
+            .next(&mut ed, COLS, ROWS)
+            .expect("a hello");
         fresh.receive(kind, &payload);
-        let mask = |text: String| text.replace(&work_text, "$WORK").replace(&work.display().to_string(), "$WORK");
+        let mask = |text: String| {
+            text.replace(&work_text, "$WORK")
+                .replace(&work.display().to_string(), "$WORK")
+        };
         let (hello, frames) = (mask(fresh.dump()), mask(client.dump()));
         if frames != hello {
             mismatches.push(format!("{name}: the frames since the first built another scene than a new client's hello\n{}", first_difference(&hello, &frames)));
@@ -162,7 +205,10 @@ fn web_scene_json_is_unchanged() {
         } else {
             let expected = std::fs::read_to_string(&path).unwrap_or_default();
             if expected != hello {
-                mismatches.push(format!("{name}.app: {}", first_difference(&expected, &hello)));
+                mismatches.push(format!(
+                    "{name}.app: {}",
+                    first_difference(&expected, &hello)
+                ));
             }
         }
     }
@@ -176,11 +222,19 @@ fn web_scene_json_is_unchanged() {
             drop(probe.next(&mut ed, COLS, ROWS));
         }
         drop(probe.next(&mut ed, COLS, ROWS));
-        assert_eq!(probe.last_encode_allocs, Some((0, 0)), "encoding an unchanged scene");
+        assert_eq!(
+            probe.last_encode_allocs,
+            Some((0, 0)),
+            "encoding an unchanged scene"
+        );
         apply_step(&mut ed, &json!({"key": "PageUp"}));
         settle(&mut ed);
         drop(probe.next(&mut ed, COLS, ROWS));
-        assert_eq!(probe.last_encode_allocs, Some((0, 0)), "encoding a frame after paging");
+        assert_eq!(
+            probe.last_encode_allocs,
+            Some((0, 0)),
+            "encoding a frame after paging"
+        );
     }
     drop(std::fs::remove_dir_all(&root));
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n\n"));
@@ -189,7 +243,11 @@ fn web_scene_json_is_unchanged() {
 
 /// Where two texts part, with a line of context from each.
 fn first_difference(expected: &str, actual: &str) -> String {
-    let line = expected.lines().zip(actual.lines()).take_while(|(a, b)| a == b).count();
+    let line = expected
+        .lines()
+        .zip(actual.lines())
+        .take_while(|(a, b)| a == b)
+        .count();
     format!(
         "differs at line {}\n  recorded: {}\n  now:      {}",
         line + 1,
@@ -203,5 +261,8 @@ fn first_difference(expected: &str, actual: &str) -> String {
 #[test]
 fn scene_proto_is_what_the_encoders_write() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/webui/scene.proto");
-    assert_eq!(std::fs::read_to_string(path).unwrap_or_default(), wire_schema());
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap_or_default(),
+        wire_schema()
+    );
 }

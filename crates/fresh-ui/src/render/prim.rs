@@ -2517,10 +2517,21 @@ mod byte_mapping_tests {
             let rows = rows_of(&text, 20, Wrap::Word);
             let width = unicode_width::UnicodeWidthStr::width(cluster) as i32;
             for column in 2..2 + width {
-                assert_eq!(byte_of(&rows, &text, 0, column), Some(2), "{cluster} at column {column}");
+                assert_eq!(
+                    byte_of(&rows, &text, 0, column),
+                    Some(2),
+                    "{cluster} at column {column}"
+                );
             }
-            assert_eq!(byte_of(&rows, &text, 0, 2 + width), Some(2 + cluster.len()), "{cluster}: its trailing caret follows the entire cluster");
-            assert_eq!(cell_of(&rows, &text, 2 + cluster.len()), (0, (2 + width) as u16));
+            assert_eq!(
+                byte_of(&rows, &text, 0, 2 + width),
+                Some(2 + cluster.len()),
+                "{cluster}: its trailing caret follows the entire cluster"
+            );
+            assert_eq!(
+                cell_of(&rows, &text, 2 + cluster.len()),
+                (0, (2 + width) as u16)
+            );
         }
     }
 

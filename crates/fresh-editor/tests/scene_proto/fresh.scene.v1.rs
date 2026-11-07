@@ -1086,8 +1086,7 @@ pub struct MenuAction {
     pub checked: ::core::option::Option<bool>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct MenuSeparator {
-}
+pub struct MenuSeparator {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MenuSubmenu {
     #[prost(string, tag = "1")]
@@ -1282,7 +1281,10 @@ pub struct SettingComplex {
 /// A setting's control.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SettingControl {
-    #[prost(oneof = "setting_control::Control", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(
+        oneof = "setting_control::Control",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
+    )]
     pub control: ::core::option::Option<setting_control::Control>,
 }
 /// Nested message and enum types in `SettingControl`.

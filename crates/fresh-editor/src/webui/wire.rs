@@ -194,8 +194,12 @@ impl<T: Message + ?Sized> Message for Box<T> {
 }
 
 impl<T: Message + ?Sized> Message for std::sync::Arc<T> {
-    fn encoded_len(&self) -> usize { (**self).encoded_len() }
-    fn encode(&self, buf: &mut Vec<u8>) { (**self).encode(buf) }
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+    fn encode(&self, buf: &mut Vec<u8>) {
+        (**self).encode(buf)
+    }
 }
 
 /// An unsigned integer field's value (`uint32`, `uint64`, `bool`).
@@ -419,7 +423,8 @@ pub(crate) mod field {
     /// Repeated numbers, packed: one length-delimited run of varints, left out
     /// when there are none.
     pub(crate) fn packed_len(tag: u32, values: impl Iterator<Item = u64>) -> usize {
-        let (count, payload) = values.fold((0usize, 0usize), |(c, p), v| (c + 1, p + varint_len(v)));
+        let (count, payload) =
+            values.fold((0usize, 0usize), |(c, p), v| (c + 1, p + varint_len(v)));
         if count == 0 {
             0
         } else {
@@ -463,11 +468,18 @@ pub(crate) mod field {
         }
     }
 
-    pub(crate) fn msgs_len<'a, M: Message + 'a>(tag: u32, items: impl Iterator<Item = &'a M>) -> usize {
+    pub(crate) fn msgs_len<'a, M: Message + 'a>(
+        tag: u32,
+        items: impl Iterator<Item = &'a M>,
+    ) -> usize {
         items.map(|m| msg_len(tag, m)).sum()
     }
 
-    pub(crate) fn msgs<'a, M: Message + 'a>(buf: &mut Vec<u8>, tag: u32, items: impl Iterator<Item = &'a M>) {
+    pub(crate) fn msgs<'a, M: Message + 'a>(
+        buf: &mut Vec<u8>,
+        tag: u32,
+        items: impl Iterator<Item = &'a M>,
+    ) {
         for m in items {
             msg(buf, tag, m);
         }
@@ -686,7 +698,6 @@ macro_rules! proto_oneof {
     };
 }
 
-
 // ─────────────────────────── protobuf, reading ───────────────────────────
 
 /// A field's value off the wire.
@@ -748,7 +759,8 @@ impl<'a> Iterator for Reader<'a> {
                     Field::Varint(v)
                 }
                 FIXED64 => {
-                    let (head, rest) = self.bytes.split_at_checked(8).ok_or(WireError::Truncated)?;
+                    let (head, rest) =
+                        self.bytes.split_at_checked(8).ok_or(WireError::Truncated)?;
                     self.bytes = rest;
                     Field::Fixed64(u64::from_le_bytes(head.try_into().unwrap_or_default()))
                 }
@@ -761,7 +773,8 @@ impl<'a> Iterator for Reader<'a> {
                     Field::Bytes(head)
                 }
                 FIXED32 => {
-                    let (head, rest) = self.bytes.split_at_checked(4).ok_or(WireError::Truncated)?;
+                    let (head, rest) =
+                        self.bytes.split_at_checked(4).ok_or(WireError::Truncated)?;
                     self.bytes = rest;
                     Field::Fixed32(u32::from_le_bytes(head.try_into().unwrap_or_default()))
                 }
@@ -785,18 +798,25 @@ impl<'a> Iterator for Reader<'a> {
 // preview cells and file browser, and the pacing hint stay off the wire; the
 // grid's cells carry what the app shows of them.
 
-use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
-use super::compose::{ComposePane, ComposeSegment, ComposeSpan, ComposeImage, ComposeSelection, ComposeHangingContext};
-use super::compose_tables::{Table as ComposeTable, Row as ComposeTableRow, Cell as ComposeTableCell};
-use super::compose_text::Context as ComposeTextContext;
-use super::compose_text::Chunk as ComposeTextChunk;
-use super::compose_assets::Chunk;
-use super::compose_viewport::{Value as ComposeViewport, Reply as ComposeViewportReply};
-use super::compose_tables::{Measurement as ComposeTableMeasurement, Column as ComposeTableColumn, Sample as ComposeTableSample, Style as ComposeTableStyle};
+use super::compose::{
+    ComposeHangingContext, ComposeImage, ComposePane, ComposeSegment, ComposeSelection, ComposeSpan,
+};
 use super::compose::{EditAnchor, EditReceipt, InputReply};
-use super::compose_index::{Owner as IndexOwner, Part as IndexPart, Chunk as IndexChunk};
+use super::compose_assets::Chunk;
 use super::compose_document::Chunk as DocumentChunk;
+use super::compose_index::{Chunk as IndexChunk, Owner as IndexOwner, Part as IndexPart};
 use super::compose_navigation::CaretState;
+use super::compose_tables::{
+    Cell as ComposeTableCell, Row as ComposeTableRow, Table as ComposeTable,
+};
+use super::compose_tables::{
+    Column as ComposeTableColumn, Measurement as ComposeTableMeasurement,
+    Sample as ComposeTableSample, Style as ComposeTableStyle,
+};
+use super::compose_text::Chunk as ComposeTextChunk;
+use super::compose_text::Context as ComposeTextContext;
+use super::compose_viewport::{Reply as ComposeViewportReply, Value as ComposeViewport};
+use super::{PaneModel, SceneTheme, ScrollbarMarker, SeparatorModel};
 use crate::view::scene::{
     ContextMenuView, EntryDialogView, FileExplorerView, FileRow, KbConfirm, KbEditDialog, KbRow,
     KbSearchView, KeybindingEditorView, MapEntryView, MenuEntry, MenuItemView, PaletteView,
@@ -1624,7 +1644,11 @@ pub(crate) fn schema() -> String {
          // and Key would clash with names the app already has.\n\
          option swift_prefix = \"Wire\";\n",
     );
-    for part in SCHEMA.iter().chain(ONEOF_SCHEMA).chain(std::iter::once(&FRAME_SCHEMA)) {
+    for part in SCHEMA
+        .iter()
+        .chain(ONEOF_SCHEMA)
+        .chain(std::iter::once(&FRAME_SCHEMA))
+    {
         out.push('\n');
         out.push_str(part);
     }
@@ -1674,12 +1698,29 @@ impl EncodedScene {
     /// follow-up scene change when its payload is omitted on the next push.
     pub(crate) fn table_reference_hashes(&mut self, model: &mut SceneModel<'_>) {
         for (index, pane) in model.panes.iter_mut().enumerate() {
-            let saved: Vec<_> = pane.compose.as_mut().map(|compose| compose.tables.iter_mut().enumerate()
-                .filter_map(|(index, table)| table.measurement.take().map(|value| (index, value))).collect()).unwrap_or_default();
-            if saved.is_empty() { continue; }
-            self.pane_hash_scratch.clear(); pane.encode(&mut self.pane_hash_scratch);
+            let saved: Vec<_> = pane
+                .compose
+                .as_mut()
+                .map(|compose| {
+                    compose
+                        .tables
+                        .iter_mut()
+                        .enumerate()
+                        .filter_map(|(index, table)| {
+                            table.measurement.take().map(|value| (index, value))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if saved.is_empty() {
+                continue;
+            }
+            self.pane_hash_scratch.clear();
+            pane.encode(&mut self.pane_hash_scratch);
             self.pane_hashes[index] = hash_bytes(&self.pane_hash_scratch);
-            for (index, measurement) in saved { pane.compose.as_mut().unwrap().tables[index].measurement = Some(measurement); }
+            for (index, measurement) in saved {
+                pane.compose.as_mut().unwrap().tables[index].measurement = Some(measurement);
+            }
         }
     }
 
@@ -1794,7 +1835,11 @@ impl RowScratch {
         let runs = || self.run_bytes.iter().map(|&n| u64::from(n));
         let styles = || self.run_styles.iter().copied();
         let len = field::uint_len(1, row as u64)
-            + if self.text.is_empty() { 0 } else { field::bytes_len(2, self.text.len()) }
+            + if self.text.is_empty() {
+                0
+            } else {
+                field::bytes_len(2, self.text.len())
+            }
             + field::packed_len(3, runs())
             + field::packed_len(4, styles());
         put_key(out, tag, LEN);
@@ -1939,9 +1984,18 @@ impl ClientScene {
         let new = grid.hashes;
         grid_copies_into(&self.grid, new, &mut self.copies_at, &mut self.copies);
         let mut changed = !self.copies.is_empty();
-        field::packed(out, 9, self.copies.iter().flat_map(|run| run.iter().map(|&v| v as u64)));
+        field::packed(
+            out,
+            9,
+            self.copies
+                .iter()
+                .flat_map(|run| run.iter().map(|&v| v as u64)),
+        );
         for (i, h) in new.iter().enumerate() {
-            let copied = self.copies.iter().any(|&[to, _, n]| (to..to + n).contains(&i));
+            let copied = self
+                .copies
+                .iter()
+                .any(|&[to, _, n]| (to..to + n).contains(&i));
             if self.grid.get(i) == Some(h) || copied {
                 continue;
             }
@@ -1996,10 +2050,16 @@ mod tests {
     #[test]
     fn rows_that_moved_are_named_by_where_they_were() {
         // Lines 1..6 scrolled by two: four rows moved up, two came into view.
-        assert_eq!(copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 5, 6, 7, 8]), vec![[0, 2, 4]]);
+        assert_eq!(
+            copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 5, 6, 7, 8]),
+            vec![[0, 2, 4]]
+        );
         // A row that changed (a scrollbar's) splits the run; rows that stayed
         // where they were need nothing.
-        assert_eq!(copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 9, 6, 5, 6]), vec![[0, 2, 2], [3, 5, 1]]);
+        assert_eq!(
+            copies(&[1, 2, 3, 4, 5, 6], &[3, 4, 9, 6, 5, 6]),
+            vec![[0, 2, 2], [3, 5, 1]]
+        );
         assert!(copies(&[1, 2], &[1, 2]).is_empty());
     }
 
@@ -2020,7 +2080,17 @@ mod tests {
 
     #[test]
     fn varints_round_trip_and_bad_ones_are_refused() {
-        for v in [0u64, 1, 127, 128, 300, 16_383, 16_384, u64::from(u32::MAX), u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            300,
+            16_383,
+            16_384,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
             let mut buf = Vec::new();
             put_varint(&mut buf, v);
             assert_eq!(buf.len(), varint_len(v), "{v}");
@@ -2046,8 +2116,15 @@ mod tests {
         put_header(&mut buf, kind::APPLIED, 0);
         let (k, payload, used) = read_message(&buf).unwrap().unwrap();
         assert_eq!((k, &buf[payload], used), (kind::FRAME, &b"abc"[..], 5));
-        assert_eq!(read_message(&buf[used..]).unwrap(), Some((kind::APPLIED, 2..2, 2)));
-        assert_eq!(read_message(&buf[..4]).unwrap(), None, "a payload still arriving");
+        assert_eq!(
+            read_message(&buf[used..]).unwrap(),
+            Some((kind::APPLIED, 2..2, 2))
+        );
+        assert_eq!(
+            read_message(&buf[..4]).unwrap(),
+            None,
+            "a payload still arriving"
+        );
         let mut huge = Vec::new();
         put_header(&mut huge, kind::FRAME, MAX_PAYLOAD + 1);
         assert!(matches!(read_message(&huge), Err(WireError::TooLong(_))));

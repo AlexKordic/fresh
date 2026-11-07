@@ -554,7 +554,10 @@ impl Editor {
     /// test is where a regression actually fails the build; this is how you
     /// find out which handler caused it.
     pub(crate) fn dispatch_plugin_command_measured(&mut self, command: PluginCommand) {
-        let label = VariantNameSink::of(match &command { PluginCommand::ScopedCompose { command, .. } => command, _ => &command });
+        let label = VariantNameSink::of(match &command {
+            PluginCommand::ScopedCompose { command, .. } => command,
+            _ => &command,
+        });
         let label = label.as_str();
         let started = std::time::Instant::now();
         if let Err(e) = self.handle_plugin_command(command) {
@@ -585,8 +588,12 @@ impl Editor {
         match command {
             PluginCommand::ScopedCompose { batch, command } => {
                 let window = fresh_core::WindowId(batch.window_id);
-                if self.windows.get(&window).and_then(|w| w.buffer_state(batch.buffer_id))
-                    .is_some_and(|state| state.marker_list.instance_id() == batch.buffer_epoch) {
+                if self
+                    .windows
+                    .get(&window)
+                    .and_then(|w| w.buffer_state(batch.buffer_id))
+                    .is_some_and(|state| state.marker_list.instance_id() == batch.buffer_epoch)
+                {
                     let previous = self.active_window;
                     self.active_window = window;
                     let result = self.handle_plugin_command(*command);
@@ -1022,7 +1029,10 @@ impl Editor {
                 #[cfg(feature = "web")]
                 if let Some(window) = self.windows.get_mut(&fresh_core::WindowId(batch.window_id)) {
                     if window.compose_readiness.has_batch(&batch)
-                        && window.buffer_state(batch.buffer_id).is_some_and(|state| state.coord_map.map(0, batch.revision).is_none()) {
+                        && window
+                            .buffer_state(batch.buffer_id)
+                            .is_some_and(|state| state.coord_map.map(0, batch.revision).is_none())
+                    {
                         // Those commands could no longer rebase. Re-offer the
                         // lines at a current revision instead of acknowledging
                         // source decorations that were necessarily dropped.

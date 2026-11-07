@@ -71,7 +71,8 @@ impl Client {
         for run in frame.copies.chunks(3) {
             let [to, from, count] = [run[0] as usize, run[1] as usize, run[2] as usize];
             for k in 0..count {
-                if let (Some(row), Some(old)) = (self.grid.get_mut(to + k), previous.get(from + k)) {
+                if let (Some(row), Some(old)) = (self.grid.get_mut(to + k), previous.get(from + k))
+                {
                     *row = old.clone();
                     self.rows_copied += 1;
                 }
@@ -131,11 +132,21 @@ impl Client {
     /// its text and its runs (byte length:style), everything else as the
     /// decoded message prints.
     pub fn dump(&self) -> String {
-        let mut out = format!("size {}x{} window {}\n", self.width, self.height, self.window_id);
-        out.push_str(&format!("cursor {:?}\ntheme {:?}\n", self.cursor, self.theme));
+        let mut out = format!(
+            "size {}x{} window {}\n",
+            self.width, self.height, self.window_id
+        );
+        out.push_str(&format!(
+            "cursor {:?}\ntheme {:?}\n",
+            self.cursor, self.theme
+        ));
         for (i, row) in self.grid.iter().enumerate() {
-            let runs: Vec<String> =
-                row.run_bytes.iter().zip(&row.run_styles).map(|(n, style)| format!("{n}:{style:x}")).collect();
+            let runs: Vec<String> = row
+                .run_bytes
+                .iter()
+                .zip(&row.run_styles)
+                .map(|(n, style)| format!("{n}:{style:x}"))
+                .collect();
             out.push_str(&format!("grid[{i}] {:?} {}\n", row.text, runs.join(" ")));
         }
         for (i, pane) in self.panes.iter().enumerate() {

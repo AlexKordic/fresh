@@ -431,10 +431,22 @@ impl Session {
 
     /// Core source actions need no table/image projection or cached pixel
     /// layout, but still share the normal caret-memory completion path.
-    pub fn begin_source_action(&mut self, editor: &mut Editor, input: &super::compose::Input<'_>) -> Result<(), String> {
-        let scope = input.scope.as_ref().ok_or("source action requires a pane")?;
+    pub fn begin_source_action(
+        &mut self,
+        editor: &mut Editor,
+        input: &super::compose::Input<'_>,
+    ) -> Result<(), String> {
+        let scope = input
+            .scope
+            .as_ref()
+            .ok_or("source action requires a pane")?;
         self.begin_target(input.id, scope)?;
-        let mut context = InputContext::new(scope.leaf, scope.buffer, None, std::mem::take(&mut self.memory));
+        let mut context = InputContext::new(
+            scope.leaf,
+            scope.buffer,
+            None,
+            std::mem::take(&mut self.memory),
+        );
         context.plans = std::mem::take(&mut self.plans);
         context.source_revision = scope.revision;
         context.selection_revision = scope.selection;

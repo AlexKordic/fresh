@@ -829,7 +829,8 @@ impl EditorServer {
         if self.web.is_some() || self.config.web_addr.is_some() {
             return;
         }
-        let (Some(path), Some(editor)) = (self.config.scene_socket.clone(), self.editor.as_ref()) else {
+        let (Some(path), Some(editor)) = (self.config.scene_socket.clone(), self.editor.as_ref())
+        else {
             return;
         };
         #[cfg(unix)]

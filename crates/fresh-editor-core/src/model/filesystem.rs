@@ -568,7 +568,8 @@ pub trait FileSystem: Send + Sync {
     /// Hash a resource of at most `maximum` bytes, rejecting oversized input.
     /// Remote backends hash on the host rather than downloading unchanged data.
     fn content_digest_bounded(&self, path: &Path, maximum: u64) -> io::Result<ContentDigest> {
-        let digest = ContentDigest::of_reader(self.open_file(path)?.take(maximum.saturating_add(1)))?;
+        let digest =
+            ContentDigest::of_reader(self.open_file(path)?.take(maximum.saturating_add(1)))?;
         if digest.size > maximum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

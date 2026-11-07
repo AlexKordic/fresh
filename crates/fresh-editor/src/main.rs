@@ -3182,10 +3182,7 @@ fn ensure_session_command(values: &[String], args: &Args) -> AnyhowResult<()> {
     use fresh::server::ipc::ClientConnection;
     use fresh::server::protocol::{ClientControl, ClientHello, ServerControl, TermSize};
     use std::time::Duration;
-    anyhow::ensure!(
-        values.len() == 1,
-        "Usage: fresh --cmd session ensure NAME"
-    );
+    anyhow::ensure!(values.len() == 1, "Usage: fresh --cmd session ensure NAME");
     let name = &values[0];
     anyhow::ensure!(
         !name.is_empty()
@@ -3220,9 +3217,15 @@ fn ensure_session_command(values: &[String], args: &Args) -> AnyhowResult<()> {
         ServerControl::VersionMismatch(m) => anyhow::bail!("{}", m.message),
         _ => anyhow::bail!("Unexpected editor handshake"),
     };
-    anyhow::ensure!(hello.session_id == *name, "Editor identity changed; try again");
+    anyhow::ensure!(
+        hello.session_id == *name,
+        "Editor identity changed; try again"
+    );
     let pid = paths.read_pid()?;
-    println!("{}", serde_json::json!({ "scene": hello.fc_scene, "pid": pid }));
+    println!(
+        "{}",
+        serde_json::json!({ "scene": hello.fc_scene, "pid": pid })
+    );
     Ok(())
 }
 

@@ -278,11 +278,9 @@ mod tests {
         snapshot.capture(1, 0..20, vec![0..20], 20, vec![record(2..4, 0..20)]);
         let mut coordinates = CoordMap::default();
         coordinates.record_barrier(5);
-        assert!(
-            snapshot
-                .rebase(5, vec![], &coordinates)
-                .active(&(0..20), &[])
-                .is_empty()
-        );
+        assert!(snapshot
+            .rebase(5, vec![], &coordinates)
+            .active(&(0..20), &[])
+            .is_empty());
     }
 }

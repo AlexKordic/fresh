@@ -64,7 +64,9 @@ impl Editor {
             let window = self.active_window_mut();
             if let Some(state) = window.buffer_state(buffer_id) {
                 let (epoch, revision) = (state.marker_list.instance_id(), state.buffer.version());
-                window.compose_readiness.adjust(buffer_id, epoch, revision, position, removed, inserted);
+                window
+                    .compose_readiness
+                    .adjust(buffer_id, epoch, revision, position, removed, inserted);
             }
         }
         let Some(seen) = self

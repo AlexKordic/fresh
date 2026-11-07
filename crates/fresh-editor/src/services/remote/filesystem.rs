@@ -136,17 +136,18 @@ impl RemoteFileSystem {
             ChannelError::Io(e) => e,
             ChannelError::Remote(msg) => {
                 let normalized = msg.to_ascii_lowercase();
-                let kind = if normalized.contains("not found") || normalized.contains("no such file") {
-                    io::ErrorKind::NotFound
-                } else if normalized.contains("permission denied") {
-                    io::ErrorKind::PermissionDenied
-                } else if normalized.contains("is a directory") {
-                    io::ErrorKind::IsADirectory
-                } else if normalized.contains("not a directory") {
-                    io::ErrorKind::NotADirectory
-                } else {
-                    io::ErrorKind::Other
-                };
+                let kind =
+                    if normalized.contains("not found") || normalized.contains("no such file") {
+                        io::ErrorKind::NotFound
+                    } else if normalized.contains("permission denied") {
+                        io::ErrorKind::PermissionDenied
+                    } else if normalized.contains("is a directory") {
+                        io::ErrorKind::IsADirectory
+                    } else if normalized.contains("not a directory") {
+                        io::ErrorKind::NotADirectory
+                    } else {
+                        io::ErrorKind::Other
+                    };
                 io::Error::new(kind, msg)
             }
             e => io::Error::other(e.to_string()),
@@ -158,15 +159,27 @@ impl RemoteFileSystem {
         if let Some(maximum) = maximum {
             params["max_bytes"] = maximum.into();
         }
-        let result = self.channel.request_blocking("digest", params).map_err(Self::to_io_error)?;
+        let result = self
+            .channel
+            .request_blocking("digest", params)
+            .map_err(Self::to_io_error)?;
         let invalid = |what: &str| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("{what} in digest response"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{what} in digest response"),
+            )
         };
-        let size = result.get("size").and_then(|v| v.as_u64()).ok_or_else(|| invalid("missing size"))?;
+        let size = result
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| invalid("missing size"))?;
         if maximum.is_some_and(|maximum| size > maximum) {
             return Err(invalid("byte limit exceeded"));
         }
-        let hex = result.get("sha256").and_then(|v| v.as_str()).ok_or_else(|| invalid("missing sha256"))?;
+        let hex = result
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid("missing sha256"))?;
         let sha256 = parse_sha256_hex(hex).ok_or_else(|| invalid("malformed sha256"))?;
         Ok(ContentDigest { size, sha256 })
     }
@@ -483,7 +496,8 @@ impl FileSystem for RemoteFileSystem {
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
-        self.metadata_with_version(path).map(|(metadata, _)| metadata)
+        self.metadata_with_version(path)
+            .map(|(metadata, _)| metadata)
     }
 
     fn metadata_with_version(&self, path: &Path) -> io::Result<(FileMetadata, Option<Vec<u8>>)> {
@@ -500,7 +514,10 @@ impl FileSystem for RemoteFileSystem {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        Ok((Self::convert_metadata(&rm, &name), rm.change_stamp.as_ref().map(|stamp| stamp.bytes())))
+        Ok((
+            Self::convert_metadata(&rm, &name),
+            rm.change_stamp.as_ref().map(|stamp| stamp.bytes()),
+        ))
     }
 
     fn symlink_metadata(&self, path: &Path) -> io::Result<FileMetadata> {
@@ -1029,8 +1046,14 @@ mod tests {
     #[test]
     fn agent_os_errors_keep_their_classification_regardless_of_capitalization() {
         for (message, kind) in [
-            ("[Errno 2] No such file or directory", io::ErrorKind::NotFound),
-            ("[Errno 13] Permission denied", io::ErrorKind::PermissionDenied),
+            (
+                "[Errno 2] No such file or directory",
+                io::ErrorKind::NotFound,
+            ),
+            (
+                "[Errno 13] Permission denied",
+                io::ErrorKind::PermissionDenied,
+            ),
             ("[Errno 21] Is a directory", io::ErrorKind::IsADirectory),
             ("[Errno 20] Not a directory", io::ErrorKind::NotADirectory),
         ] {

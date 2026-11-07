@@ -93,6 +93,9 @@ mod tests {
         let buffer: Vec<u8> = Vec::with_capacity(1000);
         let (allocs, bytes) = super::since(before).expect("counting");
         drop(buffer);
-        assert!(allocs >= 1 && bytes >= 1000, "{allocs} allocations, {bytes} bytes");
+        assert!(
+            allocs >= 1 && bytes >= 1000,
+            "{allocs} allocations, {bytes} bytes"
+        );
     }
 }

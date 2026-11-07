@@ -25,25 +25,52 @@ mod tests {
         config.clipboard.use_osc52 = false;
         config.clipboard.use_system_clipboard = false;
         let mut editor = Editor::for_test(
-            config, 80, 24, Some(root.path().into()),
+            config,
+            80,
+            24,
+            Some(root.path().into()),
             crate::config_io::DirectoryContext::for_testing(root.path()),
             crate::view::color_support::ColorCapability::TrueColor,
             std::sync::Arc::new(crate::model::filesystem::StdFileSystem),
-            None, None, false, false, false,
-        ).unwrap();
-        let theme = crate::view::theme::Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let theme =
+            crate::view::theme::Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
         let mut unavailable = PopupListItem::new("disabled", "Unavailable".into());
         unavailable.disabled = true;
         for global in [false, true] {
-            let popup = Popup::list(vec![unavailable.clone(), PopupListItem::new("enabled", "Available".into())], &theme);
-            if global { editor.global_popups.show(popup); }
-            else { editor.active_state_mut().popups.show(popup); }
+            let popup = Popup::list(
+                vec![
+                    unavailable.clone(),
+                    PopupListItem::new("enabled", "Available".into()),
+                ],
+                &theme,
+            );
+            if global {
+                editor.global_popups.show(popup);
+            } else {
+                editor.active_state_mut().popups.show(popup);
+            }
             editor.select_popup_item(0);
-            assert!(editor.topmost_popup_mut().is_some(), "disabled row dismissed popup");
+            assert!(
+                editor.topmost_popup_mut().is_some(),
+                "disabled row dismissed popup"
+            );
             editor.select_popup_item(99);
-            assert!(editor.topmost_popup_mut().is_some(), "missing row dismissed popup");
+            assert!(
+                editor.topmost_popup_mut().is_some(),
+                "missing row dismissed popup"
+            );
             editor.select_popup_item(1);
-            assert!(editor.topmost_popup_mut().is_none(), "valid row must still confirm");
+            assert!(
+                editor.topmost_popup_mut().is_none(),
+                "valid row must still confirm"
+            );
         }
     }
 }
@@ -98,7 +125,9 @@ impl Editor {
         } else {
             self.active_state_mut().popups.top_mut().is_some_and(set)
         };
-        if !selectable { return; }
+        if !selectable {
+            return;
+        }
         if let Err(e) = self.handle_action(Action::PopupConfirm) {
             tracing::warn!("popup confirm failed: {e}");
         }

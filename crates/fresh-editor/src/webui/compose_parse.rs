@@ -82,7 +82,9 @@ impl ComposeCache {
         for (id, window) in &editor.windows {
             if let Some((manager, views)) = window.buffers.splits() {
                 for (leaf, buffer) in manager.visible_leaves() {
-                    if views.get(&leaf).and_then(|view| view.buffer_state(buffer))
+                    if views
+                        .get(&leaf)
+                        .and_then(|view| view.buffer_state(buffer))
                         .is_some_and(|view| view.view_mode == ViewMode::PageView)
                     {
                         visible.insert((id.0, buffer.0));
@@ -96,14 +98,18 @@ impl ComposeCache {
     /// Bound cached snapshot retention by capacity as well as entry count.
     /// Visible Compose working sources and the requested document are never
     /// discarded solely to fit the budget. Parser ownership is separate.
-    pub(super) fn trim_source_cache(&mut self, current: Option<(u64, usize)>, incoming: usize,
-                                   visible: &HashSet<(u64, usize)>) {
+    pub(super) fn trim_source_cache(
+        &mut self,
+        current: Option<(u64, usize)>,
+        incoming: usize,
+        visible: &HashSet<(u64, usize)>,
+    ) {
         loop {
             let bytes = self.documents.values().fold(incoming, |bytes, doc| {
                 bytes.saturating_add(doc.snapshot_bytes())
             });
-            let entries =
-                self.documents.len() + usize::from(current.is_some_and(|key| !self.documents.contains_key(&key)));
+            let entries = self.documents.len()
+                + usize::from(current.is_some_and(|key| !self.documents.contains_key(&key)));
             if entries <= CACHE_LIMIT && bytes <= SOURCE_CACHE_BYTES {
                 return;
             }
@@ -459,14 +465,24 @@ mod tests {
         gather(&mut cache, &mut editor);
         let live = retain_capacity(&mut cache, &editor, 20 << 20);
         gather(&mut cache, &mut editor);
-        assert!(cache.documents.len() < 4, "entry-count-only retention exceeds the byte budget");
+        assert!(
+            cache.documents.len() < 4,
+            "entry-count-only retention exceeds the byte budget"
+        );
         assert!(!cache.documents.contains_key(&(window, buffers[1].0)));
         assert!(sources[1].upgrade().is_none());
         assert!(sources[0].upgrade().is_some());
         assert!(sources[2].upgrade().is_some());
         assert!(cache.documents.contains_key(&(window, current.0)));
         assert!(live.upgrade().is_some());
-        assert!(cache.documents.values().map(Document::snapshot_bytes).sum::<usize>() <= SOURCE_CACHE_BYTES);
+        assert!(
+            cache
+                .documents
+                .values()
+                .map(Document::snapshot_bytes)
+                .sum::<usize>()
+                <= SOURCE_CACHE_BYTES
+        );
     }
 
     #[test]
@@ -477,10 +493,15 @@ mod tests {
         let old = retain_capacity(&mut cache, &editor, 20 << 20);
         let current = editor.new_buffer();
         editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
-        editor.active_state_mut().buffer.set_line_ending(crate::model::buffer::LineEnding::CRLF);
+        editor
+            .active_state_mut()
+            .buffer
+            .set_line_ending(crate::model::buffer::LineEnding::CRLF);
         let cursor = editor.active_cursors().primary_id();
         let source = "# Current café e\u{301} 👩🏽‍💻\r\n";
-        editor.replace_native_texts(vec![(0..0, source.to_owned(), cursor)]).unwrap();
+        editor
+            .replace_native_texts(vec![(0..0, source.to_owned(), cursor)])
+            .unwrap();
         editor.active_cursors_mut().primary_mut().position = 0;
         gather(&mut cache, &mut editor);
         let live = retain_capacity(&mut cache, &editor, SOURCE_CACHE_BYTES + (1 << 20));
@@ -505,9 +526,20 @@ mod tests {
         editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
         gather(&mut cache, &mut editor);
         retain_capacity(&mut cache, &editor, SOURCE_CACHE_BYTES / 2);
-        assert_eq!(cache.documents.values().map(|doc| doc.text.capacity()).sum::<usize>(), SOURCE_CACHE_BYTES);
+        assert_eq!(
+            cache
+                .documents
+                .values()
+                .map(|doc| doc.text.capacity())
+                .sum::<usize>(),
+            SOURCE_CACHE_BYTES
+        );
         gather(&mut cache, &mut editor);
-        assert_eq!(cache.documents.len(), 1, "the indices also consume retained heap capacity");
+        assert_eq!(
+            cache.documents.len(),
+            1,
+            "the indices also consume retained heap capacity"
+        );
         assert!(old.upgrade().is_none());
     }
 
@@ -528,16 +560,30 @@ mod tests {
         let second_source = retain_capacity(&mut cache, &editor, 40 << 20);
         for _ in 0..3 {
             gather(&mut cache, &mut editor);
-            assert!(first_source.upgrade().is_some(), "visible documents must not evict each other");
+            assert!(
+                first_source.upgrade().is_some(),
+                "visible documents must not evict each other"
+            );
             editor.set_active_window(first_window);
             gather(&mut cache, &mut editor);
             assert!(second_source.upgrade().is_some());
-            assert_eq!(Arc::as_ptr(&cache.documents[&(first_window.0, first_buffer.0)].text), first_source.as_ptr());
+            assert_eq!(
+                Arc::as_ptr(&cache.documents[&(first_window.0, first_buffer.0)].text),
+                first_source.as_ptr()
+            );
             editor.set_active_window(second_window);
         }
         // After leaving Compose, that old snapshot is an ordinary LRU victim.
-        editor.windows.get_mut(&first_window).unwrap().focused_view_mut().view_mode = ViewMode::Source;
-        assert!(!cache.poll(&editor), "retire over-budget hidden retention without another gather");
+        editor
+            .windows
+            .get_mut(&first_window)
+            .unwrap()
+            .focused_view_mut()
+            .view_mode = ViewMode::Source;
+        assert!(
+            !cache.poll(&editor),
+            "retire over-budget hidden retention without another gather"
+        );
         assert!(first_source.upgrade().is_none());
         assert!(second_source.upgrade().is_some());
         assert_eq!(cache.documents.len(), 1);
@@ -575,10 +621,20 @@ mod tests {
         assert!(!cache.documents.contains_key(&keys[1]));
         assert!(cancel.load(Ordering::Acquire));
         assert!(cache.parse_wanted.is_empty());
-        assert_eq!(cache.parsing.len(), 1, "eviction cannot create an extra parser slot");
-        assert!(source.upgrade().is_some(), "the running job still owns its snapshot");
+        assert_eq!(
+            cache.parsing.len(),
+            1,
+            "eviction cannot create an extra parser slot"
+        );
+        assert!(
+            source.upgrade().is_some(),
+            "the running job still owns its snapshot"
+        );
         complete(job, &output);
-        assert!(!cache.poll(&editor), "an evicted late result cannot restore the source");
+        assert!(
+            !cache.poll(&editor),
+            "an evicted late result cannot restore the source"
+        );
         assert!(cache.parsing.is_empty());
         assert!(source.upgrade().is_none());
         assert!(input.try_recv().is_err());

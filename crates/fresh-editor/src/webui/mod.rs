@@ -110,24 +110,24 @@ use serde_json::{json, Value};
 use crate::app::Editor;
 use crate::view::scene::Rgb;
 
-mod wire;
 mod compose;
-mod compose_index;
-mod compose_document;
-mod compose_decorations;
 mod compose_assets;
-mod compose_text;
-mod compose_tables;
+mod compose_decorations;
+mod compose_document;
+mod compose_index;
 pub(crate) mod compose_navigation;
+mod compose_tables;
+mod compose_text;
 pub(crate) mod compose_viewport;
 mod popup_pointer;
 #[cfg(unix)]
 mod scene_bridge;
-#[cfg(unix)]
-pub use scene_bridge::SceneBridge;
+mod wire;
 use crate::config;
 use crate::config_io::DirectoryContext;
 use crate::model::filesystem::{FileSystem, StdFileSystem};
+#[cfg(unix)]
+pub use scene_bridge::SceneBridge;
 
 /// Default terminal size the bridge boots / resets to (cols, rows). One source
 /// so `run()`, the `/reset` route, and the daemon's pre-client grid (a browser
@@ -366,14 +366,22 @@ impl WireProbe {
     /// and payload, `None` for a frame with nothing new.
     pub fn next(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> Option<(u64, Vec<u8>)> {
         let source = &mut self.source;
-        let model = SceneModel::gather(editor, &mut source.renderer, cols, rows, SceneFor::App, &mut SceneTimes::default());
+        let model = SceneModel::gather(
+            editor,
+            &mut source.renderer,
+            cols,
+            rows,
+            SceneFor::App,
+            &mut SceneTimes::default(),
+        );
         let (seq, text) = source.clip.current(editor);
         let before = crate::alloc_stats::counts();
         let grid = self.grid.frame(model.buf);
         self.encoded.encode(&model, wire::Clipboard { seq, text });
         self.body.clear();
         let message = if self.seq == 0 {
-            self.client.write_hello(&mut self.body, &self.encoded, Some(&grid), None);
+            self.client
+                .write_hello(&mut self.body, &self.encoded, Some(&grid), None);
             Some(wire::kind::SERVER_HELLO)
         } else {
             self.client
@@ -1250,7 +1258,10 @@ impl MouseInput {
             kind,
             col: v.get("col").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
             row: v.get("row").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
-            n: v.get("n").and_then(|x| x.as_u64()).unwrap_or(1).clamp(1, 10) as u16,
+            n: v.get("n")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1)
+                .clamp(1, 10) as u16,
             count: v.get("count").and_then(|x| x.as_u64()).unwrap_or(1),
             modifiers,
         })
@@ -1448,7 +1459,11 @@ fn apply_kbedit(editor: &mut Editor, row: Option<u64>) {
 /// A client's wanted grid size after a resize to `cols` × `rows`, clamped as
 /// the HTTP `/resize` route clamps; `None` when it didn't change. A resize
 /// always sends both, but a partial one keeps the other from `current`.
-fn apply_resize_want(current: Option<(u16, u16)>, cols: Option<u64>, rows: Option<u64>) -> Option<(u16, u16)> {
+fn apply_resize_want(
+    current: Option<(u16, u16)>,
+    cols: Option<u64>,
+    rows: Option<u64>,
+) -> Option<(u16, u16)> {
     let cur = current.unwrap_or(DEFAULT_SIZE);
     let next = (
         cols.map_or(cur.0, |c| (c as u16).clamp(20, 400)),
@@ -2022,7 +2037,12 @@ impl SceneRenderer {
     /// the hardware-cursor cell. The cells are what a terminal shown this frame
     /// from scratch would hold (`as_drawn_from_scratch`), and a hidden cursor
     /// reads as the origin, as the per-frame `TestBackend` reported both.
-    fn render(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> (&Buffer, Option<(u16, u16)>) {
+    fn render(
+        &mut self,
+        editor: &mut Editor,
+        cols: u16,
+        rows: u16,
+    ) -> (&Buffer, Option<(u16, u16)>) {
         self.terminal.backend_mut().size = ratatui::layout::Size::new(cols, rows);
         if let Err(never) = self.terminal.autoresize() {
             match never {}
@@ -2354,8 +2374,20 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
 }
 
 /// The browser's scene, rendered with `renderer`.
-fn scene_json_with(editor: &mut Editor, renderer: &mut SceneRenderer, cols: u16, rows: u16) -> Value {
-    let model = SceneModel::gather(editor, renderer, cols, rows, SceneFor::Browser, &mut SceneTimes::default());
+fn scene_json_with(
+    editor: &mut Editor,
+    renderer: &mut SceneRenderer,
+    cols: u16,
+    rows: u16,
+) -> Value {
+    let model = SceneModel::gather(
+        editor,
+        renderer,
+        cols,
+        rows,
+        SceneFor::Browser,
+        &mut SceneTimes::default(),
+    );
     scene_json_value(&model)
 }
 
@@ -2646,7 +2678,12 @@ fn scene_json_value(model: &SceneModel<'_>) -> Value {
             // `cells` is the whole pane.
             let (content, gw) = (pane.content, pane.gutter_width);
             let gutter_rect = Rect::new(content.x, content.y, gw, content.height);
-            let text_rect = Rect::new(content.x + gw, content.y, content.width - gw, content.height);
+            let text_rect = Rect::new(
+                content.x + gw,
+                content.y,
+                content.width - gw,
+                content.height,
+            );
             let markers: Vec<Value> = pane
                 .markers
                 .iter()
@@ -2799,7 +2836,10 @@ fn apply_key(editor: &mut Editor, input: KeyInput<'_>) {
         "PageUp" => KeyCode::PageUp,
         "PageDown" => KeyCode::PageDown,
         "Insert" => KeyCode::Insert,
-        f if f.len() > 1 && f.starts_with('F') && f[1..].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n)) => {
+        f if f.len() > 1
+            && f.starts_with('F')
+            && f[1..].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n)) =>
+        {
             KeyCode::F(f[1..].parse().unwrap_or(1))
         }
         s if s.chars().count() == 1 => KeyCode::Char(s.chars().next().unwrap()),
@@ -2916,7 +2956,9 @@ fn super_chord_action(
         }
         // `resolve` falls back from the key context to Normal and Global, as
         // the editor's own dispatch does (Cmd+Shift+P is a Global binding).
-        let action = slot.as_ref().map(|(_, r)| r.resolve(&event, context.clone()))?;
+        let action = slot
+            .as_ref()
+            .map(|(_, r)| r.resolve(&event, context.clone()))?;
         (!matches!(action, Action::None | Action::InsertChar(_))).then_some(action)
     })
 }

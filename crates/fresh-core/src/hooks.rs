@@ -851,9 +851,19 @@ mod tests {
     #[test]
     fn compose_batch_correlation_is_not_exposed_to_javascript() {
         let value = hook_args_to_json(&HookArgs::LinesChanged {
-            buffer_id: crate::BufferId(3), lines: vec![], epoch: 7, is_composing_in_any_split: true,
-            compose_batch: Some(crate::api::LinesBatch { window_id: 11, buffer_id: crate::BufferId(3), buffer_epoch: 17, revision: 7, id: 19 }),
-        }).unwrap();
+            buffer_id: crate::BufferId(3),
+            lines: vec![],
+            epoch: 7,
+            is_composing_in_any_split: true,
+            compose_batch: Some(crate::api::LinesBatch {
+                window_id: 11,
+                buffer_id: crate::BufferId(3),
+                buffer_epoch: 17,
+                revision: 7,
+                id: 19,
+            }),
+        })
+        .unwrap();
         assert_eq!(value["buffer_id"], 3);
         assert_eq!(value["epoch"], 7);
         assert!(value.get("compose_batch").is_none());

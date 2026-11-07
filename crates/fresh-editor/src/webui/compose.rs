@@ -1791,7 +1791,12 @@ impl ComposeCache {
 
     /// Source/caret ownership without gathering or certifying a formatted
     /// projection. Only an already-current source index can supply the hash.
-    pub(crate) fn source_selection(&self, editor: &mut Editor, scope: &Scope, epoch: usize) -> Option<u64> {
+    pub(crate) fn source_selection(
+        &self,
+        editor: &mut Editor,
+        scope: &Scope,
+        epoch: usize,
+    ) -> Option<u64> {
         let context = format!("{:?}", editor.get_key_context());
         let window = editor.active_window();
         if window.id.0 != scope.window || window.pane_buffer(scope.leaf) != Some(scope.buffer) {
@@ -3359,7 +3364,9 @@ mod tests {
                 pane: pane.clone(),
                 cursors: Vec::new(),
                 preserved_cursors: Vec::new(),
-                anchors: Vec::new(), source_revision: None, source_length: None,
+                anchors: Vec::new(),
+                source_revision: None,
+                source_length: None,
             }),
             result: Some(EditReceipt {
                 window: 1,
@@ -3369,7 +3376,9 @@ mod tests {
                 pane,
                 cursors: Vec::new(),
                 preserved_cursors: Vec::new(),
-                anchors: Vec::new(), source_revision: None, source_length: None,
+                anchors: Vec::new(),
+                source_revision: None,
+                source_length: None,
             }),
             ..Default::default()
         };

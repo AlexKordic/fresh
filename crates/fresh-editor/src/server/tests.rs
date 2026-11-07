@@ -1683,10 +1683,10 @@ mod integration_tests {
     #[cfg(all(feature = "web", unix))]
     #[test]
     fn test_scene_socket_serves_fc_sessions() {
-        use crate::server::tests::scene_proto;
         use crate::config::Config;
         use crate::config_io::DirectoryContext;
         use crate::server::editor_server::{EditorServer, EditorServerConfig};
+        use crate::server::tests::scene_proto;
         use prost::Message;
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
@@ -1710,7 +1710,12 @@ mod integration_tests {
         fn try_scene(path: &std::path::Path) -> Option<scene_proto::Frame> {
             let mut stream = UnixStream::connect(path).ok()?;
             stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-            let hello = scene_proto::ClientHello { version: 1, telemetry: false, ..Default::default() }.encode_to_vec();
+            let hello = scene_proto::ClientHello {
+                version: 1,
+                telemetry: false,
+                ..Default::default()
+            }
+            .encode_to_vec();
             let mut message = vec![16, hello.len() as u8];
             message.extend_from_slice(&hello);
             stream.write_all(&message).ok()?;
@@ -1736,7 +1741,11 @@ mod integration_tests {
             }
         }
 
-        fn hello_as(socket_paths: &crate::server::ipc::SocketPaths, size: TermSize, control: bool) -> (ClientConnection, crate::server::protocol::ServerHello) {
+        fn hello_as(
+            socket_paths: &crate::server::ipc::SocketPaths,
+            size: TermSize,
+            control: bool,
+        ) -> (ClientConnection, crate::server::protocol::ServerHello) {
             let conn = ClientConnection::connect(socket_paths).expect("connect client");
             let mut hello = ClientHello::new(size);
             hello.fc_control = control;
@@ -1791,7 +1800,10 @@ mod integration_tests {
         // (1) Bound by the first handshake (which builds the editor, so a
         //     failed restore is still reported in place of the hello),
         //     owner-only, and named in that handshake.
-        assert!(!scene_path.exists(), "no scene socket before a client has built the editor");
+        assert!(
+            !scene_path.exists(),
+            "no scene socket before a client has built the editor"
+        );
         let (control, hello) = hello_as(&socket_paths, TermSize::new(50, 10), true);
         assert_eq!(
             hello.fc_scene.as_deref(),
@@ -1823,7 +1835,10 @@ mod integration_tests {
         shutdown_handle.store(true, Ordering::SeqCst);
         drop(server_handle.join());
         drop(socket_paths.cleanup());
-        assert!(!scene_path.exists(), "the scene socket goes away with the session");
+        assert!(
+            !scene_path.exists(),
+            "the scene socket goes away with the session"
+        );
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 }

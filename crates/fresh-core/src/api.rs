@@ -4575,7 +4575,10 @@ pub enum PluginCommand {
     /// Source decorations produced by a tracked hook belong to that window
     /// and buffer lifetime, even if focus changes before they are applied.
     #[ts(skip)]
-    ScopedCompose { batch: LinesBatch, command: Box<PluginCommand> },
+    ScopedCompose {
+        batch: LinesBatch,
+        command: Box<PluginCommand>,
+    },
 
     /// Set a line indicator in the gutter's indicator column
     /// Used for git gutter, breakpoints, bookmarks, etc.

@@ -24,8 +24,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 static NEXT_SCENE_CLIENT: AtomicU64 = AtomicU64::new(1);
 
@@ -66,8 +66,10 @@ fn native_output_accepts_a_valid_large_frame_but_still_bounds_a_stalled_client()
     let (kind, range, _) = wire::read_message(&client.outbuf).unwrap().unwrap();
     assert_eq!(kind, kind::FRAME);
     assert_eq!(range.len(), client.body.len());
-    assert!(client.flush().is_ok(),
-        "a valid native payload may exceed the browser's 8 MiB cap");
+    assert!(
+        client.flush().is_ok(),
+        "a valid native payload may exceed the browser's 8 MiB cap"
+    );
     client.outbuf.resize(client.out_start + OUTBUF_CAP + 1, 0);
     assert!(client.flush().is_err(), "an unread queue remains bounded");
 }
@@ -218,7 +220,9 @@ impl SceneBridge {
         out.frame_owed |= self.compose.poll(editor);
         let active = editor.active_session_id();
         for (&id, window) in &mut editor.windows {
-            if id != active { window.compose_readiness.retain_demands(&[]); }
+            if id != active {
+                window.compose_readiness.retain_demands(&[]);
+            }
             out.frame_owed |= window.compose_readiness.expire(Instant::now());
         }
         // Release payloads sent in the previous push before accepting the
@@ -267,21 +271,39 @@ impl SceneBridge {
             self.viewport_clients = live;
         }
         for client in &mut self.clients {
-            let obsolete: Vec<_> = client.asset_targets.iter().filter(|(_, target)| !target.current(editor)).map(|(id, _)| *id).collect();
+            let obsolete: Vec<_> = client
+                .asset_targets
+                .iter()
+                .filter(|(_, target)| !target.current(editor))
+                .map(|(id, _)| *id)
+                .collect();
             for id in obsolete {
                 self.assets.cancel(client.id, id);
                 client.asset_targets.remove(&id);
                 client.asset_transfers.retain(|transfer| transfer.id != id);
-                client.asset_transfers.push_back(super::compose_assets::Transfer::failure(id, "Image source or authority changed; retry the load"));
+                client
+                    .asset_transfers
+                    .push_back(super::compose_assets::Transfer::failure(
+                        id,
+                        "Image source or authority changed; retry the load",
+                    ));
             }
         }
         for (id, transfer) in self.assets.completed() {
             if let Some(client) = self.clients.iter_mut().find(|client| client.id == id) {
-                if client.asset_targets.contains_key(&transfer.id) { client.asset_transfers.push_back(transfer); }
+                if client.asset_targets.contains_key(&transfer.id) {
+                    client.asset_transfers.push_back(transfer);
+                }
             }
         }
-        out.frame_owed |= self.clients.iter().any(|client| !client.asset_transfers.is_empty() && client.ready());
-        out.frame_owed |= self.clients.iter().any(|client| client.document.wants_prepare(Instant::now()));
+        out.frame_owed |= self
+            .clients
+            .iter()
+            .any(|client| !client.asset_transfers.is_empty() && client.ready());
+        out.frame_owed |= self
+            .clients
+            .iter()
+            .any(|client| client.document.wants_prepare(Instant::now()));
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -289,8 +311,10 @@ impl SceneBridge {
                         continue;
                     }
                     tune(&stream);
-                    let mut client = SceneClient::new(NEXT_SCENE_CLIENT.fetch_add(1, Ordering::Relaxed), stream);
-                    client.document = super::compose_document::Session::new(self.document_budget.clone());
+                    let mut client =
+                        SceneClient::new(NEXT_SCENE_CLIENT.fetch_add(1, Ordering::Relaxed), stream);
+                    client.document =
+                        super::compose_document::Session::new(self.document_budget.clone());
                     self.clients.push(client);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -307,9 +331,16 @@ impl SceneBridge {
             editor.active_window_mut().menu_bar_visible = show;
             out.mutated = true;
         }
-        if !self.clients.iter().any(|client| client.greeted && client.rich_compose) {
+        if !self
+            .clients
+            .iter()
+            .any(|client| client.greeted && client.rich_compose)
+        {
             self.compose.clear();
-            for window in editor.windows.values_mut() { window.compose_regions.clear(); window.compose_readiness.clear(); }
+            for window in editor.windows.values_mut() {
+                window.compose_regions.clear();
+                window.compose_readiness.clear();
+            }
         }
         out
     }
@@ -319,7 +350,10 @@ impl SceneBridge {
     /// while an app is owed a frame it was held back from (it is behind);
     /// while none can take one, nothing is built.
     pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) -> bool {
-        super::compose_viewport::retain(editor, &self.clients.iter().map(|client| client.id).collect());
+        super::compose_viewport::retain(
+            editor,
+            &self.clients.iter().map(|client| client.id).collect(),
+        );
         let wants_hello = self.clients.iter().any(|c| c.greeted && !c.hello_sent);
         if !wants_hello && !self.clients.iter().any(|c| c.hello_sent && c.ready()) {
             for client in self.clients.iter_mut().filter(|c| c.hello_sent) {
@@ -331,14 +365,27 @@ impl SceneBridge {
         let started = Instant::now();
         let mut times = SceneTimes::default();
         let source = &mut self.source;
-        let mut model = SceneModel::gather(editor, &mut source.renderer, cols, rows, SceneFor::App, &mut times);
+        let mut model = SceneModel::gather(
+            editor,
+            &mut source.renderer,
+            cols,
+            rows,
+            SceneFor::App,
+            &mut times,
+        );
         let grid_started = Instant::now();
         let grid = self.grid.frame(model.buf);
         times.grid_ms = grid_started.elapsed().as_secs_f64() * 1000.0;
         let build_ms = started.elapsed().as_secs_f64() * 1000.0;
         let encode_started = Instant::now();
         let (clip_seq, clip_text) = source.clip.current(editor);
-        self.encoded.encode(&model, wire::Clipboard { seq: clip_seq, text: clip_text });
+        self.encoded.encode(
+            &model,
+            wire::Clipboard {
+                seq: clip_seq,
+                text: clip_text,
+            },
+        );
         let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let base = Timing {
             build_ms,
@@ -369,21 +416,44 @@ impl SceneBridge {
                         if let Some(buffer) = pane.buffer {
                             let leaf = fresh_core::LeafId(fresh_core::SplitId(pane.leaf));
                             let buffer = crate::model::event::BufferId(buffer);
-                            let viewport = super::compose_viewport::snapshot(editor, client.id, leaf, buffer);
+                            let viewport =
+                                super::compose_viewport::snapshot(editor, client.id, leaf, buffer);
                             let region = viewport.map(|v| v.requested_region());
-                            pane.compose = self.compose.gather_tables_with_context(editor, leaf, buffer, region, client.measured_tables, client.paragraph_windows, viewport.and_then(|v| v.context()));
-                            if let Some(compose) = &mut pane.compose { compose.viewport = viewport; }
+                            pane.compose = self.compose.gather_tables_with_context(
+                                editor,
+                                leaf,
+                                buffer,
+                                region,
+                                client.measured_tables,
+                                client.paragraph_windows,
+                                viewport.and_then(|v| v.context()),
+                            );
+                            if let Some(compose) = &mut pane.compose {
+                                compose.viewport = viewport;
+                            }
                             if let Some(compose) = &mut pane.compose {
                                 for table in &mut compose.tables {
-                                    let key = (model.window_id, pane.leaf as u64, compose.asset_document, table.start, table.end, table.measurement_id);
+                                    let key = (
+                                        model.window_id,
+                                        pane.leaf as u64,
+                                        compose.asset_document,
+                                        table.start,
+                                        table.end,
+                                        table.measurement_id,
+                                    );
                                     table_measurements.insert(key);
-                                    if client.table_measurements.contains(&key) { table.measurement = None; }
+                                    if client.table_measurements.contains(&key) {
+                                        table.measurement = None;
+                                    }
                                 }
                             }
                             if let Some(compose) = &pane.compose {
                                 for source in &compose.format_regions {
                                     compose_regions.push(crate::app::window::ComposeRegion {
-                                        leaf, buffer, revision: compose.buffer_revision, source: source.clone(),
+                                        leaf,
+                                        buffer,
+                                        revision: compose.buffer_revision,
+                                        source: source.clone(),
                                     });
                                 }
                             }
@@ -393,28 +463,70 @@ impl SceneBridge {
                 // A deferred motion can need source far from what this client
                 // is reading. Supply it in the reply for geometry, without
                 // replacing the visible viewport merely to measure a command.
-                if let Some(scope) = client.input_scope.or(client.pending_input_target.map(|target| target.scope)) {
+                if let Some(scope) = client
+                    .input_scope
+                    .or(client.pending_input_target.map(|target| target.scope))
+                {
                     if scope.window == model.window_id {
-                        let revision = editor.active_window().buffer_state(scope.buffer).map_or(0, |state| state.buffer.version());
-                        if let Some(region) = client.navigation.region(scope.window, scope.leaf, scope.buffer, revision) {
-                            let keep=client.navigation.context(&scope);
-                            let measurement = self.compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, Some(region), client.measured_tables, client.paragraph_windows, keep);
+                        let revision = editor
+                            .active_window()
+                            .buffer_state(scope.buffer)
+                            .map_or(0, |state| state.buffer.version());
+                        if let Some(region) = client.navigation.region(
+                            scope.window,
+                            scope.leaf,
+                            scope.buffer,
+                            revision,
+                        ) {
+                            let keep = client.navigation.context(&scope);
+                            let measurement = self.compose.gather_tables_with_context(
+                                editor,
+                                scope.leaf,
+                                scope.buffer,
+                                Some(region),
+                                client.measured_tables,
+                                client.paragraph_windows,
+                                keep,
+                            );
                             if let Some(compose) = &measurement {
                                 for source in &compose.format_regions {
-                                    compose_regions.push(crate::app::window::ComposeRegion { leaf: scope.leaf, buffer: scope.buffer,
-                                        revision: compose.buffer_revision, source: source.clone() });
+                                    compose_regions.push(crate::app::window::ComposeRegion {
+                                        leaf: scope.leaf,
+                                        buffer: scope.buffer,
+                                        revision: compose.buffer_revision,
+                                        source: source.clone(),
+                                    });
                                 }
                                 if let Some(target) = client.pending_input_target {
                                     let ready = compose.ready != Some(false);
-                                    let fingerprint = (target.id, compose.buffer_revision, compose.projection_revision, compose.selection_revision, ready);
-                                    if client.input_reply.is_none() && ready && client.last_measurement != Some(fingerprint) {
-                                        client.input_reply = Some(super::compose::InputReply { id: target.id, needs_layout: true, ..Default::default() });
+                                    let fingerprint = (
+                                        target.id,
+                                        compose.buffer_revision,
+                                        compose.projection_revision,
+                                        compose.selection_revision,
+                                        ready,
+                                    );
+                                    if client.input_reply.is_none()
+                                        && ready
+                                        && client.last_measurement != Some(fingerprint)
+                                    {
+                                        client.input_reply = Some(super::compose::InputReply {
+                                            id: target.id,
+                                            needs_layout: true,
+                                            ..Default::default()
+                                        });
                                     }
-                                    if let Some(reply) = client.input_reply.as_mut().filter(|reply| !reply.accepted && !reply.cancelled) {
+                                    if let Some(reply) = client
+                                        .input_reply
+                                        .as_mut()
+                                        .filter(|reply| !reply.accepted && !reply.cancelled)
+                                    {
                                         reply.compose = measurement;
                                         // A newly ready offscreen projection must retain the
                                         // requested focus. A later pixel request takes priority.
-                                        if reply.need_region.is_none() && reply.need_y.is_none() { reply.need_region = Some(region); }
+                                        if reply.need_region.is_none() && reply.need_y.is_none() {
+                                            reply.need_region = Some(region);
+                                        }
                                         client.last_measurement = Some(fingerprint);
                                     }
                                 }
@@ -422,8 +534,13 @@ impl SceneBridge {
                         }
                     }
                 }
-                compose_regions.extend(client.document.prepare(editor, &mut self.compose, client.id,
-                    client.measured_tables, client.paragraph_windows));
+                compose_regions.extend(client.document.prepare(
+                    editor,
+                    &mut self.compose,
+                    client.id,
+                    client.measured_tables,
+                    client.paragraph_windows,
+                ));
                 timing.build_ms += gather_started.elapsed().as_secs_f64() * 1000.0;
                 let encode_started = Instant::now();
                 // All panes and correlated replies share one tooltip budget.
@@ -442,9 +559,15 @@ impl SceneBridge {
                 rich_encoded.table_reference_hashes(&mut model);
                 timing.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
                 timing.cpu_ms = process_cpu_ms();
-                for pane in &mut model.panes { pane.compose = None; }
+                for pane in &mut model.panes {
+                    pane.compose = None;
+                }
             }
-            let encoded = if client.rich_compose { &rich_encoded } else { &self.encoded };
+            let encoded = if client.rich_compose {
+                &rich_encoded
+            } else {
+                &self.encoded
+            };
             let sent = if !client.hello_sent {
                 client.send_hello(encoded, &grid);
                 true
@@ -470,7 +593,7 @@ impl SceneBridge {
                     .collect();
             }
         }
-        compose_regions.sort_by_key(|r| (r.buffer.0, r.leaf.0.0, r.source.start, r.source.end));
+        compose_regions.sort_by_key(|r| (r.buffer.0, r.leaf.0 .0, r.source.start, r.source.end));
         compose_regions.dedup();
         let window = editor.active_window_mut();
         window.compose_readiness.retain_demands(&compose_regions);
@@ -539,7 +662,10 @@ fn tune(stream: &UnixStream) {
             )
         };
         if result != 0 {
-            eprintln!("[scene] socket buffer not raised: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "[scene] socket buffer not raised: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }
@@ -592,12 +718,18 @@ impl SceneClient {
     /// Whether a frame may go out: at most `FRAMES_AHEAD` unapplied, unless
     /// the app has said nothing for `APPLIED_TIMEOUT`.
     fn ready(&self) -> bool {
-        self.seq.saturating_sub(self.applied) < FRAMES_AHEAD || self.sent_at.elapsed() >= APPLIED_TIMEOUT
+        self.seq.saturating_sub(self.applied) < FRAMES_AHEAD
+            || self.sent_at.elapsed() >= APPLIED_TIMEOUT
     }
 
     /// Read what arrived and apply each whole message.
-    fn read(&mut self, editor: &mut Editor, out: &mut BridgePoll, compose: &mut super::compose::ComposeCache,
-        assets: &mut super::compose_assets::Service) -> Result<(), String> {
+    fn read(
+        &mut self,
+        editor: &mut Editor,
+        out: &mut BridgePoll,
+        compose: &mut super::compose::ComposeCache,
+        assets: &mut super::compose_assets::Service,
+    ) -> Result<(), String> {
         let mut tmp = [0u8; 16384];
         loop {
             match self.stream.read(&mut tmp) {
@@ -698,7 +830,12 @@ impl SceneClient {
     fn cancel_input(&mut self, id: u64, error: &str) {
         self.navigation.clear();
         self.input_scope = None;
-        self.finish_input(super::compose::InputReply { id, cancelled: true, error: error.into(), ..Default::default() });
+        self.finish_input(super::compose::InputReply {
+            id,
+            cancelled: true,
+            error: error.into(),
+            ..Default::default()
+        });
     }
 
     fn apply_popup_pointer(&mut self, payload: &[u8], editor: &mut Editor) -> Result<bool, String> {
@@ -751,14 +888,21 @@ impl SceneClient {
                 }
             }
             if version != u64::from(wire::VERSION) {
-                return Err(format!("scene protocol {version}, expected {}", wire::VERSION));
+                return Err(format!(
+                    "scene protocol {version}, expected {}",
+                    wire::VERSION
+                ));
             }
             self.greeted = true;
             self.telemetry = telemetry;
             self.rich_compose = rich_compose;
-            if measured_tables && !rich_compose { return Err("measured tables require rich_compose".into()); }
+            if measured_tables && !rich_compose {
+                return Err("measured tables require rich_compose".into());
+            }
             self.measured_tables = measured_tables;
-            if paragraph_windows && !rich_compose { return Err("paragraph windows require rich_compose".into()); }
+            if paragraph_windows && !rich_compose {
+                return Err("paragraph windows require rich_compose".into());
+            }
             self.paragraph_windows = paragraph_windows;
             if native_popup_projection && !rich_compose {
                 return Err("native popup projection requires rich_compose".into());
@@ -769,76 +913,164 @@ impl SceneClient {
         }
         match k {
             kind::COMPOSE_VIEWPORT_REQUEST => {
-                if !self.rich_compose || !self.hello_sent { return Err("viewport requests require a rich scene hello".into()); }
-                if self.viewport_reply.is_some() { return Err("viewport requests must wait for their reply".into()); }
+                if !self.rich_compose || !self.hello_sent {
+                    return Err("viewport requests require a rich scene hello".into());
+                }
+                if self.viewport_reply.is_some() {
+                    return Err("viewport requests must wait for their reply".into());
+                }
                 let request = super::compose_viewport::Request::parse(payload)?;
-                let reply = if let Some(previous) = self.last_viewport_reply.filter(|reply| reply.id == request.id) {
+                let reply = if let Some(previous) = self
+                    .last_viewport_reply
+                    .filter(|reply| reply.id == request.id)
+                {
                     previous
                 } else {
-                    if self.last_viewport_reply.is_some_and(|reply| reply.id > request.id) { return Err("viewport request ids must increase".into()); }
-                    super::compose_viewport::Reply { id: request.id, accepted: super::compose_viewport::update(editor, self.id, &request) }
+                    if self
+                        .last_viewport_reply
+                        .is_some_and(|reply| reply.id > request.id)
+                    {
+                        return Err("viewport request ids must increase".into());
+                    }
+                    super::compose_viewport::Reply {
+                        id: request.id,
+                        accepted: super::compose_viewport::update(editor, self.id, &request),
+                    }
                 };
                 self.last_viewport_reply = Some(reply);
                 self.viewport_reply = Some(reply);
                 out.frame_owed = true;
             }
             kind::COMPOSE_ASSET => {
-                if !self.rich_compose { return Err("image requests require rich_compose in hello".into()); }
+                if !self.rich_compose {
+                    return Err("image requests require rich_compose in hello".into());
+                }
                 let request = super::compose_assets::Request::parse(payload).map_err(w)?;
                 if request.cancel {
                     assets.cancel(self.id, request.id);
-                    self.asset_transfers.retain(|transfer| transfer.id != request.id);
+                    self.asset_transfers
+                        .retain(|transfer| transfer.id != request.id);
                     self.asset_targets.remove(&request.id);
                     return Ok(());
                 }
-                if request.id <= self.last_asset { return Err("image request ids must increase".into()); }
+                if request.id <= self.last_asset {
+                    return Err("image request ids must increase".into());
+                }
                 self.last_asset = request.id;
-                if self.asset_transfers.len() >= 16 { return Err("too many pending image replies".into()); }
+                if self.asset_transfers.len() >= 16 {
+                    return Err("too many pending image replies".into());
+                }
                 let mut resolution_retryable = false;
                 let resolved = (|| {
-                    let scope = request.scope.as_ref().ok_or("image request requires a document")?;
-                    if scope.window != editor.active_window().id.0 || editor.active_window().pane_buffer(scope.leaf) != Some(scope.buffer) {
+                    let scope = request
+                        .scope
+                        .as_ref()
+                        .ok_or("image request requires a document")?;
+                    if scope.window != editor.active_window().id.0
+                        || editor.active_window().pane_buffer(scope.leaf) != Some(scope.buffer)
+                    {
                         return Err("image document is no longer displayed".to_string());
                     }
-                    let viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
+                    let viewport = super::compose_viewport::snapshot(
+                        editor,
+                        self.id,
+                        scope.leaf,
+                        scope.buffer,
+                    );
                     let region = viewport.map(|v| v.requested_region());
                     let navigation = self.navigation.context(scope);
                     let keep = match (navigation, viewport.and_then(|v| v.context())) {
                         (Some(a), Some(b)) => Some(a.start.min(b.start)..a.end.max(b.end)),
                         (a, b) => a.or(b),
                     };
-                    let pane = compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.paragraph_windows, keep).ok_or("image document is not composing")?;
+                    let pane = compose
+                        .gather_tables_with_context(
+                            editor,
+                            scope.leaf,
+                            scope.buffer,
+                            region,
+                            self.measured_tables,
+                            self.paragraph_windows,
+                            keep,
+                        )
+                        .ok_or("image document is not composing")?;
                     resolution_retryable = true;
-                    if pane.buffer_revision != scope.revision { return Err("image source changed; request its current annotation".into()); }
-                    if pane.asset_authority != request.authority { return Err("image filesystem authority changed".into()); }
-                    if pane.asset_document != request.document { return Err("image document path changed".into()); }
-                    if compose.parsing_pending(scope.window, scope.buffer.0) { return Err("image metadata is being parsed; retry its current annotation".into()); }
-                    let image = pane.images.iter().find(|image| image.start == request.start && image.end == request.end)
+                    if pane.buffer_revision != scope.revision {
+                        return Err("image source changed; request its current annotation".into());
+                    }
+                    if pane.asset_authority != request.authority {
+                        return Err("image filesystem authority changed".into());
+                    }
+                    if pane.asset_document != request.document {
+                        return Err("image document path changed".into());
+                    }
+                    if compose.parsing_pending(scope.window, scope.buffer.0) {
+                        return Err(
+                            "image metadata is being parsed; retry its current annotation".into(),
+                        );
+                    }
+                    let image = pane
+                        .images
+                        .iter()
+                        .find(|image| image.start == request.start && image.end == request.end)
                         .ok_or("image annotation is no longer in this source region")?;
                     resolution_retryable = false;
                     let window = editor.active_window();
-                    let document = window.buffer_state(scope.buffer).and_then(|s| s.buffer.file_path()).ok_or("save the document before loading relative images")?;
+                    let document = window
+                        .buffer_state(scope.buffer)
+                        .and_then(|s| s.buffer.file_path())
+                        .ok_or("save the document before loading relative images")?;
                     let path = super::compose_assets::resolve(document, &image.target)?;
-                    Ok((super::compose_assets::Target { scope: *scope, fs: window.authority().filesystem.clone(), document: document.to_path_buf(), instance: window.buffer_state(scope.buffer).unwrap().marker_list.instance_id() }, path))
+                    Ok((
+                        super::compose_assets::Target {
+                            scope: *scope,
+                            fs: window.authority().filesystem.clone(),
+                            document: document.to_path_buf(),
+                            instance: window
+                                .buffer_state(scope.buffer)
+                                .unwrap()
+                                .marker_list
+                                .instance_id(),
+                        },
+                        path,
+                    ))
                 })();
-                let result = resolved.map_err(|error| (error, resolution_retryable)).and_then(|(target, path)| {
-                    assets.submit(self.id, request.id, target.fs.clone(), path, request.conditional)
-                        .map_err(|error| (error, true))?;
-                    self.asset_targets.insert(request.id, target);
-                    Ok(())
-                });
+                let result = resolved
+                    .map_err(|error| (error, resolution_retryable))
+                    .and_then(|(target, path)| {
+                        assets
+                            .submit(
+                                self.id,
+                                request.id,
+                                target.fs.clone(),
+                                path,
+                                request.conditional,
+                            )
+                            .map_err(|error| (error, true))?;
+                        self.asset_targets.insert(request.id, target);
+                        Ok(())
+                    });
                 if let Err((error, retryable)) = result {
-                    self.asset_transfers.push_back(if retryable { super::compose_assets::Transfer::retryable_failure(request.id, error) }
-                        else { super::compose_assets::Transfer::failure(request.id, error) });
+                    self.asset_transfers.push_back(if retryable {
+                        super::compose_assets::Transfer::retryable_failure(request.id, error)
+                    } else {
+                        super::compose_assets::Transfer::failure(request.id, error)
+                    });
                     out.frame_owed = true;
                 }
             }
             kind::COMPOSE_INPUT => {
-                if !self.rich_compose { return Err("rich input requires rich_compose in hello".into()); }
+                if !self.rich_compose {
+                    return Err("rich input requires rich_compose in hello".into());
+                }
                 let mut input = super::compose::Input::parse(payload).map_err(w)?;
                 self.input_scope = input.scope;
-                if input.id == 0 { return Err("rich input has no request id".into()); }
-                if input.id > self.last_input.saturating_add(1) { return Err("rich input request ids must be sequential".into()); }
+                if input.id == 0 {
+                    return Err("rich input has no request id".into());
+                }
+                if input.id > self.last_input.saturating_add(1) {
+                    return Err("rich input request ids must be sequential".into());
+                }
                 if let Some(reply) = &self.input_reply {
                     // A terminal cancellation can race a legal retry of the
                     // earlier needs-layout reply. Keep the terminal outcome;
@@ -850,25 +1082,53 @@ impl SceneClient {
                     return Err("rich inputs must wait for their reply".into());
                 }
                 if input.id <= self.last_input {
-                    self.input_reply = Some(self.last_input_reply.as_ref().filter(|reply| reply.id == input.id).cloned()
-                        .unwrap_or(super::compose::InputReply { id: input.id, accepted: true, ..Default::default() }));
+                    self.input_reply = Some(
+                        self.last_input_reply
+                            .as_ref()
+                            .filter(|reply| reply.id == input.id)
+                            .cloned()
+                            .unwrap_or(super::compose::InputReply {
+                                id: input.id,
+                                accepted: true,
+                                ..Default::default()
+                            }),
+                    );
                     out.frame_owed = true;
                     return Ok(());
                 }
                 if input.cancel {
-                    self.cancel_input(input.id, "The pending editor action was cancelled because its file or view changed.");
+                    self.cancel_input(
+                        input.id,
+                        "The pending editor action was cancelled because its file or view changed.",
+                    );
                     out.frame_owed = true;
                     return Ok(());
                 }
                 self.pending_input_target = input.scope.map(|scope| {
-                    let epoch = if input.buffer_epoch != 0 { input.buffer_epoch } else {
-                        editor.windows.get(&fresh_core::WindowId(scope.window)).and_then(|window| window.buffer_state(scope.buffer))
+                    let epoch = if input.buffer_epoch != 0 {
+                        input.buffer_epoch
+                    } else {
+                        editor
+                            .windows
+                            .get(&fresh_core::WindowId(scope.window))
+                            .and_then(|window| window.buffer_state(scope.buffer))
                             .map_or(0, |state| state.marker_list.instance_id())
                     };
-                    super::compose::InputTarget { id: input.id, scope, epoch, pointer: input.position.is_some() }
+                    super::compose::InputTarget {
+                        id: input.id,
+                        scope,
+                        epoch,
+                        pointer: input.position.is_some(),
+                    }
                 });
-                if self.pending_input_target.is_some_and(|target| !target.valid(editor)) {
-                    self.cancel_input(input.id, "The pending editor action was cancelled because its file or view changed.");
+                if self
+                    .pending_input_target
+                    .is_some_and(|target| !target.valid(editor))
+                {
+                    self.cancel_input(
+                        input.id,
+                        "The pending editor action was cancelled because its file or view changed.",
+                    );
                     out.frame_owed = true;
                     return Ok(());
                 }
@@ -898,14 +1158,23 @@ impl SceneClient {
                 }
                 if !input.selection_targets.is_empty() {
                     if !super::compose::document_keyboard(editor) {
-                        self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                        self.finish_input(super::compose::InputReply {
+                            id: input.id,
+                            needs_layout: true,
+                            ..Default::default()
+                        });
                     } else {
                         match input.select(editor) {
                             Ok(()) => {
                                 out.mutated = true;
                                 self.navigation.clear();
                                 let result = self.input_result(editor, compose, &input);
-                                self.finish_input(super::compose::InputReply { id: input.id, accepted: true, result, ..Default::default() });
+                                self.finish_input(super::compose::InputReply {
+                                    id: input.id,
+                                    accepted: true,
+                                    result,
+                                    ..Default::default()
+                                });
                             }
                             Err(error) => self.cancel_input(input.id, &error),
                         }
@@ -915,13 +1184,28 @@ impl SceneClient {
                 }
                 if input.replacement.is_some() || input.text_input {
                     if !super::compose::document_keyboard(editor) {
-                        self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                        self.finish_input(super::compose::InputReply {
+                            id: input.id,
+                            needs_layout: true,
+                            ..Default::default()
+                        });
                         out.frame_owed = true;
                         return Ok(());
                     }
                     let cursors = if input.replacement.is_some() {
-                        input.replacement_cursor.into_iter().chain(input.replacements.iter().map(|r| r.cursor)).collect()
-                    } else { editor.active_window().active_cursors().iter().map(|(id, _)| id.0).collect::<Vec<_>>() };
+                        input
+                            .replacement_cursor
+                            .into_iter()
+                            .chain(input.replacements.iter().map(|r| r.cursor))
+                            .collect()
+                    } else {
+                        editor
+                            .active_window()
+                            .active_cursors()
+                            .iter()
+                            .map(|(id, _)| id.0)
+                            .collect::<Vec<_>>()
+                    };
                     let preserved_cursors = input.preserved_cursors(editor);
                     let result = input.replace(editor);
                     match result {
@@ -929,19 +1213,60 @@ impl SceneClient {
                             out.mutated = true;
                             self.navigation.clear();
                             let edit = input.scope.and_then(|scope| {
-                                let epoch = editor.active_window().buffer_state(scope.buffer)?.marker_list.instance_id();
-                                let position = editor.active_window().active_cursors().primary().position;
-                                let mut pane = compose.gather_tables_at(editor, scope.leaf, scope.buffer, Some(position), self.measured_tables, self.paragraph_windows)?;
-                                pane.viewport = super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer);
-                                if let Some(viewport) = &pane.viewport { pane.top_byte = viewport.position; }
+                                let epoch = editor
+                                    .active_window()
+                                    .buffer_state(scope.buffer)?
+                                    .marker_list
+                                    .instance_id();
+                                let position =
+                                    editor.active_window().active_cursors().primary().position;
+                                let mut pane = compose.gather_tables_at(
+                                    editor,
+                                    scope.leaf,
+                                    scope.buffer,
+                                    Some(position),
+                                    self.measured_tables,
+                                    self.paragraph_windows,
+                                )?;
+                                pane.viewport = super::compose_viewport::snapshot(
+                                    editor,
+                                    self.id,
+                                    scope.leaf,
+                                    scope.buffer,
+                                );
+                                if let Some(viewport) = &pane.viewport {
+                                    pane.top_byte = viewport.position;
+                                }
                                 // Gathering formatter metadata cannot relabel
                                 // an older edit proof with a newer source.
-                                let proof = proof.filter(|proof| proof.result_revision == pane.buffer_revision && proof.result_length == pane.document_len);
-                                let (anchors, source_revision, source_length) = proof.map(|proof| (proof.anchors, Some(proof.revision), Some(proof.length)))
+                                let proof = proof.filter(|proof| {
+                                    proof.result_revision == pane.buffer_revision
+                                        && proof.result_length == pane.document_len
+                                });
+                                let (anchors, source_revision, source_length) = proof
+                                    .map(|proof| {
+                                        (proof.anchors, Some(proof.revision), Some(proof.length))
+                                    })
                                     .unwrap_or_default();
-                                Some(super::compose::EditReceipt { window: scope.window, leaf: scope.leaf.0.0, buffer: scope.buffer.0, epoch, pane, cursors, preserved_cursors, anchors, source_revision, source_length })
+                                Some(super::compose::EditReceipt {
+                                    window: scope.window,
+                                    leaf: scope.leaf.0 .0,
+                                    buffer: scope.buffer.0,
+                                    epoch,
+                                    pane,
+                                    cursors,
+                                    preserved_cursors,
+                                    anchors,
+                                    source_revision,
+                                    source_length,
+                                })
                             });
-                            self.finish_input(super::compose::InputReply { id: input.id, accepted: true, edit, ..Default::default() });
+                            self.finish_input(super::compose::InputReply {
+                                id: input.id,
+                                accepted: true,
+                                edit,
+                                ..Default::default()
+                            });
                         }
                         Err(error) => self.cancel_input(input.id, &error),
                     }
@@ -955,11 +1280,24 @@ impl SceneClient {
                             self.navigation.clear();
                             let carets = self.navigation.pointer(editor, &input);
                             let result = self.input_result(editor, compose, &input);
-                            self.finish_input(super::compose::InputReply { id: input.id, accepted: true, carets, result, ..Default::default() });
+                            self.finish_input(super::compose::InputReply {
+                                id: input.id,
+                                accepted: true,
+                                carets,
+                                result,
+                                ..Default::default()
+                            });
                         }
-                        Ok(super::compose::PointerState::Ready) => self.cancel_input(input.id, "The clicked file is no longer available. Click again."),
+                        Ok(super::compose::PointerState::Ready) => self.cancel_input(
+                            input.id,
+                            "The clicked file is no longer available. Click again.",
+                        ),
                         Ok(super::compose::PointerState::Pending) => {
-                            self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                            self.finish_input(super::compose::InputReply {
+                                id: input.id,
+                                needs_layout: true,
+                                ..Default::default()
+                            });
                         }
                         Err(error) => self.cancel_input(input.id, &error),
                     }
@@ -967,7 +1305,11 @@ impl SceneClient {
                     return Ok(());
                 }
                 if input.scope.is_some() && !super::compose::document_keyboard(editor) {
-                    self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                    self.finish_input(super::compose::InputReply {
+                        id: input.id,
+                        needs_layout: true,
+                        ..Default::default()
+                    });
                     out.frame_owed = true;
                     return Ok(());
                 }
@@ -975,22 +1317,38 @@ impl SceneClient {
                 // on Markdown decoration readiness or a pixel layout. Retain
                 // the normal path for stale source, navigation and retries of
                 // an already deferred measured action.
-                if input.kind == kind::ACTION && input.position.is_none() && input.region.is_none()
-                    && input.source_revision.is_none() && self.navigation.pending_action(input.id).is_none()
+                if input.kind == kind::ACTION
+                    && input.position.is_none()
+                    && input.region.is_none()
+                    && input.source_revision.is_none()
+                    && self.navigation.pending_action(input.id).is_none()
                 {
-                    if let (Some(scope), Some(_), Some(target)) =
-                        (input.scope, source_action(input.payload).map_err(w)?, self.pending_input_target)
-                    {
-                        if compose.source_selection(editor, &scope, target.epoch) == Some(scope.selection) {
+                    if let (Some(scope), Some(_), Some(target)) = (
+                        input.scope,
+                        source_action(input.payload).map_err(w)?,
+                        self.pending_input_target,
+                    ) {
+                        if compose.source_selection(editor, &scope, target.epoch)
+                            == Some(scope.selection)
+                        {
                             editor.focus_split(scope.leaf, scope.buffer);
                             self.navigation.begin_source_action(editor, &input)?;
-                            let applied = self.handle(kind::ACTION, input.payload, editor, out, compose, assets);
+                            let applied = self.handle(
+                                kind::ACTION,
+                                input.payload,
+                                editor,
+                                out,
+                                compose,
+                                assets,
+                            );
                             // Always finish, including an invalid argument payload.
                             // This retains valid affinity/goals and prunes changed
                             // source memory exactly as an ordinary scoped action.
                             let mut reply = self.navigation.finish(editor, &input);
                             applied?;
-                            if reply.accepted { reply.result = self.input_result(editor, compose, &input); }
+                            if reply.accepted {
+                                reply.result = self.input_result(editor, compose, &input);
+                            }
                             self.finish_input(reply);
                             out.frame_owed = true;
                             return Ok(());
@@ -999,31 +1357,86 @@ impl SceneClient {
                 }
                 let mut accepted = false;
                 let current = input.scope.as_ref().and_then(|scope| {
-                    let viewport = (scope.window == editor.active_window().id.0).then(|| super::compose_viewport::snapshot(editor, self.id, scope.leaf, scope.buffer)).flatten();
-                    let navigation = self.navigation.region(scope.window, scope.leaf, scope.buffer, scope.revision);
+                    let viewport = (scope.window == editor.active_window().id.0)
+                        .then(|| {
+                            super::compose_viewport::snapshot(
+                                editor,
+                                self.id,
+                                scope.leaf,
+                                scope.buffer,
+                            )
+                        })
+                        .flatten();
+                    let navigation = self.navigation.region(
+                        scope.window,
+                        scope.leaf,
+                        scope.buffer,
+                        scope.revision,
+                    );
                     let region = navigation.or(viewport.map(|v| v.requested_region()));
-                    let keep = self.navigation.context(scope).or_else(|| if navigation.is_none() { viewport.and_then(|v| v.context()) } else { None });
-                    compose.gather_tables_with_context(editor, scope.leaf, scope.buffer, region, self.measured_tables, self.paragraph_windows, keep)
+                    let keep = self.navigation.context(scope).or_else(|| {
+                        if navigation.is_none() {
+                            viewport.and_then(|v| v.context())
+                        } else {
+                            None
+                        }
+                    });
+                    compose.gather_tables_with_context(
+                        editor,
+                        scope.leaf,
+                        scope.buffer,
+                        region,
+                        self.measured_tables,
+                        self.paragraph_windows,
+                        keep,
+                    )
                 });
-                if current.as_ref().is_some_and(|pane| pane.ready == Some(false) && !pane.current_projection) {
-                    self.finish_input(super::compose::InputReply { id: input.id, needs_layout: true, ..Default::default() });
+                if current
+                    .as_ref()
+                    .is_some_and(|pane| pane.ready == Some(false) && !pane.current_projection)
+                {
+                    self.finish_input(super::compose::InputReply {
+                        id: input.id,
+                        needs_layout: true,
+                        ..Default::default()
+                    });
                     out.frame_owed = true;
                     return Ok(());
                 }
-                let snapshot = current.filter(|pane| input.scope.as_ref().is_some_and(|scope| scope.matches(editor, pane)));
-                if snapshot.is_none() && input.scope.is_some_and(|scope| compose.gather_at(editor, scope.leaf, scope.buffer, None).is_none()) {
-                    self.cancel_input(input.id, "Rich Compose is no longer available in this view. Retry your action.");
+                let snapshot = current.filter(|pane| {
+                    input
+                        .scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.matches(editor, pane))
+                });
+                if snapshot.is_none()
+                    && input.scope.is_some_and(|scope| {
+                        compose
+                            .gather_at(editor, scope.leaf, scope.buffer, None)
+                            .is_none()
+                    })
+                {
+                    self.cancel_input(
+                        input.id,
+                        "Rich Compose is no longer available in this view. Retry your action.",
+                    );
                     out.frame_owed = true;
                     return Ok(());
                 }
                 // A completed parser/formatter can replace the projection
                 // between capture and dispatch without changing its source.
                 // An obsolete scope must request a new layout explicitly.
-                let mut reply = super::compose::InputReply { id: input.id, accepted,
-                    needs_layout: input.scope.is_some() && snapshot.is_none(), ..Default::default() };
+                let mut reply = super::compose::InputReply {
+                    id: input.id,
+                    accepted,
+                    needs_layout: input.scope.is_some() && snapshot.is_none(),
+                    ..Default::default()
+                };
                 if !accepted && (input.scope.is_none() || snapshot.is_some()) {
                     if let (Some(scope), Some(region)) = (&input.scope, input.region) {
-                        if region > snapshot.as_ref().unwrap().document_len { return Err("source region is outside the document".into()); }
+                        if region > snapshot.as_ref().unwrap().document_len {
+                            return Err("source region is outside the document".into());
+                        }
                         self.navigation.request_region(scope, region);
                         reply.needs_layout = true;
                         self.finish_input(reply);
@@ -1032,21 +1445,35 @@ impl SceneClient {
                     }
                     if input.position.is_some() {
                         if let Some(start) = input.attachment_start {
-                            if input.extend || !snapshot.as_ref().is_some_and(|pane| pane.images.iter().any(|image| (image.rendered || image.source_preview) && image.start == start && Some(image.end) == input.position)) {
-                                return Err("image selection does not match its source annotation".into());
+                            if input.extend
+                                || !snapshot.as_ref().is_some_and(|pane| {
+                                    pane.images.iter().any(|image| {
+                                        (image.rendered || image.source_preview)
+                                            && image.start == start
+                                            && Some(image.end) == input.position
+                                    })
+                                })
+                            {
+                                return Err(
+                                    "image selection does not match its source annotation".into()
+                                );
                             }
                         }
                         accepted = input.pointer(editor);
                         out.mutated |= accepted;
-                        if accepted { reply.carets = self.navigation.pointer(editor, &input); }
+                        if accepted {
+                            reply.carets = self.navigation.pointer(editor, &input);
+                        }
                     } else if (kind::KEY..=kind::KB_EDIT_CLICK).contains(&input.kind) {
                         if let Some(scope) = &input.scope {
                             editor.focus_split(scope.leaf, scope.buffer);
-                            self.navigation.begin(editor, &input, snapshot.as_ref().unwrap())?;
+                            self.navigation
+                                .begin(editor, &input, snapshot.as_ref().unwrap())?;
                         } else {
                             self.navigation.clear();
                         }
-                        let applied = if let Some(action) = self.navigation.pending_action(input.id) {
+                        let applied = if let Some(action) = self.navigation.pending_action(input.id)
+                        {
                             out.mutated = true;
                             editor.handle_action(action).map_err(|e| e.to_string())
                         } else {
@@ -1063,7 +1490,9 @@ impl SceneClient {
                     }
                 }
                 reply.accepted = accepted;
-                if accepted { reply.result = self.input_result(editor, compose, &input); }
+                if accepted {
+                    reply.result = self.input_result(editor, compose, &input);
+                }
                 self.finish_input(reply);
                 out.frame_owed = true;
             }
@@ -1192,11 +1621,15 @@ impl SceneClient {
                 if !self.rich_compose {
                     return Err("document navigation requires rich_compose in hello".into());
                 }
-                self.index.handle(super::compose_index::Request::parse(payload).map_err(w)?);
+                self.index
+                    .handle(super::compose_index::Request::parse(payload).map_err(w)?);
             }
             kind::COMPOSE_DOCUMENT_REQUEST => {
-                if !self.rich_compose { return Err("complete document reading requires rich_compose in hello".into()); }
-                self.document.handle(super::compose_document::Request::parse(payload).map_err(w)?);
+                if !self.rich_compose {
+                    return Err("complete document reading requires rich_compose in hello".into());
+                }
+                self.document
+                    .handle(super::compose_document::Request::parse(payload).map_err(w)?);
             }
             kind::APPLIED => {
                 for f in Reader::new(payload) {
@@ -1216,7 +1649,8 @@ impl SceneClient {
 
     fn send_hello(&mut self, scene: &EncodedScene, grid: &GridFrame<'_>) {
         self.body.clear();
-        self.scene.write_hello(&mut self.body, scene, Some(grid), None);
+        self.scene
+            .write_hello(&mut self.body, scene, Some(grid), None);
         self.queue(kind::SERVER_HELLO);
         self.hello_sent = true;
         self.seq = 0;
@@ -1227,8 +1661,14 @@ impl SceneClient {
     fn send_frame(&mut self, scene: &EncodedScene, grid: &GridFrame<'_>, base: Timing) {
         let started = Instant::now();
         self.body.clear();
-        let changed = self.scene.write_frame(&mut self.body, self.seq + 1, scene, Some(grid), None);
-        if !changed && self.input_reply.is_none() && self.viewport_reply.is_none() && self.asset_transfers.is_empty() {
+        let changed = self
+            .scene
+            .write_frame(&mut self.body, self.seq + 1, scene, Some(grid), None);
+        if !changed
+            && self.input_reply.is_none()
+            && self.viewport_reply.is_none()
+            && self.asset_transfers.is_empty()
+        {
             return;
         }
         if let Some(transfer) = self.asset_transfers.front_mut() {
@@ -1243,7 +1683,9 @@ impl SceneClient {
             wire::field::msg(&mut self.body, 24, &reply);
             self.input_scope = None;
         }
-        if let Some(reply) = self.viewport_reply.take() { wire::field::msg(&mut self.body, 26, &reply); }
+        if let Some(reply) = self.viewport_reply.take() {
+            wire::field::msg(&mut self.body, 26, &reply);
+        }
         if self.telemetry {
             // Timing goes last, so it can say how long writing this frame took.
             let timing = Timing {
@@ -1307,7 +1749,9 @@ impl SceneClient {
 fn source_action(payload: &[u8]) -> Result<Option<&str>, WireError> {
     let mut name = "";
     for field in Reader::new(payload) {
-        if let (1, value) = field? { name = value.text()?; }
+        if let (1, value) = field? {
+            name = value.text()?;
+        }
     }
     Ok(matches!(name, "save" | "undo" | "redo").then_some(name))
 }

@@ -76,7 +76,8 @@ impl Request {
                     }
                 }
                 (8, Field::Varint(region)) => {
-                    value.region = Some(usize::try_from(region).map_err(|_| "viewport region is too large")?);
+                    value.region =
+                        Some(usize::try_from(region).map_err(|_| "viewport region is too large")?);
                 }
                 (8, _) => return Err("viewport region must be a source byte".into()),
                 _ => {}
@@ -158,7 +159,9 @@ impl Registry {
         if reset {
             if entry.instance == instance {
                 state.marker_list.delete(entry.marker);
-                if let Some(marker) = entry.region_marker { state.marker_list.delete(marker); }
+                if let Some(marker) = entry.region_marker {
+                    state.marker_list.delete(marker);
+                }
             }
             entry.region_marker = None;
             let top = boundary(state, top.min(state.buffer.len()));
@@ -174,9 +177,13 @@ impl Registry {
             .marker_list
             .get_position(entry.marker)?
             .min(state.buffer.len());
-        entry.value.region = entry.region_marker.and_then(|marker| state.marker_list.get_position(marker))
+        entry.value.region = entry
+            .region_marker
+            .and_then(|marker| state.marker_list.get_position(marker))
             .map(|position| position.min(state.buffer.len()));
-        if entry.value.region.is_none() { entry.region_marker = None; }
+        if entry.value.region.is_none() {
+            entry.region_marker = None;
+        }
         entry.revision = revision;
         Some(entry.value)
     }
@@ -209,7 +216,10 @@ impl Registry {
         // Native source coordinates are signed machine integers. Reject
         // unrepresentable hints before replaying positive edit deltas.
         if request.value.position > isize::MAX as usize
-            || request.value.region.is_some_and(|region| region > isize::MAX as usize)
+            || request
+                .value
+                .region
+                .is_some_and(|region| region > isize::MAX as usize)
         {
             return false;
         }
@@ -229,8 +239,16 @@ impl Registry {
         let region = match request.value.region {
             None => None,
             Some(region) => {
-                let Some(region) = state.coord_map.map_with_gravity(region, request.scope.revision, true) else { return false; };
-                if region > state.buffer.len() { return false; }
+                let Some(region) =
+                    state
+                        .coord_map
+                        .map_with_gravity(region, request.scope.revision, true)
+                else {
+                    return false;
+                };
+                if region > state.buffer.len() {
+                    return false;
+                }
                 Some(boundary(state, region))
             }
         };
@@ -238,8 +256,11 @@ impl Registry {
         if !state.marker_list.set_position(entry.marker, position) {
             return false;
         }
-        if let Some(marker) = entry.region_marker.take() { state.marker_list.delete(marker); }
-        entry.region_marker = region.map(|position| state.marker_list.create_left_gravity(position));
+        if let Some(marker) = entry.region_marker.take() {
+            state.marker_list.delete(marker);
+        }
+        entry.region_marker =
+            region.map(|position| state.marker_list.create_left_gravity(position));
         entry.value = Value {
             position,
             region,
@@ -261,7 +282,9 @@ impl Registry {
                 if let Some(state) = window.buffers.get_mut(&key.buffer) {
                     if state.marker_list.instance_id() == entry.instance {
                         state.marker_list.delete(entry.marker);
-                        if let Some(marker) = entry.region_marker { state.marker_list.delete(marker); }
+                        if let Some(marker) = entry.region_marker {
+                            state.marker_list.delete(marker);
+                        }
                     }
                 }
             }
@@ -378,13 +401,27 @@ mod tests {
         field::raw_bytes(&mut base, 2, &[]);
         assert_eq!(Request::parse(&base).unwrap().value.region, None);
         for probe in [0, 90049] {
-            let mut bytes = base.clone(); field::opt_uint(&mut bytes, 8, Some(probe));
-            assert_eq!(Request::parse(&bytes).unwrap().value.region, Some(probe as usize));
+            let mut bytes = base.clone();
+            field::opt_uint(&mut bytes, 8, Some(probe));
+            assert_eq!(
+                Request::parse(&bytes).unwrap().value.region,
+                Some(probe as usize)
+            );
         }
         for bytes in [
-            { let mut bytes = base.clone(); field::double(&mut bytes, 8, 12.0); bytes },
-            { let mut bytes = base; field::raw_bytes(&mut bytes, 8, b"12"); bytes },
-        ] { assert!(Request::parse(&bytes).is_err()); }
+            {
+                let mut bytes = base.clone();
+                field::double(&mut bytes, 8, 12.0);
+                bytes
+            },
+            {
+                let mut bytes = base;
+                field::raw_bytes(&mut bytes, 8, b"12");
+                bytes
+            },
+        ] {
+            assert!(Request::parse(&bytes).is_err());
+        }
     }
 
     #[test]
@@ -418,7 +455,10 @@ mod tests {
             },
         };
         assert!(update(&mut editor, 42, &request));
-        assert_eq!(snapshot(&mut editor, 42, leaf, buffer).unwrap().region, Some(14));
+        assert_eq!(
+            snapshot(&mut editor, 42, leaf, buffer).unwrap().region,
+            Some(14)
+        );
         let id = editor.active_window().active_cursors().primary_id();
         editor
             .active_window_mut()
@@ -437,8 +477,15 @@ mod tests {
         assert_eq!(after.position, 1110);
         assert_eq!(after.offset, -3.5);
         assert_eq!(after.horizontal_offset, 129.75);
-        assert_eq!(after.region, Some(1114), "the independent probe survives edits beyond the coordinate ring");
-        assert_eq!(snapshot(&mut editor, 43, leaf, buffer).unwrap().region, None);
+        assert_eq!(
+            after.region,
+            Some(1114),
+            "the independent probe survives edits beyond the coordinate ring"
+        );
+        assert_eq!(
+            snapshot(&mut editor, 43, leaf, buffer).unwrap().region,
+            None
+        );
         assert_eq!(
             snapshot(&mut editor, 43, leaf, buffer)
                 .unwrap()
@@ -530,29 +577,75 @@ mod tests {
         let leaf = editor.active_window().effective_active_split();
         let buffer = editor.active_window().active_buffer();
         let initial = snapshot(&mut editor, 7, leaf, buffer).unwrap();
-        let scope = Scope { window: editor.active_window().id.0, leaf, buffer,
-            revision: editor.active_window().active_state().buffer.version(), projection: 0, selection: 0 };
-        let mut request = Request { id: 1, scope, value: Value { region: Some(12), sequence: 1, ..initial } };
-        let count = editor.active_window().active_state().marker_list.marker_count();
+        let scope = Scope {
+            window: editor.active_window().id.0,
+            leaf,
+            buffer,
+            revision: editor.active_window().active_state().buffer.version(),
+            projection: 0,
+            selection: 0,
+        };
+        let mut request = Request {
+            id: 1,
+            scope,
+            value: Value {
+                region: Some(12),
+                sequence: 1,
+                ..initial
+            },
+        };
+        let count = editor
+            .active_window()
+            .active_state()
+            .marker_list
+            .marker_count();
         assert!(update(&mut editor, 7, &request));
-        assert_eq!(editor.active_window().active_state().marker_list.marker_count(), count + 1);
+        assert_eq!(
+            editor
+                .active_window()
+                .active_state()
+                .marker_list
+                .marker_count(),
+            count + 1
+        );
         let retained = snapshot(&mut editor, 7, leaf, buffer).unwrap();
-        request.value.position = 6; request.value.region = Some(usize::MAX);
+        request.value.position = 6;
+        request.value.region = Some(usize::MAX);
         assert!(!update(&mut editor, 7, &request));
         assert_eq!(snapshot(&mut editor, 7, leaf, buffer).unwrap(), retained);
         request.value.region = None;
         assert!(update(&mut editor, 7, &request));
         let moved = snapshot(&mut editor, 7, leaf, buffer).unwrap();
-        assert_eq!(moved.position, 6); assert_eq!(moved.region, None);
-        assert_eq!(editor.active_window().active_state().marker_list.marker_count(), count);
+        assert_eq!(moved.position, 6);
+        assert_eq!(moved.region, None);
+        assert_eq!(
+            editor
+                .active_window()
+                .active_state()
+                .marker_list
+                .marker_count(),
+            count
+        );
         let id = editor.active_window().active_cursors().primary_id();
-        editor.active_window_mut().active_cursors_mut().get_mut(id).unwrap().position = 0;
+        editor
+            .active_window_mut()
+            .active_cursors_mut()
+            .get_mut(id)
+            .unwrap()
+            .position = 0;
         crate::webui::apply_step(&mut editor, &json!({"type":"é"}));
         let after_edit = snapshot(&mut editor, 7, leaf, buffer).unwrap();
         request.value.region = Some(usize::MAX);
-        assert!(!update(&mut editor, 7, &request), "an old oversized probe must be refused before edit arithmetic");
-        request.value.region = None; request.value.position = usize::MAX;
-        assert!(!update(&mut editor, 7, &request), "an old oversized anchor must be refused before edit arithmetic");
+        assert!(
+            !update(&mut editor, 7, &request),
+            "an old oversized probe must be refused before edit arithmetic"
+        );
+        request.value.region = None;
+        request.value.position = usize::MAX;
+        assert!(
+            !update(&mut editor, 7, &request),
+            "an old oversized anchor must be refused before edit arithmetic"
+        );
         assert_eq!(snapshot(&mut editor, 7, leaf, buffer).unwrap(), after_edit);
     }
 }
