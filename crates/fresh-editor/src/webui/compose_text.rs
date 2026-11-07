@@ -33,12 +33,29 @@ impl Index {
 
     pub fn new(text: &str) -> Self {
         let mut entries = vec![(0, 0)];
+        let mut start = 0;
         let mut units = 0;
-        for (byte, scalar) in text.char_indices() {
-            if byte - entries.last().unwrap().0 >= STRIDE {
-                entries.push((byte, units));
+        while text.len() - start > STRIDE {
+            let mut end = start + STRIDE;
+            while !text.is_char_boundary(end) {
+                end += 1;
             }
-            units += scalar.len_utf16();
+            if end == text.len() {
+                break;
+            }
+            // Valid UTF-8: every leading byte contributes one UTF-16 unit;
+            // a four-byte scalar contributes its second surrogate unit too.
+            let block = &text.as_bytes()[start..end];
+            units += if block.is_ascii() {
+                block.len()
+            } else {
+                block
+                    .iter()
+                    .map(|&byte| usize::from(byte & 0xc0 != 0x80) + usize::from(byte >= 0xf0))
+                    .sum::<usize>()
+            };
+            entries.push((end, units));
+            start = end;
         }
         Self(entries)
     }
@@ -120,6 +137,61 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scalar_reference(text: &str) -> Index {
+        let mut entries = vec![(0, 0)];
+        let mut units = 0;
+        for (byte, scalar) in text.char_indices() {
+            if byte - entries.last().unwrap().0 >= STRIDE {
+                entries.push((byte, units));
+            }
+            units += scalar.len_utf16();
+        }
+        Index(entries)
+    }
+
+    fn assert_same_checkpoints(text: &str) {
+        let expected = scalar_reference(text);
+        let actual = Index::new(text);
+        assert_eq!(actual.0, expected.0);
+        assert_eq!(actual.allocated_bytes(), expected.allocated_bytes());
+        assert_eq!(
+            actual.utf16_at(text, text.len()),
+            Some(text.encode_utf16().count())
+        );
+        for &(byte, units) in &actual.0 {
+            assert_eq!(actual.utf16_at(text, byte), Some(units));
+            for offset in byte.saturating_sub(3)..=(byte + 4).min(text.len()) {
+                assert_eq!(
+                    actual.utf16_at(text, offset),
+                    expected.utf16_at(text, offset)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn block_counting_preserves_scalar_checkpoints_across_utf8_boundaries() {
+        for text in ["", "a", "é", "文", "👩", "\0\r\n", "e\u{301}👩🏽‍💻"] {
+            assert_same_checkpoints(text);
+        }
+        for offset in 0..=STRIDE + 4 {
+            let prefix = "a".repeat(offset);
+            let suffix = "b".repeat(2 * STRIDE + 4);
+            for scalar in ["é", "文", "👩", "e\u{301}👩🏽‍💻\r\n"] {
+                assert_same_checkpoints(&format!("{prefix}{scalar}{suffix}"));
+            }
+        }
+        for length in [STRIDE - 1, STRIDE, STRIDE + 1, 2 * STRIDE, 3 * STRIDE] {
+            assert_same_checkpoints(&"a".repeat(length));
+        }
+    }
+
+    #[test]
+    fn block_counting_matches_every_unicode_scalar_without_changing_index_capacity() {
+        let text: String = (0..=0x10ffff).filter_map(char::from_u32).collect();
+        assert_same_checkpoints(&text);
+    }
 
     #[test]
     fn many_carets_share_coalesced_context_instead_of_multiplying_source_payload() {
