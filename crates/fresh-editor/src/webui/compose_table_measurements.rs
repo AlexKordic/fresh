@@ -3,7 +3,8 @@
 
 use super::super::compose::{ComposeImage, ComposeSpan};
 use super::*;
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct Measurement {
@@ -26,6 +27,65 @@ pub(crate) struct Style {
     pub end: usize,
     pub flags: u32,
     pub code: bool,
+}
+
+/// Samples own their text and styles exactly once. The randomized fingerprint
+/// index contains only offsets, with full equality checks for hash collisions.
+#[derive(Default)]
+struct Samples {
+    values: Vec<Sample>,
+    heads: HashMap<u64, usize>,
+    previous: Vec<usize>,
+}
+
+impl Samples {
+    fn insert(&mut self, sample: Sample) {
+        let fingerprint = self.heads.hasher().hash_one(&sample);
+        self.insert_hashed(fingerprint, sample);
+    }
+
+    fn insert_hashed(&mut self, fingerprint: u64, sample: Sample) {
+        const NONE: usize = usize::MAX;
+        let head = self.heads.entry(fingerprint).or_insert(NONE);
+        let mut index = *head;
+        while index != NONE {
+            if self.values[index] == sample {
+                return;
+            }
+            index = self.previous[index];
+        }
+        self.previous.push(*head);
+        *head = self.values.len();
+        self.values.push(sample);
+    }
+}
+
+#[cfg(test)]
+impl Measurement {
+    /// Compare reconstructed deduplication scratch capacity for the complete
+    /// parser samples. Excludes final samples, allocator/hash-table bookkeeping,
+    /// construction temporaries and RSS; this is not a measured live heap peak.
+    pub(crate) fn deduplication_scratch_capacity(&self) -> (usize, usize) {
+        use std::collections::HashSet;
+        let (mut cloned, mut indexed) = (0, 0);
+        for column in &self.columns {
+            let mut old = HashSet::new();
+            let mut new = Samples::default();
+            for sample in &column.samples {
+                old.insert(sample.clone());
+                new.insert(sample.clone());
+            }
+            assert_eq!(new.values, column.samples);
+            cloned += old.capacity() * std::mem::size_of::<Sample>()
+                + old
+                    .iter()
+                    .map(|s| s.text.capacity() + s.spans.capacity() * std::mem::size_of::<Style>())
+                    .sum::<usize>();
+            indexed += new.heads.capacity() * std::mem::size_of::<(u64, usize)>()
+                + new.previous.capacity() * std::mem::size_of::<usize>();
+        }
+        (cloned, indexed)
+    }
 }
 
 fn style(at: usize, header: bool, spans: &[&ComposeSpan], images: &[&ComposeImage]) -> (u32, bool) {
@@ -88,13 +148,9 @@ impl Tables {
         let mut relevant: Vec<&ComposeSpan> = Vec::new();
         let mut images: Vec<&ComposeImage> = Vec::new();
         for table in &mut self.parsed {
-            let mut columns = vec![
-                Column {
-                    samples: Vec::new()
-                };
-                table.alignments.len()
-            ];
-            let mut seen = vec![HashSet::new(); columns.len()];
+            let mut columns: Vec<_> = (0..table.alignments.len())
+                .map(|_| Samples::default())
+                .collect();
             for row in &table.rows {
                 for (column, cell) in row.cells.iter().enumerate().take(columns.len()) {
                     if cell.source.start >= row.source.end {
@@ -157,23 +213,110 @@ impl Tables {
                         );
                     }
                     if raw.text == reading.text && raw.spans == reading.spans && !reading.image {
-                        if seen[column].insert(reading.clone()) {
-                            columns[column].samples.push(reading);
-                        }
+                        columns[column].insert(reading);
                     } else {
                         for sample in [reading, raw] {
-                            if seen[column].insert(sample.clone()) {
-                                columns[column].samples.push(sample);
-                            }
+                            columns[column].insert(sample);
                         }
                     }
                 }
             }
-            let measurement = Measurement { columns };
+            // Avoid Vec's in-place collect reusing the larger Samples slots
+            // as excess retained capacity for the much smaller Column type.
+            let mut measurement = Measurement {
+                columns: Vec::with_capacity(columns.len()),
+            };
+            for column in columns {
+                measurement.columns.push(Column {
+                    samples: column.values,
+                });
+            }
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             measurement.hash(&mut hash);
             table.measurement_id = hash.finish().max(1);
             table.measurement = Some(Arc::new(measurement));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn variants() -> Vec<Sample> {
+        let plain = Sample {
+            text: "café 東京".into(),
+            spans: vec![],
+            minimum_only: false,
+            image: false,
+        };
+        vec![
+            plain.clone(),
+            Sample {
+                // Canonically equal text still has different byte/style offsets.
+                text: "cafe\u{301} 東京".into(),
+                ..plain.clone()
+            },
+            Sample {
+                spans: vec![Style {
+                    start: 0,
+                    end: 5,
+                    flags: 1,
+                    code: false,
+                }],
+                ..plain.clone()
+            },
+            Sample {
+                spans: vec![Style {
+                    start: 0,
+                    end: 5,
+                    flags: 1,
+                    code: true,
+                }],
+                ..plain.clone()
+            },
+            Sample {
+                minimum_only: true,
+                ..plain.clone()
+            },
+            Sample {
+                image: true,
+                ..plain
+            },
+        ]
+    }
+
+    #[test]
+    fn fingerprint_collisions_preserve_complete_sample_identity_and_order() {
+        let values = variants();
+        let mut samples = Samples::default();
+        for sample in values
+            .iter()
+            .chain(values.iter().rev())
+            .chain(values.iter())
+        {
+            samples.insert_hashed(7, sample.clone());
+        }
+        assert_eq!(samples.values, values);
+        assert_eq!(samples.heads.len(), 1, "exercise an actual collision chain");
+    }
+
+    #[test]
+    fn randomized_index_matches_hashset_deduplication_and_keeps_first_storage() {
+        let mut samples = Samples::default();
+        let mut seen = HashSet::new();
+        let mut expected = Vec::new();
+        let first = variants().remove(0);
+        let first_storage = first.text.as_ptr();
+        samples.insert(first);
+        for sample in variants().into_iter().cycle().take(60) {
+            if seen.insert(sample.clone()) {
+                expected.push(sample.clone());
+            }
+            samples.insert(sample);
+        }
+        assert_eq!(samples.values, expected);
+        assert_eq!(samples.values[0].text.as_ptr(), first_storage);
     }
 }

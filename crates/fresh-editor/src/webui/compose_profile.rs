@@ -173,6 +173,13 @@ fn profile_rich_compose_document_workloads() {
             std::fs::write(path.join(format!("{name}.pb")), &bytes).unwrap();
         }
         let wire_bytes = bytes.len();
+        let process_peak_rss_bytes = peak_rss_bytes();
+        let (cloned_scratch, indexed_scratch) = pane
+            .tables
+            .iter()
+            .filter_map(|t| t.measurement.as_ref())
+            .map(|m| m.deduplication_scratch_capacity())
+            .fold((0, 0), |(old, new), (a, b)| (old + a, new + b));
         for table in &mut pane.tables {
             table.measurement = None;
         }
@@ -186,7 +193,9 @@ fn profile_rich_compose_document_workloads() {
             "pane_without_measurements_bytes": pane.encoded_len(),
             "semantic_spans": doc.spans.len(), "images": doc.images.len(), "window_images": pane.images.len(),
             "window_table_rows": pane.tables.iter().map(|table| table.rows.len()).sum::<usize>(), "table_samples": samples,
-            "process_peak_rss_bytes": peak_rss_bytes(),
+            "process_peak_rss_bytes": process_peak_rss_bytes,
+            "table_dedup_cloned_scratch_capacity_bytes": cloned_scratch,
+            "table_dedup_indexed_scratch_capacity_bytes": indexed_scratch,
             "retained_capacity_weight_bytes": doc.retained_bytes(),
             "retained_source_capacity_bytes": doc.text.capacity(),
             "retained_index_capacity_bytes": doc.text_index.allocated_bytes(),
@@ -207,6 +216,7 @@ fn profile_rich_compose_document_workloads() {
             "parse_scope": "semantic parse of a prepared immutable source and UTF-16 index; preparation is reported separately",
             "rss_scope": "process high-water mark since start, including input fixtures and prior cases",
             "retention_scope": "unit-profile cache capacity weights, not resident/allocator-live bytes; excludes allocator rounding, unreported container bookkeeping, editor buffers and external/parser/native ownership",
+            "table_dedup_scratch_scope": "reconstructed indexes over complete parser samples; reported element/string/style capacities only; excludes final samples, allocator/hash bookkeeping, construction temporaries and peak/live memory",
             "cases": reports,
         })).unwrap()).unwrap();
     }
