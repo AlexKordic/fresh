@@ -75,23 +75,42 @@ impl Worker {
 }
 
 impl ComposeCache {
+    /// Cache pressure must not make visible panes or workspaces continually
+    /// evict and reparse each other. Hidden tabs remain ordinary LRU victims.
+    pub(super) fn visible_documents(editor: &Editor) -> HashSet<(u64, usize)> {
+        let mut visible = HashSet::new();
+        for (id, window) in &editor.windows {
+            if let Some((manager, views)) = window.buffers.splits() {
+                for (leaf, buffer) in manager.visible_leaves() {
+                    if views.get(&leaf).and_then(|view| view.buffer_state(buffer))
+                        .is_some_and(|view| view.view_mode == ViewMode::PageView)
+                    {
+                        visible.insert((id.0, buffer.0));
+                    }
+                }
+            }
+        }
+        visible
+    }
+
     /// Bound cached snapshot retention by capacity as well as entry count.
-    /// The requested document is never discarded just because it alone is
-    /// larger than the cache budget. Parser ownership is accounted separately.
-    pub(super) fn trim_source_cache(&mut self, current: (u64, usize), incoming: usize) {
+    /// Visible Compose working sources and the requested document are never
+    /// discarded solely to fit the budget. Parser ownership is separate.
+    pub(super) fn trim_source_cache(&mut self, current: Option<(u64, usize)>, incoming: usize,
+                                   visible: &HashSet<(u64, usize)>) {
         loop {
             let bytes = self.documents.values().fold(incoming, |bytes, doc| {
                 bytes.saturating_add(doc.snapshot_bytes())
             });
             let entries =
-                self.documents.len() + usize::from(!self.documents.contains_key(&current));
+                self.documents.len() + usize::from(current.is_some_and(|key| !self.documents.contains_key(&key)));
             if entries <= CACHE_LIMIT && bytes <= SOURCE_CACHE_BYTES {
                 return;
             }
             let Some(oldest) = self
                 .documents
                 .iter()
-                .filter(|(key, _)| **key != current)
+                .filter(|(key, _)| Some(**key) != current && !visible.contains(*key))
                 .min_by_key(|(_, doc)| doc.used)
                 .map(|(key, _)| *key)
             else {
@@ -262,6 +281,8 @@ impl ComposeCache {
         for key in obsolete {
             self.parsing[&key].store(true, Ordering::Release);
         }
+        let visible = Self::visible_documents(editor);
+        self.trim_source_cache(None, 0, &visible);
     }
 
     /// A completed parse never borrows a newer mutable source. Polling also
@@ -488,6 +509,38 @@ mod tests {
         gather(&mut cache, &mut editor);
         assert_eq!(cache.documents.len(), 1, "the indices also consume retained heap capacity");
         assert!(old.upgrade().is_none());
+    }
+
+    #[test]
+    fn visible_workspaces_keep_their_working_snapshots_under_cache_pressure() {
+        let (mut editor, root) = editor("# First workspace\n");
+        let mut cache = ComposeCache::default();
+        let first_window = editor.active_window().id;
+        let first_buffer = editor.active_buffer();
+        gather(&mut cache, &mut editor);
+        let first_source = retain_capacity(&mut cache, &editor, 40 << 20);
+        let other = root.path().join("second");
+        std::fs::create_dir(&other).unwrap();
+        let second_window = editor.create_window_at(other, "Second workspace".into());
+        editor.set_active_window(second_window);
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        gather(&mut cache, &mut editor);
+        let second_source = retain_capacity(&mut cache, &editor, 40 << 20);
+        for _ in 0..3 {
+            gather(&mut cache, &mut editor);
+            assert!(first_source.upgrade().is_some(), "visible documents must not evict each other");
+            editor.set_active_window(first_window);
+            gather(&mut cache, &mut editor);
+            assert!(second_source.upgrade().is_some());
+            assert_eq!(Arc::as_ptr(&cache.documents[&(first_window.0, first_buffer.0)].text), first_source.as_ptr());
+            editor.set_active_window(second_window);
+        }
+        // After leaving Compose, that old snapshot is an ordinary LRU victim.
+        editor.windows.get_mut(&first_window).unwrap().focused_view_mut().view_mode = ViewMode::Source;
+        assert!(!cache.poll(&editor), "retire over-budget hidden retention without another gather");
+        assert!(first_source.upgrade().is_none());
+        assert!(second_source.upgrade().is_some());
+        assert_eq!(cache.documents.len(), 1);
     }
 
     #[test]

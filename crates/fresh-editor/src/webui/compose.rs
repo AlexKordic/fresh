@@ -18,8 +18,8 @@ const BACKGROUND_PARSE_BYTES: usize = 64 << 10;
 const WINDOW_BYTES: usize = 64 << 10;
 const CACHE_LIMIT: usize = 8;
 /// Retained source and sparse UTF-16 index capacity, excluding the editor's
-/// buffer, semantic metadata and occupied parser jobs. One current document
-/// may exceed this soft cache budget; it must remain fully editable/renderable.
+/// buffer, semantic metadata and occupied parser jobs. The requested document
+/// and visible Compose working set may exceed this soft retention budget.
 const SOURCE_CACHE_BYTES: usize = 64 << 20;
 
 #[path = "compose_parse.rs"]
@@ -1891,6 +1891,7 @@ impl ComposeCache {
         keep: Option<Range<usize>>,
     ) -> Option<ComposePane> {
         self.prune(editor);
+        let visible = Self::visible_documents(editor);
         let context = editor.get_key_context();
         let owns_keyboard = document_keyboard(editor);
         let context = format!("{context:?}");
@@ -1974,7 +1975,7 @@ impl ComposeCache {
             // Release the obsolete cached source/index and older snapshots
             // before copying this revision. A parser still owns its cancelled
             // input until completion; eviction never pretends that slot is free.
-            self.trim_source_cache(key, state.buffer.len());
+            self.trim_source_cache(Some(key), state.buffer.len(), &visible);
             let bytes = state
                 .buffer
                 .get_text_range_mut(0, state.buffer.len())
@@ -1998,7 +1999,7 @@ impl ComposeCache {
             self.schedule();
         }
         // The read's actual capacity and sparse index are known only now.
-        self.trim_source_cache(key, 0);
+        self.trim_source_cache(Some(key), 0, &visible);
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
         let window = doc.source_window_policy(top_byte, region, keep, paragraph_windows);
