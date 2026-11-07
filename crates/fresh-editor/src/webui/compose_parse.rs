@@ -293,9 +293,14 @@ impl ComposeCache {
             token.store(true, Ordering::Release);
         }
         self.documents.clear();
-        self.parsing.clear();
         self.parse_wanted.clear();
-        self.parser = None;
+        // Cancellation is cooperative. Keep the worker and occupied slots
+        // until their completions are consumed; reconnects share that same
+        // bounded queue. A quiescent worker (including a failed startup) can
+        // be released and started again on demand.
+        if self.parsing.is_empty() {
+            self.parser = None;
+        }
     }
 }
 
@@ -460,6 +465,118 @@ mod tests {
     }
 
     #[test]
+    fn clear_reconnect_keeps_running_and_waiting_work_owned_until_completion() {
+        let (mut editor, _root) = editor(&"# Anchor\n\nParagraph café.\n\n".repeat(6000));
+        let (mut cache, input, output) = controlled();
+        gather(&mut cache, &mut editor);
+        let running = input.recv().unwrap();
+        let running_source = Arc::downgrade(&running.text);
+        let running_cancel = running.cancel.clone();
+        cache.clear();
+        gather(&mut cache, &mut editor);
+        for turn in 0..12 {
+            let cursor = editor.active_cursors().primary_id();
+            editor
+                .replace_native_texts(vec![(0..0, format!("{turn} "), cursor)])
+                .unwrap();
+            cache.clear();
+            let raw = gather(&mut cache, &mut editor);
+            assert_eq!(raw.ready, Some(false));
+            assert_eq!(
+                cache.parsing.len(),
+                2,
+                "resets must keep both occupied slots"
+            );
+            assert_eq!(
+                cache.parse_wanted.len(),
+                1,
+                "only the newest request is wanted"
+            );
+        }
+        let waiting = input
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let waiting_source = Arc::downgrade(&waiting.text);
+        assert!(running_cancel.load(Ordering::Acquire));
+        assert!(waiting.cancel.load(Ordering::Acquire));
+        assert!(
+            input.try_recv().is_err(),
+            "no additional job can bypass occupied slots"
+        );
+        complete(running, &output);
+        assert!(
+            !cache.poll(&editor),
+            "a late cancelled result cannot publish"
+        );
+        assert!(running_source.upgrade().is_none());
+        let newest = input
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(newest.key.revision, editor.active_state().buffer.version());
+        assert!(newest.text.starts_with("11 10 9 "));
+        assert!(input.try_recv().is_err());
+        complete(waiting, &output);
+        assert!(!cache.poll(&editor));
+        assert!(waiting_source.upgrade().is_none());
+        assert_eq!(cache.parsing.len(), 1);
+        complete(newest, &output);
+        assert!(cache.poll(&editor));
+        assert!(cache.parsing.is_empty());
+        let rich = gather(&mut cache, &mut editor);
+        assert_eq!(rich.ready, Some(true));
+        assert!(rich.text.starts_with("11 10 9 "));
+    }
+
+    #[test]
+    fn clear_without_reconnect_drains_results_before_releasing_the_worker() {
+        let (mut editor, _root) = editor(&"Paragraph café.\n\n".repeat(6000));
+        let (mut cache, input, output) = controlled();
+        gather(&mut cache, &mut editor);
+        let job = input.recv().unwrap();
+        let source = Arc::downgrade(&job.text);
+        let cancel = job.cancel.clone();
+        for _ in 0..12 {
+            cache.clear();
+            assert!(!cache.poll(&editor));
+        }
+        assert!(cancel.load(Ordering::Acquire));
+        complete(job, &output);
+        assert!(!cache.poll(&editor));
+        assert!(source.upgrade().is_none());
+        assert!(cache.documents.is_empty());
+        assert!(cache.parsing.is_empty());
+        cache.clear();
+        assert!(matches!(
+            input.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn dropping_cache_cancels_work_and_closes_the_parser_channels() {
+        let (mut editor, _root) = editor(&"Paragraph café.\n\n".repeat(6000));
+        let (mut cache, input, output) = controlled();
+        gather(&mut cache, &mut editor);
+        let job = input.recv().unwrap();
+        let source = Arc::downgrade(&job.text);
+        let cancel = job.cancel.clone();
+        drop(cache);
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(matches!(
+            input.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        let completion = Completion {
+            key: job.key,
+            text: job.text.clone(),
+            result: Ok(None),
+        };
+        drop(job);
+        assert!(output.send(completion).is_err());
+        assert!(source.upgrade().is_none());
+    }
+
+    #[test]
     fn large_source_keeps_current_context_and_receipts_while_semantics_are_pending() {
         let source = "# Heading\n\n![picture](image.png)\n\n".to_owned()
             + &"café 東京 👩🏽‍💻 paragraph.\n\n".repeat(70000);
@@ -598,5 +715,13 @@ mod tests {
         assert!(!cache.parsing_pending(editor.active_window().id.0, editor.active_buffer().0));
         assert!(!cache.poll(&editor));
         assert!(cache.parsing.is_empty());
+        cache.clear();
+        assert_eq!(gather(&mut cache, &mut editor).ready, Some(false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !cache.poll(&editor) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(gather(&mut cache, &mut editor).ready, Some(true));
+        assert!(cache.documents.values().all(|document| document.parsed));
     }
 }
