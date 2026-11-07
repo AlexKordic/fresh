@@ -957,6 +957,16 @@ pub struct ComposeDocumentChunk {
     pub error: ::prost::alloc::string::String,
     #[prost(uint64, tag = "9")]
     pub decoration_revision: u64,
+    #[prost(uint64, tag = "10")]
+    pub base_id: u64,
+    #[prost(uint64, tag = "11")]
+    pub result_length: u64,
+    #[prost(bytes = "vec", tag = "12")]
+    pub result_digest: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "13")]
+    pub base_digest: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "14")]
+    pub encoding: u32,
 }
 /// A line between panes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1460,6 +1470,9 @@ pub struct ServerHello {
     /// Complete projected text, independently streamed as type 5.
     #[prost(bool, tag = "7")]
     pub compose_document_text: bool,
+    /// Retained baseline and binary updates on the complete document stream.
+    #[prost(bool, tag = "8")]
+    pub compose_document_updates: bool,
 }
 /// Type 3: why Fresh is closing the connection.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1608,6 +1621,28 @@ pub struct ComposeDocumentRequest {
     pub applied_sequence: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "5")]
     pub selection_revision: ::core::option::Option<u64>,
+    /// Presence retains the acknowledged body: zero starts a fresh baseline;
+    /// otherwise use that request's baseline when it is still available.
+    #[prost(uint64, optional, tag = "6")]
+    pub base_id: ::core::option::Option<u64>,
+}
+/// Binary splice offsets address the prior encoded ComposePane, not source.
+/// At most 64 ordered, nonoverlapping splices; literals are binary bytes.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ComposeDocumentSplice {
+    #[prost(uint64, tag = "1")]
+    pub offset: u64,
+    #[prost(uint64, tag = "2")]
+    pub remove: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub insert: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ComposeDocumentDelta {
+    #[prost(message, repeated, tag = "1")]
+    pub edits: ::prost::alloc::vec::Vec<ComposeDocumentSplice>,
+    #[prost(uint64, tag = "2")]
+    pub base_length: u64,
 }
 /// Source carets captured with the input's source_revision (or scope revision).
 /// A receipt reports only IDs whose unchanged mapped ranges match the live

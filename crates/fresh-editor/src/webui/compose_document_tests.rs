@@ -45,7 +45,9 @@ fn ack(session: &mut Session, id: u64, sequence: u64) {
     );
 }
 fn next(session: &mut Session) -> Option<Chunk> {
-    Session::next_chunk(session.read.as_mut()?)
+    let chunk = Session::next_chunk(session.read.as_mut()?);
+    session.release_unused();
+    chunk
 }
 
 #[test]
@@ -219,4 +221,137 @@ fn source_admission_and_request_ownership_are_explicit_without_changing_source()
     .encode_to_vec();
     duplicate.extend_from_slice(&[40, 0]);
     assert!(Request::parse(&duplicate).is_err());
+    assert!(Request::parse(
+        &pb::ComposeDocumentRequest {
+            id: 1,
+            base_id: Some(0),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    )
+    .is_err());
+}
+
+fn persistent(session: &mut Session, id: u64, base: u64) {
+    session.handle(
+        Request::parse(
+            &pb::ComposeDocumentRequest {
+                id,
+                owner: Some(owner()),
+                selection_revision: Some(0),
+                base_id: Some(base),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+        .unwrap(),
+    );
+}
+fn body(text: &str, selection: u64) -> Vec<u8> {
+    pb::ComposePane {
+        text: text.into(),
+        selection_revision: selection,
+        buffer_revision: 5,
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+fn collect(session: &mut Session, id: u64) -> (Vec<u8>, Chunk) {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = next(session).unwrap();
+        assert!(chunk.error.is_empty(), "{}", chunk.error);
+        bytes.extend_from_slice(&chunk.data);
+        if chunk.done {
+            return (bytes, chunk);
+        }
+        ack(session, id, chunk.sequence);
+    }
+}
+
+#[test]
+fn acknowledged_baselines_update_in_place_and_cancel_or_idle_expiry_releases_the_shared_slot() {
+    let budget = Budget::default();
+    let mut session = Session::new(budget.clone());
+    let text = "unchanged projected text café\r\n".repeat(10_000);
+    let original = body(&text, 1);
+    persistent(&mut session, 1, 0);
+    session.read.as_mut().unwrap().stage(original.clone(), None);
+    let (bytes, last) = collect(&mut session, 1);
+    assert_eq!(bytes, original);
+    assert_eq!(last.result_digest, Sha256::digest(&original).to_vec());
+    assert_eq!(last.encoding, 0);
+    assert_eq!(last.result_length, original.len());
+    assert!(session.baseline.is_none());
+    assert!(session.read.as_ref().unwrap().blob.is_some());
+    assert_eq!(
+        budget.0.load(Ordering::Relaxed),
+        1,
+        "a persistent body waits for final ACK"
+    );
+    ack(&mut session, 1, last.sequence);
+    assert!(session.read.is_none());
+    assert_eq!(session.baseline.as_ref().unwrap().id, 1);
+    persistent(&mut session, 2, 1);
+    let changed = body(&text, 2);
+    session
+        .read
+        .as_mut()
+        .unwrap()
+        .stage(changed.clone(), session.baseline.as_ref());
+    let (bytes, last) = collect(&mut session, 2);
+    assert_eq!(last.encoding, 1);
+    assert_eq!(last.base_id, 1);
+    assert!(bytes.len() < 100);
+    assert_eq!(last.base_digest, Sha256::digest(&original).to_vec());
+    assert_eq!(last.result_digest, Sha256::digest(&changed).to_vec());
+    let delta = pb::ComposeDocumentDelta::decode(bytes.as_slice()).unwrap();
+    let mut applied = Vec::new();
+    let mut at = 0;
+    for edit in delta.edits {
+        applied.extend_from_slice(&original[at..edit.offset as usize]);
+        applied.extend(edit.insert);
+        at = (edit.offset + edit.remove) as usize;
+    }
+    applied.extend_from_slice(&original[at..]);
+    assert_eq!(applied, changed);
+    assert_eq!(
+        session.baseline.as_ref().unwrap().id,
+        1,
+        "final data does not promote an unacknowledged candidate"
+    );
+    ack(&mut session, 2, last.sequence);
+    assert_eq!(session.baseline.as_ref().unwrap().bytes, changed);
+    assert_eq!(budget.0.load(Ordering::Relaxed), 1);
+    persistent(&mut session, 3, 2);
+    session
+        .read
+        .as_mut()
+        .unwrap()
+        .fail("new selection changed".into());
+    let retired = next(&mut session).unwrap();
+    ack(&mut session, 3, retired.sequence);
+    assert_eq!(
+        session.baseline.as_ref().unwrap().id,
+        2,
+        "a retired candidate does not discard a verified binary base"
+    );
+    let idle = session.baseline.as_ref().unwrap().used + BASE_TIMEOUT;
+    session.expire(idle);
+    assert!(session.baseline.is_none());
+    assert_eq!(budget.0.load(Ordering::Relaxed), 0);
+    persistent(&mut session, 4, 2);
+    session.read.as_mut().unwrap().stage(original, None);
+    let (_, last) = collect(&mut session, 4);
+    assert_eq!(
+        last.encoding, 0,
+        "an evicted base falls back to full delivery"
+    );
+    session.expire(session.read.as_ref().unwrap().waiting.unwrap().1 + ACK_TIMEOUT);
+    assert!(session.read.is_none());
+    assert_eq!(
+        budget.0.load(Ordering::Relaxed),
+        0,
+        "a missing final ACK cannot retain a candidate forever"
+    );
 }

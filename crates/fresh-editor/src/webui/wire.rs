@@ -1071,6 +1071,8 @@ proto! {
         4 sequence: uint64, 5 length: uint64, 6 data: bytes,
         7 done: bool, 8 error: string,
         9 decoration_revision: uint64,
+        10 base_id: uint64, 11 result_length: uint64,
+        12 result_digest: bytes, 13 base_digest: bytes, 14 encoding: uint32,
     }
     /// A line between panes.
     SeparatorModel as Separator { 1 vertical: bool, 2 x: uint32, 3 y: uint32, 4 len: uint32 }
@@ -1319,6 +1321,8 @@ message ServerHello {
   bool compose_semantic_index = 6;
   // Complete projected text, independently streamed as type 5.
   bool compose_document_text = 7;
+  // Retained baseline and binary updates on the complete document stream.
+  bool compose_document_updates = 8;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -1408,6 +1412,20 @@ message ComposeDocumentRequest {
   bool cancel = 3;
   optional uint64 applied_sequence = 4;
   optional uint64 selection_revision = 5;
+  // Presence retains the acknowledged body: zero starts a fresh baseline;
+  // otherwise use that request's baseline when it is still available.
+  optional uint64 base_id = 6;
+}
+// Binary splice offsets address the prior encoded ComposePane, not source.
+// At most 64 ordered, nonoverlapping splices; literals are binary bytes.
+message ComposeDocumentSplice {
+  uint64 offset = 1;
+  uint64 remove = 2;
+  bytes insert = 3;
+}
+message ComposeDocumentDelta {
+  repeated ComposeDocumentSplice edits = 1;
+  uint64 base_length = 2;
 }
 // Source carets captured with the input's source_revision (or scope revision).
 // A receipt reports only IDs whose unchanged mapped ranges match the live
@@ -1949,6 +1967,7 @@ impl ClientScene {
         field::uint(out, 5, 1);
         field::uint(out, 6, 1);
         field::uint(out, 7, 1);
+        field::uint(out, 8, 1);
     }
 }
 

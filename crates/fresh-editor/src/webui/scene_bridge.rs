@@ -226,6 +226,7 @@ impl SceneBridge {
         // ack; it must not receive a spurious busy reply for an already freed
         // transfer slot.
         for client in &mut self.clients {
+            client.document.expire(Instant::now());
             for id in client.asset_finished.drain(..) {
                 self.assets.cancel(client.id, id);
                 client.asset_targets.remove(&id);

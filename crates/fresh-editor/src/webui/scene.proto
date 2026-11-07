@@ -589,6 +589,11 @@ message ComposeDocumentChunk {
   bool done = 7;
   string error = 8;
   uint64 decoration_revision = 9;
+  uint64 base_id = 10;
+  uint64 result_length = 11;
+  bytes result_digest = 12;
+  bytes base_digest = 13;
+  uint32 encoding = 14;
 }
 
 // A line between panes.
@@ -877,6 +882,8 @@ message ServerHello {
   bool compose_semantic_index = 6;
   // Complete projected text, independently streamed as type 5.
   bool compose_document_text = 7;
+  // Retained baseline and binary updates on the complete document stream.
+  bool compose_document_updates = 8;
 }
 // Type 3: why Fresh is closing the connection.
 message Error {
@@ -966,6 +973,20 @@ message ComposeDocumentRequest {
   bool cancel = 3;
   optional uint64 applied_sequence = 4;
   optional uint64 selection_revision = 5;
+  // Presence retains the acknowledged body: zero starts a fresh baseline;
+  // otherwise use that request's baseline when it is still available.
+  optional uint64 base_id = 6;
+}
+// Binary splice offsets address the prior encoded ComposePane, not source.
+// At most 64 ordered, nonoverlapping splices; literals are binary bytes.
+message ComposeDocumentSplice {
+  uint64 offset = 1;
+  uint64 remove = 2;
+  bytes insert = 3;
+}
+message ComposeDocumentDelta {
+  repeated ComposeDocumentSplice edits = 1;
+  uint64 base_length = 2;
 }
 // Source carets captured with the input's source_revision (or scope revision).
 // A receipt reports only IDs whose unchanged mapped ranges match the live
