@@ -116,9 +116,43 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn ordinary_native_text_proves_actual_multicaret_selection_and_crlf_insertions() {
+        let (mut editor, _root) = fixture("alpha café omega");
+        editor.active_state_mut().buffer.set_line_ending(LineEnding::CRLF);
+        editor.active_cursors_mut().primary_mut().position = 5;
+        editor.active_cursors_mut().primary_mut().anchor = Some(0);
+        editor.active_cursors_mut().add(Cursor::new(17));
+        let proof = Proof::prepare_native(&editor, "日\n").unwrap();
+        editor.insert_native_text("日\n".into());
+        let proof = proof.verified(&editor).unwrap();
+        assert_eq!(proof.anchors.iter().map(|a| (a.before_start, a.before_end, a.start, a.end)).collect::<Vec<_>>(),
+            vec![(0, 5, 0, 5), (17, 17, 17, 22)]);
+        assert!(proof.anchors.iter().all(|a| a.digest == Sha256::digest("日\r\n".as_bytes()).to_vec()));
+        assert_eq!(editor.active_state().buffer.slice_bytes(0..22), "日\r\n café omega日\r\n".as_bytes());
+    }
+
+    #[test]
+    fn empty_native_text_cannot_claim_to_delete_a_selection() {
+        let (mut editor, _root) = fixture("tail");
+        editor.active_cursors_mut().primary_mut().position = 4;
+        editor.active_cursors_mut().primary_mut().anchor = Some(0);
+        assert!(Proof::prepare_native(&editor, "").is_none());
+        editor.insert_native_text(String::new());
+        assert_eq!(editor.active_state().buffer.slice_bytes(0..4), b"tail");
+    }
 }
 
 impl Proof {
+    pub(super) fn prepare_native(editor: &Editor, text: &str) -> Option<Self> {
+        if text.is_empty() { return None; }
+        let targets = editor.active_cursors().iter().map(|(id, cursor)| {
+            (cursor.selection_range().unwrap_or(cursor.position..cursor.position), text.to_owned(), id)
+        }).collect::<Vec<_>>();
+        Self::prepare(editor, &targets)
+    }
+
     pub(super) fn prepare(editor: &Editor, targets: &[(Range<usize>, String, CursorId)]) -> Option<Self> {
         if targets.is_empty() || targets.len() > 1024 { return None; }
         let state = editor.active_state();

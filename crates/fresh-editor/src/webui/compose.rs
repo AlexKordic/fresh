@@ -530,8 +530,10 @@ impl<'a> Input<'a> {
             if editor.active_window().is_editing_disabled() {
                 return Err("The document is read-only; text was not inserted.".into());
             }
-            editor.insert_native_text(self.text()?);
-            return Ok(None);
+            let text = self.text()?;
+            let proof = EditProof::prepare_native(editor, &text);
+            editor.insert_native_text(text);
+            return Ok(proof.and_then(|proof| proof.verified(editor)));
         }
         let range = self.replacement.clone().unwrap();
         let revision = self
