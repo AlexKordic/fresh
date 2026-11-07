@@ -98,7 +98,7 @@ impl ComposeCache {
     /// Bound cached snapshot retention by capacity as well as entry count.
     /// Visible Compose working sources and the requested document are never
     /// discarded solely to fit the budget. Parser ownership is separate.
-    pub(super) fn trim_source_cache(
+    pub(super) fn trim_cache(
         &mut self,
         current: Option<(u64, usize)>,
         incoming: usize,
@@ -106,11 +106,11 @@ impl ComposeCache {
     ) {
         loop {
             let bytes = self.documents.values().fold(incoming, |bytes, doc| {
-                bytes.saturating_add(doc.snapshot_bytes())
+                bytes.saturating_add(doc.retained_bytes())
             });
             let entries = self.documents.len()
                 + usize::from(current.is_some_and(|key| !self.documents.contains_key(&key)));
-            if entries <= CACHE_LIMIT && bytes <= SOURCE_CACHE_BYTES {
+            if entries <= CACHE_LIMIT && bytes <= CACHE_BYTES {
                 return;
             }
             let Some(oldest) = self
@@ -288,7 +288,7 @@ impl ComposeCache {
             self.parsing[&key].store(true, Ordering::Release);
         }
         let visible = Self::visible_documents(editor);
-        self.trim_source_cache(None, 0, &visible);
+        self.trim_cache(None, 0, &visible);
     }
 
     /// A completed parse never borrows a newer mutable source. Polling also
@@ -338,6 +338,8 @@ impl ComposeCache {
                 }
             }
         }
+        let visible = Self::visible_documents(editor);
+        self.trim_cache(None, 0, &visible);
         self.schedule();
         changed
     }
@@ -442,6 +444,178 @@ mod tests {
         Arc::downgrade(text)
     }
 
+    fn retain_formatter_capacity(
+        cache: &mut ComposeCache,
+        editor: &Editor,
+        capacity: usize,
+    ) -> Weak<String> {
+        let doc = cache
+            .documents
+            .get_mut(&(editor.active_window().id.0, editor.active_buffer().0))
+            .unwrap();
+        let length = doc.text.len();
+        let mut replacement = String::with_capacity(capacity);
+        replacement.push('a');
+        doc.decorations.capture(
+            99,
+            0..length,
+            vec![0..length],
+            length,
+            vec![crate::view::conceal::ResolvedConceal {
+                source: 0..1,
+                replacement: Some(replacement),
+                activation: None,
+            }],
+        );
+        Arc::downgrade(&doc.text)
+    }
+
+    #[test]
+    fn completed_parser_metadata_is_admitted_before_poll_returns() {
+        let (mut editor, _root) = editor("abc\n");
+        let (mut cache, input, output) = controlled();
+        let mut sources = Vec::new();
+        for index in 0..3 {
+            if index != 0 {
+                editor.new_buffer();
+                editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+                let cursor = editor.active_cursors().primary_id();
+                editor
+                    .replace_native_texts(vec![(0..0, "abc\n".into(), cursor)])
+                    .unwrap();
+            }
+            gather(&mut cache, &mut editor);
+            sources.push(retain_formatter_capacity(&mut cache, &editor, 20 << 20));
+        }
+        let mut source = "| Link | Text |\n|---|---|\n".to_owned();
+        for row in 0..6000 {
+            source.push_str(&format!("| [row-{row}](target.md) | **café {row}** |\n"));
+        }
+        editor.new_buffer();
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        let cursor = editor.active_cursors().primary_id();
+        editor
+            .replace_native_texts(vec![(0..0, source, cursor)])
+            .unwrap();
+        gather(&mut cache, &mut editor);
+        assert_eq!(cache.documents.len(), 4);
+        assert!(
+            cache
+                .documents
+                .values()
+                .map(Document::retained_bytes)
+                .sum::<usize>()
+                <= CACHE_BYTES
+        );
+        let job = input
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        complete(job, &output);
+        assert!(cache.poll(&editor));
+        assert!(
+            sources[0].upgrade().is_none(),
+            "the completed metadata must retire old cache ownership immediately"
+        );
+        assert!(
+            cache
+                .documents
+                .values()
+                .map(Document::retained_bytes)
+                .sum::<usize>()
+                <= CACHE_BYTES
+        );
+        let current = &cache.documents[&(editor.active_window().id.0, editor.active_buffer().0)];
+        assert!(current.parsed);
+        assert!(
+            current.metadata_bytes > 4 << 20,
+            "the fixture must introduce metadata pressure"
+        );
+    }
+
+    #[test]
+    fn parsed_table_samples_and_spans_contribute_to_cache_retention() {
+        let mut source = "| Link | Text |\n|---|---|\n".to_owned();
+        for row in 0..1000 {
+            source.push_str(&format!("| [row-{row}](target.md) | **café {row}** |\n"));
+        }
+        let doc = Document::parse(source, 1, 1, 1);
+        let tables = doc.tables.snapshot(&doc.text, 0..doc.text.len(), &[]);
+        let samples: usize = tables
+            .iter()
+            .filter_map(|table| table.measurement.as_ref())
+            .flat_map(|measurement| &measurement.columns)
+            .flat_map(|column| &column.samples)
+            .map(|sample| {
+                sample.text.capacity()
+                    + sample.spans.capacity()
+                        * std::mem::size_of::<super::super::super::compose_tables::Style>()
+            })
+            .sum();
+        assert!(
+            samples > doc.text.len(),
+            "the fixture must exercise metadata larger than source"
+        );
+        let lower_bound = doc.text.capacity()
+            + doc.text_index.allocated_bytes()
+            + samples
+            + doc.spans.capacity() * std::mem::size_of::<ComposeSpan>();
+        assert!(
+            doc.retained_bytes() >= lower_bound,
+            "cache retention omits parsed spans and complete font inputs"
+        );
+    }
+
+    #[test]
+    fn formatter_metadata_pressure_evicts_hidden_snapshots_without_source_pressure() {
+        let (mut editor, _root) = editor("abc\n");
+        let mut cache = ComposeCache::default();
+        let mut sources = Vec::new();
+        let mut buffers = Vec::new();
+        for index in 0..4 {
+            if index != 0 {
+                editor.new_buffer();
+                editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+                let cursor = editor.active_cursors().primary_id();
+                editor
+                    .replace_native_texts(vec![(0..0, "abc\n".into(), cursor)])
+                    .unwrap();
+            }
+            gather(&mut cache, &mut editor);
+            let buffer = editor.active_buffer();
+            buffers.push(buffer);
+            let doc = cache
+                .documents
+                .get_mut(&(editor.active_window().id.0, buffer.0))
+                .unwrap();
+            sources.push(Arc::downgrade(&doc.text));
+            let length = doc.text.len();
+            let mut replacement = String::with_capacity(20 << 20);
+            replacement.push('a');
+            doc.decorations.capture(
+                99,
+                0..length,
+                vec![0..length],
+                length,
+                vec![crate::view::conceal::ResolvedConceal {
+                    source: 0..1,
+                    replacement: Some(replacement),
+                    activation: None,
+                }],
+            );
+        }
+        let pane = gather(&mut cache, &mut editor);
+        assert!(
+            cache.documents.len() < 4,
+            "small source buffers can still retain large formatter allocations"
+        );
+        assert!(sources[0].upgrade().is_none());
+        assert_eq!(pane.text, "abc\n");
+        editor.switch_buffer(buffers[0]);
+        let restored = gather(&mut cache, &mut editor);
+        assert_eq!(restored.text, "abc\n");
+        assert_eq!(restored.text_context.unwrap().text, "abc\n");
+    }
+
     #[test]
     fn snapshot_byte_pressure_evicts_the_oldest_entry_below_the_count_limit() {
         let (mut editor, _root) = editor("# Current café\n");
@@ -479,9 +653,9 @@ mod tests {
             cache
                 .documents
                 .values()
-                .map(Document::snapshot_bytes)
+                .map(Document::retained_bytes)
                 .sum::<usize>()
-                <= SOURCE_CACHE_BYTES
+                <= CACHE_BYTES
         );
     }
 
@@ -504,11 +678,11 @@ mod tests {
             .unwrap();
         editor.active_cursors_mut().primary_mut().position = 0;
         gather(&mut cache, &mut editor);
-        let live = retain_capacity(&mut cache, &editor, SOURCE_CACHE_BYTES + (1 << 20));
+        let live = retain_capacity(&mut cache, &editor, CACHE_BYTES + (1 << 20));
         let pane = gather(&mut cache, &mut editor);
         let key = (editor.active_window().id.0, current.0);
         assert_eq!(cache.documents.len(), 1);
-        assert!(cache.documents[&key].snapshot_bytes() > SOURCE_CACHE_BYTES);
+        assert!(cache.documents[&key].retained_bytes() > CACHE_BYTES);
         assert_eq!(cache.documents[&key].text.as_str(), source);
         assert_eq!(pane.document_len, source.len());
         assert!(pane.text.contains("Current café"));
@@ -521,18 +695,18 @@ mod tests {
         let (mut editor, _root) = editor("# First\n");
         let mut cache = ComposeCache::default();
         gather(&mut cache, &mut editor);
-        let old = retain_capacity(&mut cache, &editor, SOURCE_CACHE_BYTES / 2);
+        let old = retain_capacity(&mut cache, &editor, CACHE_BYTES / 2);
         editor.new_buffer();
         editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
         gather(&mut cache, &mut editor);
-        retain_capacity(&mut cache, &editor, SOURCE_CACHE_BYTES / 2);
+        retain_capacity(&mut cache, &editor, CACHE_BYTES / 2);
         assert_eq!(
             cache
                 .documents
                 .values()
                 .map(|doc| doc.text.capacity())
                 .sum::<usize>(),
-            SOURCE_CACHE_BYTES
+            CACHE_BYTES
         );
         gather(&mut cache, &mut editor);
         assert_eq!(

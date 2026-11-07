@@ -132,8 +132,7 @@ impl Cache {
         });
     }
 
-    #[cfg(test)]
-    pub(super) fn allocated_bytes(&self) -> usize {
+    pub(in crate::webui::compose) fn allocated_bytes(&self) -> usize {
         self.heap_bytes + self.entries.capacity() * size_of::<Entry>()
     }
 }

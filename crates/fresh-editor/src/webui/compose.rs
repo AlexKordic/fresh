@@ -17,10 +17,12 @@ use std::sync::{Arc, Weak};
 const BACKGROUND_PARSE_BYTES: usize = 64 << 10;
 const WINDOW_BYTES: usize = 64 << 10;
 const CACHE_LIMIT: usize = 8;
-/// Retained source and sparse UTF-16 index capacity, excluding the editor's
-/// buffer, semantic metadata and occupied parser jobs. The requested document
-/// and visible Compose working set may exceed this soft retention budget.
-const SOURCE_CACHE_BYTES: usize = 64 << 20;
+/// Retained document capacity, excluding editor buffers and occupied parser
+/// jobs. Requested/visible Compose working sources may exceed this soft target.
+const CACHE_BYTES: usize = 64 << 20;
+
+#[path = "compose_retention.rs"]
+pub(super) mod retention;
 
 #[path = "compose_parse.rs"]
 mod parsing;
@@ -846,6 +848,7 @@ pub(crate) struct ComposePane {
 }
 
 struct Document {
+    metadata_bytes: usize,
     semantics: Arc<semantics::Inventory>,
     revision: u64,
     epoch: usize,
@@ -875,10 +878,19 @@ struct CodeBlock {
 }
 
 impl Document {
-    fn snapshot_bytes(&self) -> usize {
+    fn retained_bytes(&self) -> usize {
         self.text
             .capacity()
             .saturating_add(self.text_index.allocated_bytes())
+            .saturating_add(self.metadata_bytes)
+            .saturating_add(self.decorations.retained_bytes())
+            .saturating_add(
+                self.previous_decorations
+                    .as_ref()
+                    .map_or(0, |value| value.retained_bytes()),
+            )
+            .saturating_add(self.prefix_cache.allocated_bytes())
+            .saturating_add(self.parse_error.as_ref().map_or(0, String::capacity))
     }
 
     fn parse(text: String, revision: u64, used: u64, epoch: usize) -> Self {
@@ -891,7 +903,8 @@ impl Document {
     /// receipts while the semantic parser works on its own shared snapshot.
     fn pending(text: String, revision: u64, used: u64, epoch: usize) -> Self {
         let index = Arc::new(super::compose_text::Index::new(&text));
-        Self {
+        let mut document = Self {
+            metadata_bytes: 0,
             revision,
             epoch,
             text: Arc::new(text),
@@ -912,7 +925,9 @@ impl Document {
             parsed: false,
             parse_error: None,
             previous_decorations: None,
-        }
+        };
+        document.metadata_bytes = document.measure_metadata();
+        document
     }
 
     fn parse_shared(
@@ -1160,7 +1175,8 @@ impl Document {
                     }),
             )
             .collect();
-        Some(Self {
+        let mut document = Self {
+            metadata_bytes: 0,
             revision,
             epoch,
             semantics: Arc::new(semantics.finish()),
@@ -1181,7 +1197,12 @@ impl Document {
             parsed: true,
             parse_error: None,
             previous_decorations: None,
-        })
+        };
+        document.metadata_bytes = document.measure_metadata();
+        if cancelled() {
+            return None;
+        }
+        Some(document)
     }
 
     /// Native-only overrides are resolved from parsed block ownership and
@@ -1718,7 +1739,7 @@ fn heading_underline(text: &str, heading: &Range<usize>) -> Option<Range<usize>>
     Some(start..heading.end)
 }
 
-/// Bounded per-bridge semantic cache; only composing buffers enter it. Parsing
+/// Per-bridge semantic cache with soft retention targets. Parsing
 /// is keyed by source revision, so caret moves do not reparse the document.
 #[derive(Default)]
 pub(crate) struct ComposeCache {
@@ -1980,7 +2001,7 @@ impl ComposeCache {
             // Release the obsolete cached source/index and older snapshots
             // before copying this revision. A parser still owns its cancelled
             // input until completion; eviction never pretends that slot is free.
-            self.trim_source_cache(Some(key), state.buffer.len(), &visible);
+            self.trim_cache(Some(key), state.buffer.len(), &visible);
             let bytes = state
                 .buffer
                 .get_text_range_mut(0, state.buffer.len())
@@ -2004,7 +2025,7 @@ impl ComposeCache {
             self.schedule();
         }
         // The read's actual capacity and sparse index are known only now.
-        self.trim_source_cache(Some(key), 0, &visible);
+        self.trim_cache(Some(key), 0, &visible);
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
         let window = doc.source_window_policy(top_byte, region, keep, paragraph_windows);
@@ -2170,6 +2191,8 @@ impl ComposeCache {
         if let Some(error) = &doc.parse_error {
             pane.error = error.clone();
         }
+        // Formatter records and prefix samples can grow during this gather.
+        self.trim_cache(Some(key), 0, &visible);
         Some(pane)
     }
 }

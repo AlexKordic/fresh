@@ -15,6 +15,7 @@ pub(super) struct Semantic {
 }
 
 pub(super) struct Snapshot {
+    retained_bytes: usize,
     revision: u64,
     outline: Vec<Semantic>,
     records: Vec<ResolvedConceal>,
@@ -23,12 +24,34 @@ pub(super) struct Snapshot {
 
 impl Snapshot {
     pub fn new(revision: u64, outline: Vec<Semantic>) -> Self {
-        Self {
+        let mut snapshot = Self {
+            retained_bytes: 0,
             revision,
             outline,
             records: Vec::new(),
             capture: None,
+        };
+        snapshot.refresh_retention();
+        snapshot
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn refresh_retention(&mut self) {
+        let mut heap = super::compose::retention::Heap::default();
+        heap.vector(&self.outline);
+        heap.vector(&self.records);
+        for record in &self.records {
+            if let Some(text) = &record.replacement {
+                heap.string(text);
+            }
         }
+        if let Some((_, _, complete)) = &self.capture {
+            heap.vector(complete);
+        }
+        self.retained_bytes = heap.bytes();
     }
 
     pub fn rebase(mut self, revision: u64, outline: Vec<Semantic>, coordinates: &CoordMap) -> Self {
@@ -100,6 +123,7 @@ impl Snapshot {
         self.revision = revision;
         self.outline = outline;
         self.capture = None;
+        self.refresh_retention();
         self
     }
 
@@ -145,6 +169,7 @@ impl Snapshot {
         }));
         self.records.sort_by_key(|entry| entry.source.start);
         self.capture = Some((version, region, complete));
+        self.refresh_retention();
     }
 
     pub fn active(
@@ -184,6 +209,42 @@ mod tests {
             replacement: None,
             activation: Some((false, scope)),
         }
+    }
+
+    #[test]
+    fn retention_tracks_captured_capacities_rebase_and_replacement_release() {
+        let mut snapshot = Snapshot::new(1, vec![semantic(0..5, 11)]);
+        let base = snapshot.retained_bytes();
+        let mut replacement = String::with_capacity(1 << 20);
+        replacement.push('t');
+        snapshot.capture(
+            1,
+            0..5,
+            vec![0..5],
+            5,
+            vec![ResolvedConceal {
+                source: 0..1,
+                replacement: Some(replacement),
+                activation: None,
+            }],
+        );
+        assert!(snapshot.retained_bytes() >= base + (1 << 20));
+        let mut coordinates = CoordMap::default();
+        coordinates.record_insert(2, 4, 1);
+        snapshot = snapshot.rebase(2, vec![semantic(0..6, 11)], &coordinates);
+        assert!(
+            snapshot.retained_bytes() >= (1 << 20),
+            "rebasing keeps untouched replacement ownership"
+        );
+        snapshot.capture(2, 0..6, vec![0..6], 6, Vec::new());
+        assert!(
+            snapshot.retained_bytes() < (1 << 20),
+            "replacing captured records releases their strings"
+        );
+        assert!(
+            snapshot.retained_bytes() > base,
+            "retained vector capacity still counts after removing entries"
+        );
     }
 
     #[test]

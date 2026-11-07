@@ -102,6 +102,11 @@ fn profile_rich_compose_document_workloads() {
             document = Some(parsed);
         }
         let doc = document.unwrap();
+        let retention_started = Instant::now();
+        for _ in 0..10_000 {
+            std::hint::black_box(std::hint::black_box(&doc).retained_bytes());
+        }
+        let retention_lookup_ms = retention_started.elapsed().as_secs_f64() * 1000.0;
         let started = Instant::now();
         let window = doc.source_window_policy(0, None, None, paragraph_windows);
         let tables = doc.tables.snapshot(&doc.text, window.clone(), &[]);
@@ -182,6 +187,13 @@ fn profile_rich_compose_document_workloads() {
             "semantic_spans": doc.spans.len(), "images": doc.images.len(), "window_images": pane.images.len(),
             "window_table_rows": pane.tables.iter().map(|table| table.rows.len()).sum::<usize>(), "table_samples": samples,
             "process_peak_rss_bytes": peak_rss_bytes(),
+            "retained_capacity_weight_bytes": doc.retained_bytes(),
+            "retained_source_capacity_bytes": doc.text.capacity(),
+            "retained_index_capacity_bytes": doc.text_index.allocated_bytes(),
+            "retained_static_metadata_bytes": doc.metadata_bytes,
+            "retained_formatter_bytes": doc.decorations.retained_bytes(),
+            "retained_prefix_bytes": doc.prefix_cache.allocated_bytes(),
+            "retention_lookup_10k_ms": retention_lookup_ms,
         });
         println!("COMPOSE_PROFILE {report}");
         reports.push(report);
@@ -194,6 +206,7 @@ fn profile_rich_compose_document_workloads() {
             "scope": "native parser/projection/encoding only; excludes plugin formatting and event-loop latency",
             "parse_scope": "semantic parse of a prepared immutable source and UTF-16 index; preparation is reported separately",
             "rss_scope": "process high-water mark since start, including input fixtures and prior cases",
+            "retention_scope": "unit-profile cache capacity weights, not resident/allocator-live bytes; excludes allocator rounding, unreported container bookkeeping, editor buffers and external/parser/native ownership",
             "cases": reports,
         })).unwrap()).unwrap();
     }

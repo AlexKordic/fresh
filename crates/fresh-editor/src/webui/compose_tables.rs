@@ -226,6 +226,37 @@ fn content_end(text: &str, source: &Range<usize>) -> usize {
 }
 
 impl Tables {
+    pub(super) fn account_retention(&self, heap: &mut super::compose::retention::Heap) {
+        heap.vector(&self.parsed);
+        for table in &self.parsed {
+            heap.vector(&table.alignments);
+            heap.vector(&table.rows);
+            for row in &table.rows {
+                heap.vector(&row.cells);
+                for cell in &row.cells {
+                    heap.vector(&cell.parts);
+                    for part in &cell.parts {
+                        if let Some(text) = &part.text {
+                            heap.string(text);
+                        }
+                    }
+                }
+            }
+            if let Some(measurement) = &table.measurement {
+                if heap.arc(measurement) {
+                    heap.vector(&measurement.columns);
+                    for column in &measurement.columns {
+                        heap.vector(&column.samples);
+                        for sample in &column.samples {
+                            heap.string(&sample.text);
+                            heap.vector(&sample.spans);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn event(&mut self, text: &str, event: &Event<'_>, source: &Range<usize>) {
         match event {
             Event::Start(Tag::Table(alignments)) => {
