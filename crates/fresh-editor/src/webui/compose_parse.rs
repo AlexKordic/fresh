@@ -75,6 +75,33 @@ impl Worker {
 }
 
 impl ComposeCache {
+    /// Bound cached snapshot retention by capacity as well as entry count.
+    /// The requested document is never discarded just because it alone is
+    /// larger than the cache budget. Parser ownership is accounted separately.
+    pub(super) fn trim_source_cache(&mut self, current: (u64, usize), incoming: usize) {
+        loop {
+            let bytes = self.documents.values().fold(incoming, |bytes, doc| {
+                bytes.saturating_add(doc.snapshot_bytes())
+            });
+            let entries =
+                self.documents.len() + usize::from(!self.documents.contains_key(&current));
+            if entries <= CACHE_LIMIT && bytes <= SOURCE_CACHE_BYTES {
+                return;
+            }
+            let Some(oldest) = self
+                .documents
+                .iter()
+                .filter(|(key, _)| **key != current)
+                .min_by_key(|(_, doc)| doc.used)
+                .map(|(key, _)| *key)
+            else {
+                return;
+            };
+            self.documents.remove(&oldest);
+            self.cancel_buffer_parse(oldest.0, oldest.1);
+        }
+    }
+
     pub(crate) fn parsing_pending(&self, window: u64, buffer: usize) -> bool {
         self.documents
             .get(&(window, buffer))
@@ -378,6 +405,130 @@ mod tests {
                 result: Ok(parsed),
             })
             .unwrap();
+    }
+
+    fn retain_capacity(cache: &mut ComposeCache, editor: &Editor, capacity: usize) -> Weak<String> {
+        let key = (editor.active_window().id.0, editor.active_buffer().0);
+        let text = &mut cache.documents.get_mut(&key).unwrap().text;
+        let value = Arc::get_mut(text).expect("a small parsed snapshot has no parser owner");
+        value.reserve_exact(capacity.saturating_sub(value.len()));
+        Arc::downgrade(text)
+    }
+
+    #[test]
+    fn snapshot_byte_pressure_evicts_the_oldest_entry_below_the_count_limit() {
+        let (mut editor, _root) = editor("# Current café\n");
+        let mut cache = ComposeCache::default();
+        let window = editor.active_window().id.0;
+        let mut buffers = Vec::new();
+        let mut sources = Vec::new();
+        for index in 0..3 {
+            if index != 0 {
+                editor.new_buffer();
+                editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+            }
+            gather(&mut cache, &mut editor);
+            buffers.push(editor.active_buffer());
+            sources.push(retain_capacity(&mut cache, &editor, 20 << 20));
+        }
+        editor.switch_buffer(buffers[0]);
+        gather(&mut cache, &mut editor); // Touch the first entry: the second is now oldest.
+        let current = editor.new_buffer();
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        gather(&mut cache, &mut editor);
+        let live = retain_capacity(&mut cache, &editor, 20 << 20);
+        gather(&mut cache, &mut editor);
+        assert!(cache.documents.len() < 4, "entry-count-only retention exceeds the byte budget");
+        assert!(!cache.documents.contains_key(&(window, buffers[1].0)));
+        assert!(sources[1].upgrade().is_none());
+        assert!(sources[0].upgrade().is_some());
+        assert!(sources[2].upgrade().is_some());
+        assert!(cache.documents.contains_key(&(window, current.0)));
+        assert!(live.upgrade().is_some());
+        assert!(cache.documents.values().map(Document::snapshot_bytes).sum::<usize>() <= SOURCE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn one_oversized_current_snapshot_keeps_exact_source_and_evicts_other_retention() {
+        let (mut editor, _root) = editor("# Earlier\n");
+        let mut cache = ComposeCache::default();
+        gather(&mut cache, &mut editor);
+        let old = retain_capacity(&mut cache, &editor, 20 << 20);
+        let current = editor.new_buffer();
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        editor.active_state_mut().buffer.set_line_ending(crate::model::buffer::LineEnding::CRLF);
+        let cursor = editor.active_cursors().primary_id();
+        let source = "# Current café e\u{301} 👩🏽‍💻\r\n";
+        editor.replace_native_texts(vec![(0..0, source.to_owned(), cursor)]).unwrap();
+        editor.active_cursors_mut().primary_mut().position = 0;
+        gather(&mut cache, &mut editor);
+        let live = retain_capacity(&mut cache, &editor, SOURCE_CACHE_BYTES + (1 << 20));
+        let pane = gather(&mut cache, &mut editor);
+        let key = (editor.active_window().id.0, current.0);
+        assert_eq!(cache.documents.len(), 1);
+        assert!(cache.documents[&key].snapshot_bytes() > SOURCE_CACHE_BYTES);
+        assert_eq!(cache.documents[&key].text.as_str(), source);
+        assert_eq!(pane.document_len, source.len());
+        assert!(pane.text.contains("Current café"));
+        assert!(old.upgrade().is_none());
+        assert!(live.upgrade().is_some());
+    }
+
+    #[test]
+    fn snapshot_budget_includes_sparse_indices_at_the_source_capacity_boundary() {
+        let (mut editor, _root) = editor("# First\n");
+        let mut cache = ComposeCache::default();
+        gather(&mut cache, &mut editor);
+        let old = retain_capacity(&mut cache, &editor, SOURCE_CACHE_BYTES / 2);
+        editor.new_buffer();
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        gather(&mut cache, &mut editor);
+        retain_capacity(&mut cache, &editor, SOURCE_CACHE_BYTES / 2);
+        assert_eq!(cache.documents.values().map(|doc| doc.text.capacity()).sum::<usize>(), SOURCE_CACHE_BYTES);
+        gather(&mut cache, &mut editor);
+        assert_eq!(cache.documents.len(), 1, "the indices also consume retained heap capacity");
+        assert!(old.upgrade().is_none());
+    }
+
+    #[test]
+    fn byte_eviction_cancels_parser_but_keeps_its_real_slot_until_completion() {
+        let (mut editor, _root) = editor("# Source\n");
+        let (mut cache, input, output) = controlled();
+        let window = editor.active_window().id.0;
+        let mut keys = Vec::new();
+        for index in 0..3 {
+            if index != 0 {
+                editor.new_buffer();
+                editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+            }
+            gather(&mut cache, &mut editor);
+            retain_capacity(&mut cache, &editor, 20 << 20);
+            keys.push((window, editor.active_buffer().0));
+        }
+        // Submit the immutable middle snapshot to the controlled real queue.
+        cache.documents.get_mut(&keys[1]).unwrap().parsed = false;
+        cache.request_parse(keys[1].0, keys[1].1);
+        cache.schedule();
+        let job = input.recv().unwrap();
+        let source = Arc::downgrade(&job.text);
+        let cancel = job.cancel.clone();
+        editor.switch_buffer(BufferId(keys[0].1));
+        gather(&mut cache, &mut editor); // Middle snapshot becomes oldest.
+        editor.new_buffer();
+        editor.active_window_mut().focused_view_mut().view_mode = ViewMode::PageView;
+        gather(&mut cache, &mut editor);
+        retain_capacity(&mut cache, &editor, 20 << 20);
+        gather(&mut cache, &mut editor);
+        assert!(!cache.documents.contains_key(&keys[1]));
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(cache.parse_wanted.is_empty());
+        assert_eq!(cache.parsing.len(), 1, "eviction cannot create an extra parser slot");
+        assert!(source.upgrade().is_some(), "the running job still owns its snapshot");
+        complete(job, &output);
+        assert!(!cache.poll(&editor), "an evicted late result cannot restore the source");
+        assert!(cache.parsing.is_empty());
+        assert!(source.upgrade().is_none());
+        assert!(input.try_recv().is_err());
     }
 
     #[test]

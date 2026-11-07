@@ -17,6 +17,10 @@ use std::sync::{Arc, Weak};
 const BACKGROUND_PARSE_BYTES: usize = 64 << 10;
 const WINDOW_BYTES: usize = 64 << 10;
 const CACHE_LIMIT: usize = 8;
+/// Retained source and sparse UTF-16 index capacity, excluding the editor's
+/// buffer, semantic metadata and occupied parser jobs. One current document
+/// may exceed this soft cache budget; it must remain fully editable/renderable.
+const SOURCE_CACHE_BYTES: usize = 64 << 20;
 
 #[path = "compose_parse.rs"]
 mod parsing;
@@ -871,6 +875,12 @@ struct CodeBlock {
 }
 
 impl Document {
+    fn snapshot_bytes(&self) -> usize {
+        self.text
+            .capacity()
+            .saturating_add(self.text_index.allocated_bytes())
+    }
+
     fn parse(text: String, revision: u64, used: u64, epoch: usize) -> Self {
         let text = Arc::new(text);
         let index = Arc::new(super::compose_text::Index::new(&text));
@@ -1955,35 +1965,27 @@ impl ComposeCache {
             .get(&key)
             .is_some_and(|d| d.revision == revision && d.epoch == state.marker_list.instance_id())
         {
+            let previous = self
+                .documents
+                .remove(&key)
+                .filter(|doc| doc.epoch == state.marker_list.instance_id())
+                .map(|doc| doc.previous_decorations.unwrap_or(doc.decorations));
+            self.cancel_buffer_parse(window_id, buffer.0);
+            // Release the obsolete cached source/index and older snapshots
+            // before copying this revision. A parser still owns its cancelled
+            // input until completion; eviction never pretends that slot is free.
+            self.trim_source_cache(key, state.buffer.len());
             let bytes = state
                 .buffer
                 .get_text_range_mut(0, state.buffer.len())
                 .ok()?;
             let text = String::from_utf8(bytes).ok()?;
-            let previous = self
-                .documents
-                .remove(&key)
-                .filter(|doc| doc.epoch == state.marker_list.instance_id());
-            self.cancel_buffer_parse(window_id, buffer.0);
-            if self.documents.len() >= CACHE_LIMIT {
-                if let Some(oldest) = self
-                    .documents
-                    .iter()
-                    .min_by_key(|(_, d)| d.used)
-                    .map(|(k, _)| *k)
-                {
-                    self.documents.remove(&oldest);
-                }
-            }
             let mut document = if text.len() > BACKGROUND_PARSE_BYTES {
                 Document::pending(text, revision, self.clock, state.marker_list.instance_id())
             } else {
                 Document::parse(text, revision, self.clock, state.marker_list.instance_id())
             };
-            if let Some(previous) = previous {
-                let snapshot = previous
-                    .previous_decorations
-                    .unwrap_or(previous.decorations);
+            if let Some(snapshot) = previous {
                 if document.parsed {
                     let outline = document.decorations.outline().to_vec();
                     document.decorations = snapshot.rebase(revision, outline, &state.coord_map);
@@ -1995,6 +1997,8 @@ impl ComposeCache {
             self.request_parse(window_id, buffer.0);
             self.schedule();
         }
+        // The read's actual capacity and sparse index are known only now.
+        self.trim_source_cache(key, 0);
         let doc = self.documents.get_mut(&key)?;
         doc.used = self.clock;
         let window = doc.source_window_policy(top_byte, region, keep, paragraph_windows);

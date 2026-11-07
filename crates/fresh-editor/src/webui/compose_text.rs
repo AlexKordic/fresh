@@ -25,6 +25,12 @@ pub(crate) struct Chunk {
 pub(super) struct Index(Vec<(usize, usize)>);
 
 impl Index {
+    pub(super) fn allocated_bytes(&self) -> usize {
+        self.0
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(usize, usize)>())
+    }
+
     pub fn new(text: &str) -> Self {
         let mut entries = vec![(0, 0)];
         let mut units = 0;
